@@ -1,0 +1,11 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+SQLAlchemy==2.0.31
+pyodbc==5.2.0
+pydantic==2.8.2
+pydantic-settings==2.3.4
+PyJWT[crypto]==2.8.0
+httpx==0.27.0
+redis==5.0.7
+azure-identity==1.17.1
+azure-keyvault-secrets==4.8.0
