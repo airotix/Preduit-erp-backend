@@ -6,9 +6,10 @@ Goal: run the API on your machine and see real catalog data from your
 
 ## 0. Prerequisites (one-time)
 
-1. **SQL scripts applied** — you've already run `V001`–`V003` and created the
-   `erp_app` / `erp_system` users. Now also run **`db/seed_dev_data.sql`** in
-   SSMS so there's demo data to see.
+1. **SQL scripts applied** — apply the migrations in **`backend/db/`** (`V001`
+   through the latest `V036`) and create the `erp_app` / `erp_system` users. Now
+   also run **`backend/db/seed_dev_data.sql`** in SSMS so there's demo data to see.
+   (The `db/`, `Docs/` and `infra/` folders live inside `backend/`.)
 2. **ODBC Driver 18 for SQL Server** — download & install from Microsoft:
    https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server
 3. **Python 3.11 or newer** — https://www.python.org/downloads/
@@ -66,6 +67,6 @@ API page.
 | `Login failed for user 'erp_app'` | Password in `.env` doesn't match the one you set in `create_users.sql`. |
 | `A network-related... server was not found` | Wrong `SQL_SERVER`. Try `localhost\SQLEXPRESS` or your instance name. |
 | `SSL Provider... certificate chain` | Ensure `SQL_TRUST_SERVER_CERT=yes` in `.env`. |
-| Products list is empty `[]` | Run `db/seed_dev_data.sql`, and confirm `DEV_TENANT_ID` in `.env` is the demo GUID. |
+| Products list is empty `[]` | Run `backend/db/seed_dev_data.sql`, and confirm `DEV_TENANT_ID` in `.env` is the demo GUID. |
 | `python not recognized` | Reinstall Python with "Add to PATH", reopen the terminal. |
 | `Failed building wheel for pyodbc` | Make sure `requirements.txt` pins `pyodbc==5.2.0` (has a prebuilt wheel for Python 3.13). Then re-run `pip install -r requirements.txt`. Older pyodbc tries to compile from source and fails on 3.13/3.14. |

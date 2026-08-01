@@ -1,23 +1,31 @@
 # Preduit ERP — Backend (FastAPI)
 
 Phase 0 foundation for the multi-tenant apparel ERP. See
-`../docs/BACKEND_ARCHITECTURE_PLAN.md` for the full design.
+`Docs/BACKEND_ARCHITECTURE_PLAN.md` for the full design.
+
+> **Layout note:** the repo has two top-level folders — `frontend/` and
+> `backend/`. The database migrations (`db/`), design docs (`Docs/`) and Azure
+> infra (`infra/`) now live **inside `backend/`**.
 
 ## What's here
 
 ```
-backend/app/
-├── main.py                    # FastAPI app + router wiring (/api/v1)
-├── core/
-│   ├── config.py              # settings; builds app + system DB URLs
-│   ├── database.py            # two engines + tenant SESSION_CONTEXT plumbing
-│   ├── security.py            # Entra External ID JWT validation → Principal
-│   └── deps.py                # tenant_db: RLS-scoped session dependency
-├── models/                    # SQLAlchemy 2.0 (reflect via sqlacodegen in prod)
-├── presenters/screen.py       # entity → frontend ScreenConfig (BFF seam)
-└── modules/
-    ├── onboarding/            # self-serve: create org (system principal, 1 txn)
-    └── catalog/               # exemplar vertical slice: router·service·repo·dto
+backend/
+├── app/                       # FastAPI application
+│   ├── main.py                # app + router wiring (/api/v1)
+│   ├── core/
+│   │   ├── config.py          # settings; builds app + system DB URLs
+│   │   ├── database.py        # two engines + tenant SESSION_CONTEXT plumbing
+│   │   ├── security.py        # Entra External ID JWT validation → Principal
+│   │   └── deps.py            # tenant_db: RLS-scoped session dependency
+│   ├── models/                # SQLAlchemy 2.0 (reflect via sqlacodegen in prod)
+│   ├── presenters/screen.py   # entity → frontend ScreenConfig (BFF seam)
+│   └── modules/               # one folder per module: router·service·repo·dto
+├── db/                        # SQL Server migrations (V001…V036), seeds, RLS
+├── Docs/                      # architecture & module plans
+├── infra/                     # Azure Bicep (ACR, Container Apps, SQL)
+├── .env.example
+└── requirements.txt
 ```
 
 Two DB principals enforce the isolation model:
@@ -40,15 +48,16 @@ image installs it automatically).
 
 ## Database migrations (database-first)
 
-The schema is owned by `../db` (Flyway). Apply it with the **system** principal:
+The schema is owned by `db/` (Flyway). Apply it with the **system** principal:
 
 ```bash
-cd ../db
+cd db
 flyway -url="$FLYWAY_URL" -user="$SQL_SYSTEM_USER" -password="$SQL_SYSTEM_PASSWORD" migrate
 ```
 
-Migrations present: `V001` core platform + RLS-ready tables, `V002` RLS policy,
-`V003` catalog (Phase 1 preview, backs the exemplar module).
+Migrations run `V001` (core platform + RLS-ready tables) through the latest
+(`V036`), covering catalog, sales, inventory, procurement, finance, production,
+the AI snapshot store and product images. Seeds live in `db/seed_dev_*.sql`.
 
 After the schema exists, regenerate ORM models from the live DB instead of
 hand-maintaining them:
@@ -70,7 +79,7 @@ sqlacodegen "$SQLALCHEMY_URL" --outfile app/models/_generated.py
 
 ```bash
 docker build -t preduit-backend .
-# Push to ACR + deploy via infra/main.bicep (see ../infra)
+# Push to ACR + deploy via infra/main.bicep (see infra/)
 ```
 
 ## Not yet wired (deliberate Phase 0 boundaries)
