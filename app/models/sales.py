@@ -3,7 +3,9 @@ import datetime
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, Date, Integer, Numeric, String, Uuid, text
+from sqlalchemy import (
+    BigInteger, Boolean, Date, DateTime, Integer, Numeric, String, Text, Uuid, text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -56,6 +58,8 @@ class SalesOrderLine(Base):
     order_id: Mapped[int] = mapped_column(BigInteger)
     sku: Mapped[str | None] = mapped_column(String(64), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
+    color: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    size: Mapped[str | None] = mapped_column(String(60), nullable=True)
     qty: Mapped[int] = mapped_column(Integer, default=0)
     price: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     line_total: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
@@ -91,6 +95,26 @@ class Invoice(Base):
     status: Mapped[str] = mapped_column(String(20), default="Open")
     gl_journal_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     posted: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class SalesInvoice(Base):
+    """Commercial/retail invoice generated against a sales order — full editable
+    doc in `data`. Retail/Online use the flat receipt layout, Wholesale the
+    colour×size matrix. Mirrors procurement's PoInvoice."""
+    __tablename__ = "sales_invoices"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    invoice_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    order_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    customer_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    invoice_type: Mapped[str] = mapped_column(String(20), default="Retail")
+    currency_code: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    total: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
+    status: Mapped[str] = mapped_column(String(20), default="Draft")
+    data: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 

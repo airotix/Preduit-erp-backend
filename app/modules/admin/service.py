@@ -13,8 +13,9 @@ from app.modules.admin.dto import (
 )
 from app.presenters.screen import list_config, text_cell
 
-_ROLE_TONE = {"Administrator": "accent", "Owner": "accent",
-              "Buyer": "neutral"}  # everything else → navy
+_ROLE_TONE = {"Admin": "accent", "Manager": "navy", "Merchandiser": "navy",
+              "Accountant": "navy", "Logistics / Inventory": "navy",
+              "User Overview": "neutral"}  # everything else → navy
 _USER_STATUS_TONE = {"Active": "green", "Invited": "amber", "Suspended": "red"}
 _RULE_TONE = {"Active": "green", "Draft": "neutral", "Paused": "amber"}
 _AUDIT_TONE = {"Approved": "green", "Created": "accent", "Updated": "navy",

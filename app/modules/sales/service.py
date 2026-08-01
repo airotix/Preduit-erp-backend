@@ -1,5 +1,6 @@
 """Sales business logic → frontend ScreenConfig."""
 import datetime
+import json
 import uuid
 from uuid import UUID
 
@@ -104,7 +105,8 @@ def orders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict
 def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreate):
     tid = _tid(tenant_id)
     customer_id = repo.find_customer_id(session, name=payload.customer)
-    lines = [{"name": l.name, "sku": l.sku, "qty": l.qty, "price": l.price}
+    lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku,
+              "qty": l.qty, "price": l.price}
              for l in payload.lines]
     return repo.create_order(
         session, tenant_id=tid, customer_id=customer_id, customer_name=payload.customer,
@@ -377,3 +379,208 @@ def customer_detail(session: Session, *, public_id: str) -> dict | None:
             ],
         },
     }
+
+
+# ============================================================================
+# Commercial / retail invoices generated from a sales order
+# Retail & Online → flat receipt layout · Wholesale → colour×size matrix.
+# Mirrors the procurement PO-invoice feature.
+# ============================================================================
+
+_SIZE_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "XXL", "2XL", "3XL", "4XL", "5XL",
+               "6XL", "7XL", "XL2", "XL3", "XL4"]
+_INVOICE_TYPES = {"Retail", "Online", "Wholesale"}
+_PRICE_KEY = {"Retail": "retail_price", "Online": "online_price", "Wholesale": "wholesale_price"}
+
+
+def _size_rank(s: str) -> int:
+    u = (s or "").upper().strip()
+    return _SIZE_ORDER.index(u) if u in _SIZE_ORDER else len(_SIZE_ORDER) + 1
+
+
+def _channel_price(variant: dict | None, invoice_type: str, fallback) -> float:
+    """Pick the price for the selected invoice type; fall back to the variant's
+    base price, then to the order line's recorded price."""
+    if variant:
+        p = variant.get(_PRICE_KEY[invoice_type])
+        if p is None:
+            p = variant.get("base_price")
+        if p is not None:
+            return round(float(p), 4)
+    return round(float(fallback or 0), 4)
+
+
+def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: str) -> dict | None:
+    """Assemble a prefilled invoice document from a sales order. Colour/size and
+    per-channel pricing are enriched by looking up each line's SKU in the catalog."""
+    invoice_type = invoice_type if invoice_type in _INVOICE_TYPES else "Retail"
+    order = repo.order_by_no(session, order_no=order_no)
+    if order is None:
+        return None
+    lines = repo.order_lines(session, order_id=order.id)
+    variants = repo.variants_by_sku(session, skus=[l["sku"] for l in lines])
+    customer = repo._customer_by_id(session, order.customer_id)
+    currency = order.currency_code or "USD"
+    biz = repo.tenant_name(session) or ""
+    today = datetime.date.today().isoformat()
+    order_date = order.order_date.isoformat() if order.order_date else ""
+
+    exporter = {"name": biz, "address": "", "country": "", "tel": "", "email": "", "taxId": ""}
+    buyer = {
+        "name": customer.name if customer else order.customer_name,
+        "phone": (customer.phone if customer else "") or "",
+        "email": (customer.email if customer else "") or "",
+        "taxId": (customer.code if customer else "") or "",
+        "address": (customer.address if customer else "") or "",
+        "country": (customer.region if customer else "") or "",
+    }
+
+    is_wholesale = invoice_type == "Wholesale"
+
+    if is_wholesale:
+        # group: article(style) -> { colors: {color: {qty:{size:q}, price}}, sizes, image, fabric, hs }
+        articles: dict[str, dict] = {}
+        for l in lines:
+            v = variants.get((l["sku"] or "").strip())
+            art = (l["name"] or (v or {}).get("title") or "Article").strip()
+            # Prefer the colour/size captured on the order line; fall back to the
+            # catalog variant looked up by SKU.
+            color = (l.get("color") or (v or {}).get("color") or "—").strip()
+            size = (l.get("size") or (v or {}).get("size") or "—").strip()
+            qty = int(l["qty"] or 0)
+            price = _channel_price(v, invoice_type, l["price"])
+            a = articles.setdefault(art, {
+                "colors": {}, "sizes": set(),
+                "image": (v or {}).get("image"), "fabric": (v or {}).get("fabric") or "",
+                "hs": (v or {}).get("hs_code") or "", "sku": (l["sku"] or ""),
+            })
+            row = a["colors"].setdefault(color, {"qty": {}, "price": price})
+            row["qty"][size] = row["qty"].get(size, 0) + qty
+            if price and not row["price"]:
+                row["price"] = price
+            a["sizes"].add(size)
+            if not a["image"] and (v or {}).get("image"):
+                a["image"] = (v or {}).get("image")
+
+        article_list = []
+        grand_qty, grand_amt = 0, 0.0
+        for art, a in articles.items():
+            sizes = sorted(a["sizes"], key=_size_rank)
+            rows = []
+            for color, cd in a["colors"].items():
+                total = sum(cd["qty"].values())
+                unit = round(float(cd["price"]), 4)
+                rows.append({"color": color, "qty": cd["qty"], "total": total,
+                             "unitPrice": unit, "amount": round(total * unit, 2)})
+            sub_qty = sum(r["total"] for r in rows)
+            sub_amt = round(sum(r["amount"] for r in rows), 2)
+            grand_qty += sub_qty
+            grand_amt += sub_amt
+            article_list.append({
+                "articleNo": "", "style": art, "description": art, "fabric": a["fabric"],
+                "sku": a["sku"], "hsCode": a["hs"], "image": a["image"] or None,
+                "sizes": sizes, "rows": rows, "subtotalQty": sub_qty, "subtotalAmount": sub_amt,
+            })
+        grand_amt = round(grand_amt, 2)
+        return {
+            "layout": "wholesale", "invoiceType": invoice_type,
+            "invoiceNo": "", "invoiceDate": today, "orderNo": order.order_no or "",
+            "poNo": order.order_no or "", "orderDate": order_date, "deliveryDate": "",
+            "paymentTerms": "Net 30", "salesRep": "", "shipTo": "Same as buyer",
+            "currency": currency,
+            "exporter": exporter, "buyer": buyer,
+            "articles": article_list,
+            "remit": {"title": biz, "bank": "", "account": ""},
+            "terms": "Payment Net 30 from invoice date. Minimum reorder 12 units per style.",
+            "totals": {"totalQty": grand_qty, "subtotal": grand_amt, "discount": 0.0,
+                       "taxRate": 0.0, "tax": 0.0, "freight": 0.0, "total": grand_amt},
+            "preparedBy": "",
+        }
+
+    # ---- Retail / Online: flat receipt ----
+    flat, grand_qty, grand_amt = [], 0, 0.0
+    for l in lines:
+        v = variants.get((l["sku"] or "").strip())
+        qty = int(l["qty"] or 0)
+        unit = _channel_price(v, invoice_type, l["price"])
+        amount = round(qty * unit, 2)
+        grand_qty += qty
+        grand_amt += amount
+        flat.append({
+            "article": (l["name"] or (v or {}).get("title") or "").strip(),
+            "colour": (l.get("color") or (v or {}).get("color") or ""),
+            "size": (l.get("size") or (v or {}).get("size") or ""),
+            "qty": qty, "unitPrice": unit, "amount": amount,
+        })
+    grand_amt = round(grand_amt, 2)
+    return {
+        "layout": "retail", "invoiceType": invoice_type,
+        "invoiceNo": "", "invoiceDate": today, "orderRef": order.order_no or "",
+        "paymentMethod": "Card", "cashier": "", "status": "Paid", "currency": currency,
+        "exporter": exporter, "buyer": buyer,
+        "lines": flat,
+        "note": "Thank you for shopping with us. Exchanges within 14 days with this receipt. Sale items final.",
+        "totals": {"totalQty": grand_qty, "subtotal": grand_amt, "discount": 0.0,
+                   "taxRate": 0.0, "tax": 0.0, "total": grand_amt},
+        "preparedBy": "",
+    }
+
+
+def _sinv_summary(inv) -> dict:
+    return {
+        "publicId": str(inv.public_id), "invoiceNo": inv.invoice_no, "orderNo": inv.order_no,
+        "customer": inv.customer_name, "invoiceType": inv.invoice_type,
+        "currency": inv.currency_code, "total": float(inv.total or 0), "status": inv.status,
+        "createdAt": inv.created_at.isoformat() + "Z" if inv.created_at else None,
+    }
+
+
+def _sinv_persist_fields(data: dict) -> dict:
+    totals = data.get("totals") or {}
+    return {
+        "invoice_no": (data.get("invoiceNo") or "").strip() or None,
+        "order_no": data.get("orderNo") or data.get("orderRef") or data.get("poNo"),
+        "customer_name": (data.get("buyer") or {}).get("name"),
+        "invoice_type": data.get("invoiceType") or "Retail",
+        "currency_code": (data.get("currency") or "USD")[:3],
+        "total": float(totals.get("total") or 0),
+    }
+
+
+def list_sales_invoice_docs(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
+    rows, total = repo.list_sales_invoices(session, limit=limit, offset=offset)
+    return {"invoices": [{
+        "publicId": str(r["public_id"]), "invoiceNo": r["invoice_no"], "orderNo": r["order_no"],
+        "customer": r["customer_name"], "invoiceType": r["invoice_type"],
+        "currency": r["currency_code"], "total": float(r["total"] or 0), "status": r["status"],
+        "createdAt": r["created_at"].isoformat() + "Z" if r["created_at"] else None,
+    } for r in rows], "total": total}
+
+
+def create_sales_invoice_doc(session: Session, *, tenant_id, data: dict) -> dict:
+    f = _sinv_persist_fields(data)
+    inv = repo.create_sales_invoice(session, tenant_id=_tid(tenant_id), data=json.dumps(data), **f)
+    return {"publicId": str(inv.public_id), "invoiceNo": inv.invoice_no}
+
+
+def get_sales_invoice_doc(session: Session, *, public_id: str) -> dict | None:
+    inv = repo.get_sales_invoice(session, public_id=public_id)
+    if inv is None:
+        return None
+    return {**_sinv_summary(inv), "data": json.loads(inv.data)}
+
+
+def update_sales_invoice_doc(session: Session, *, public_id: str, data: dict) -> dict | None:
+    inv = repo.get_sales_invoice(session, public_id=public_id)
+    if inv is None:
+        return None
+    f = _sinv_persist_fields(data)
+    inv.invoice_no = f["invoice_no"] or inv.invoice_no
+    inv.order_no = f["order_no"]
+    inv.customer_name = f["customer_name"]
+    inv.invoice_type = f["invoice_type"]
+    inv.currency_code = f["currency_code"]
+    inv.total = f["total"]
+    inv.data = json.dumps(data)
+    session.flush()
+    return {"publicId": str(inv.public_id), "invoiceNo": inv.invoice_no}

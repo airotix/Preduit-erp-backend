@@ -1,13 +1,15 @@
 """Sales data access. Tenant-filtered automatically by RLS."""
+import datetime
 from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select, text
+from sqlalchemy.orm import Session, aliased
 
+from app.models.catalog import AttributeValue, Product, ProductVariant
 from app.models.sales import (
-    Customer, Invoice, InvoiceLine, SalesOrder, SalesOrderLine, SalesReturn,
+    Customer, Invoice, InvoiceLine, SalesInvoice, SalesOrder, SalesOrderLine, SalesReturn,
 )
 
 
@@ -100,6 +102,7 @@ def create_order(session: Session, *, tenant_id: UUID, customer_id: int | None,
         price = Decimal(str(l["price"]))
         session.add(SalesOrderLine(
             tenant_id=tenant_id, order_id=order.id, name=l["name"],
+            color=l.get("color"), size=l.get("size"),
             sku=l.get("sku"), qty=qty, price=price, line_total=price * qty,
         ))
     session.flush()
@@ -254,3 +257,101 @@ def get_customer_detail(session: Session, *, public_id: str) -> dict | None:
     ).scalar_one()
     return {"customer": customer, "orders": orders,
             "lifetime": lifetime, "open_invoices": open_invoices}
+
+
+# ---------- Commercial / retail invoices generated from a sales order ----------
+
+def order_by_no(session: Session, *, order_no: str) -> SalesOrder | None:
+    return session.execute(
+        select(SalesOrder).where(func.upper(SalesOrder.order_no) == order_no.upper().strip(),
+                                 SalesOrder.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
+
+
+def order_lines(session: Session, *, order_id: int) -> list[dict]:
+    return [dict(r._mapping) for r in session.execute(
+        select(SalesOrderLine.name, SalesOrderLine.color, SalesOrderLine.size,
+               SalesOrderLine.sku, SalesOrderLine.qty, SalesOrderLine.price)
+        .where(SalesOrderLine.order_id == order_id)
+        .order_by(SalesOrderLine.id)
+    )]
+
+
+def variants_by_sku(session: Session, *, skus: list[str]) -> dict[str, dict]:
+    """Map SKU → variant detail (colour, size, style/product info, per-channel
+    prices, image). Used to enrich sales-order lines that only carry a SKU."""
+    skus = [s for s in {(s or "").strip() for s in skus} if s]
+    if not skus:
+        return {}
+    color = aliased(AttributeValue)
+    size = aliased(AttributeValue)
+    rows = session.execute(
+        select(
+            ProductVariant.sku, ProductVariant.retail_price, ProductVariant.online_price,
+            ProductVariant.wholesale_price, ProductVariant.price,
+            Product.title, Product.composition, Product.hs_code, Product.image_url,
+            color.value.label("color"), size.value.label("size"),
+            size.sort_order.label("size_sort"),
+        )
+        .join(Product, Product.id == ProductVariant.product_id)
+        .outerjoin(color, color.id == ProductVariant.color_id)
+        .outerjoin(size, size.id == ProductVariant.size_id)
+        .where(ProductVariant.sku.in_(skus))
+    ).all()
+    out: dict[str, dict] = {}
+    for r in rows:
+        m = r._mapping
+        out[m["sku"]] = {
+            "color": m["color"], "size": m["size"], "size_sort": m["size_sort"],
+            "title": m["title"], "fabric": m["composition"], "hs_code": m["hs_code"],
+            "image": m["image_url"],
+            "retail_price": m["retail_price"], "online_price": m["online_price"],
+            "wholesale_price": m["wholesale_price"], "base_price": m["price"],
+        }
+    return out
+
+
+def tenant_name(session: Session) -> str | None:
+    return session.execute(text(
+        "SELECT name FROM dbo.tenants WHERE id = CAST(SESSION_CONTEXT(N'tenant_id') AS UNIQUEIDENTIFIER)"
+    )).scalar()
+
+
+def create_sales_invoice(session: Session, *, tenant_id: UUID, invoice_no, order_no,
+                         customer_name, invoice_type, currency_code, total,
+                         data: str) -> SalesInvoice:
+    inv = SalesInvoice(
+        tenant_id=tenant_id, invoice_no=invoice_no, order_no=order_no,
+        customer_name=customer_name, invoice_type=invoice_type,
+        currency_code=currency_code, total=total, status="Draft", data=data,
+        created_at=datetime.datetime.utcnow(),
+    )
+    session.add(inv)
+    session.flush()
+    if not inv.invoice_no:
+        inv.invoice_no = f"INV-{7700 + inv.id}"
+        session.flush()
+    return inv
+
+
+def list_sales_invoices(session: Session, *, limit: int, offset: int) -> tuple[list[dict], int]:
+    stmt = (
+        select(SalesInvoice.public_id, SalesInvoice.invoice_no, SalesInvoice.order_no,
+               SalesInvoice.customer_name, SalesInvoice.invoice_type,
+               SalesInvoice.currency_code, SalesInvoice.total, SalesInvoice.status,
+               SalesInvoice.created_at)
+        .where(SalesInvoice.is_deleted == False)  # noqa: E712
+        .order_by(SalesInvoice.id.desc()).limit(limit).offset(offset)
+    )
+    rows = [dict(r._mapping) for r in session.execute(stmt)]
+    total = session.execute(
+        select(func.count()).select_from(SalesInvoice).where(SalesInvoice.is_deleted == False)  # noqa: E712
+    ).scalar_one()
+    return rows, total
+
+
+def get_sales_invoice(session: Session, *, public_id: str) -> SalesInvoice | None:
+    return session.execute(
+        select(SalesInvoice).where(SalesInvoice.public_id == public_id,
+                                   SalesInvoice.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()

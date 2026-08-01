@@ -151,3 +151,54 @@ def create_return(
 ):
     ret = service.create_return(db, tenant_id=principal.tenant_id, payload=payload)
     return {"public_id": str(ret.public_id), "rma_no": ret.rma_no}
+
+
+# ---- Commercial / retail invoices generated from a sales order ----
+# Kept under /invoice-docs so they don't collide with the AR /invoices routes.
+@router.get("/invoice-docs/draft")
+def sales_invoice_draft(
+    order: str = Query(...),
+    type: str = Query("Retail"),
+    db: Session = Depends(tenant_db),
+):
+    d = service.build_sales_invoice_draft(db, order_no=order, invoice_type=type)
+    if d is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No sales order found for '{order}'.")
+    return d
+
+
+@router.get("/invoice-docs")
+def sales_invoices_list(
+    limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
+    db: Session = Depends(tenant_db),
+):
+    return service.list_sales_invoice_docs(db, limit=limit, offset=offset)
+
+
+@router.post("/invoice-docs", status_code=status.HTTP_201_CREATED)
+def sales_invoice_create(
+    payload: dict,
+    principal: Principal = Depends(require_tenant),
+    db: Session = Depends(tenant_db),
+):
+    return service.create_sales_invoice_doc(db, tenant_id=principal.tenant_id, data=payload)
+
+
+@router.get("/invoice-docs/{public_id}")
+def sales_invoice_get(public_id: str, db: Session = Depends(tenant_db)):
+    d = service.get_sales_invoice_doc(db, public_id=public_id)
+    if d is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
+    return d
+
+
+@router.put("/invoice-docs/{public_id}")
+def sales_invoice_update(
+    public_id: str, payload: dict,
+    principal: Principal = Depends(require_tenant),
+    db: Session = Depends(tenant_db),
+):
+    d = service.update_sales_invoice_doc(db, public_id=public_id, data=payload)
+    if d is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
+    return d

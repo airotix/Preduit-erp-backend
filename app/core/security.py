@@ -40,7 +40,7 @@ def get_principal(creds: HTTPAuthorizationCredentials | None = Depends(_bearer))
             external_id=settings.dev_external_id,
             email=settings.dev_email,
             tenant_id=settings.dev_tenant_id or None,
-            roles=["Owner"],
+            roles=["Admin"],
         )
 
     if creds is None:

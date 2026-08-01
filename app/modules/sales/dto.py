@@ -32,8 +32,10 @@ class CustomerOut(BaseModel):
 
 
 class OrderLineIn(BaseModel):
-    """A single line on the New order form."""
+    """A single line on the New order form (item + colour + size + qty + price)."""
     name: str = Field(min_length=1, max_length=200)
+    color: str | None = Field(default=None, max_length=60)
+    size: str | None = Field(default=None, max_length=60)
     sku: str | None = Field(default=None, max_length=64)
     qty: int = Field(gt=0)
     price: Decimal = Field(ge=0)

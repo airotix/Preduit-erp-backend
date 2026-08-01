@@ -14,10 +14,15 @@ from app.core.security import Principal
 from app.models.core import Role, Subscription, Tenant, User
 from app.modules.onboarding.dto import CreateOrgRequest, CreateOrgResponse
 
+# The canonical role set for every tenant. "Admin" is the top role (full
+# access) that the organization creator is linked to.
 _DEFAULT_ROLES = [
-    ("Owner", "Full access to the organization", True),
-    ("Admin", "Manage users, catalog and operations", True),
-    ("Member", "Standard operational access", True),
+    ("Admin", "Full access to the organization", True),
+    ("Manager", "Operations oversight and approvals", True),
+    ("Merchandiser", "Catalog and sales", True),
+    ("Accountant", "Finance and accounting", True),
+    ("User Overview", "Read-only dashboards and reports", True),
+    ("Logistics / Inventory", "Inventory, procurement and shipments", True),
 ]
 
 
@@ -58,17 +63,17 @@ def create_organization(principal: Principal, req: CreateOrgRequest) -> CreateOr
         db.add(owner)
         db.flush()
 
-        # Link owner → Owner role, and grant the Owner role every permission.
+        # Link the creator → Admin role, and grant the Admin role every permission.
         db.execute(
             text("INSERT INTO dbo.user_roles (tenant_id, user_id, role_id) VALUES (:t,:u,:r)"),
-            {"t": tenant.id, "u": owner.id, "r": roles["Owner"].id},
+            {"t": tenant.id, "u": owner.id, "r": roles["Admin"].id},
         )
         db.execute(
             text(
                 "INSERT INTO dbo.role_permissions (tenant_id, role_id, permission_id) "
                 "SELECT :t, :r, id FROM dbo.permissions"
             ),
-            {"t": tenant.id, "r": roles["Owner"].id},
+            {"t": tenant.id, "r": roles["Admin"].id},
         )
 
         # Baseline settings + trial window.

@@ -1,11 +1,19 @@
 """Admin API contracts."""
+from typing import Literal
+
 from pydantic import BaseModel, EmailStr, Field
+
+# The only roles a user may be assigned. Keep in sync with the frontend
+# userSchema enum and the onboarding _DEFAULT_ROLES set.
+RoleName = Literal[
+    "Admin", "Manager", "Merchandiser", "Accountant", "User Overview", "Logistics / Inventory",
+]
 
 
 class UserCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     email: EmailStr
-    role: str = Field(min_length=1, max_length=60)
+    role: RoleName
     department: str = Field(min_length=1, max_length=120)
 
 
