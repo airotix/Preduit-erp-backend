@@ -31,6 +31,29 @@ class Settings(BaseSettings):
     entra_api_audience: str = ""
     entra_openid_config: str = ""
 
+    # Self-managed auth (app-issued JWT). Override JWT_SECRET in prod.
+    jwt_secret: str = "dev-insecure-change-me-please"
+    jwt_algorithm: str = "HS256"
+    jwt_access_minutes: int = 30
+    jwt_refresh_days: int = 14
+
+    # Auth hardening (AUTH-E).
+    auth_max_failed_attempts: int = 5      # failed logins before a temporary lock
+    auth_lockout_minutes: int = 15         # how long the account stays locked
+    rate_limit_enabled: bool = True        # sliding-window throttle on sensitive endpoints
+    rate_limit_window_seconds: int = 60
+    rate_limit_max_attempts: int = 10      # per window, per client+bucket
+    # Comma-separated browser origins allowed to call the API (credentialed CORS).
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def jwt_secret_is_default(self) -> bool:
+        return self.jwt_secret == "dev-insecure-change-me-please"
+
     # Dev-only login bypass (NEVER enable outside local dev).
     # When true, requests are authenticated as a fixed fake principal so the API
     # can run without Entra. dev_tenant_id should match a real tenant in the DB.
@@ -55,6 +78,26 @@ class Settings(BaseSettings):
     #   endpoint: {fx_provider_url}/{fx_api_key}/latest/{BASE}
     fx_provider_url: str = "https://v6.exchangerate-api.com/v6"
     fx_api_key: str = ""
+
+    # Email (generic SMTP). When SMTP_HOST + a from-address are set, the auth
+    # flows send real mail; otherwise they fall back to the dev-code behaviour.
+    smtp_host: str = ""
+    smtp_port: int = 587           # 587 = STARTTLS, 465 = implicit SSL
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True      # STARTTLS on port 587 (ignored for 465)
+    mail_from: str = ""            # defaults to smtp_user when blank
+    mail_from_name: str = "Preduit Retail"
+    # Public URL of the frontend — used to build reset / invite links in emails.
+    app_base_url: str = "http://localhost:3000"
+
+    @property
+    def mail_sender(self) -> str:
+        return self.mail_from or self.smtp_user
+
+    @property
+    def smtp_configured(self) -> bool:
+        return bool(self.smtp_host and self.mail_sender)
 
     # Cache
     redis_url: str = "redis://localhost:6379/0"

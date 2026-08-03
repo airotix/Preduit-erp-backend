@@ -28,9 +28,12 @@ SystemSession = sessionmaker(bind=system_engine, autoflush=False, expire_on_comm
 
 @event.listens_for(app_engine, "checkout")
 def _clear_tenant_on_checkout(dbapi_conn, conn_record, conn_proxy):  # noqa: ANN001
-    """Reset tenant context whenever a pooled connection is handed out."""
+    """Reset tenant context whenever a pooled connection is handed out. Also
+    clears any RLS bypass flag defensively — the app engine must always stay
+    subject to Row-Level Security (only the system session may bypass)."""
     cur = dbapi_conn.cursor()
     cur.execute("EXEC sp_set_session_context @key=N'tenant_id', @value=NULL")
+    cur.execute("EXEC sp_set_session_context @key=N'rls_bypass', @value=NULL")
     cur.close()
 
 
@@ -57,9 +60,15 @@ def get_db(tenant_id: str) -> Iterator[Session]:
 
 @contextmanager
 def system_session() -> Iterator[Session]:
-    """Privileged session for provisioning (bypasses RLS). Use sparingly."""
+    """Privileged session for provisioning / pre-auth lookups. Opts out of RLS
+    via SESSION_CONTEXT('rls_bypass') so it is exempt even when the connection
+    isn't the erp_system principal (e.g. LocalDB Windows auth). Tenant-scoped
+    reads on this session still filter by tenant_id explicitly."""
     session = SystemSession()
     try:
+        session.execute(
+            text("EXEC sp_set_session_context @key=N'rls_bypass', @value=1")
+        )
         yield session
         session.commit()
     except Exception:

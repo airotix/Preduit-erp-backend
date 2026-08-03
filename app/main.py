@@ -1,10 +1,13 @@
 """Preduit ERP backend — FastAPI application entrypoint."""
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.modules.admin.router import router as admin_router
 from app.modules.ai.router import router as ai_router
+from app.modules.auth.router import router as auth_router
 from app.modules.catalog.router import router as catalog_router
 from app.modules.dashboards.router import router as dashboards_router
 from app.modules.documents.router import router as documents_router
@@ -28,19 +31,30 @@ app = FastAPI(
     openapi_url="/api/v1/openapi.json",
 )
 
-# Allow the Next.js dev server to call the API from the browser.
+# Fail fast if the app-issued JWT secret was never overridden outside dev — a
+# default secret means anyone can forge tokens.
+if settings.env != "dev" and settings.jwt_secret_is_default:
+    raise RuntimeError(
+        "JWT_SECRET is still the built-in dev default. Set a strong JWT_SECRET "
+        "(env / Key Vault) before running outside dev."
+    )
+if settings.jwt_secret_is_default:
+    logging.getLogger("uvicorn.error").warning(
+        "Using the default dev JWT secret — override JWT_SECRET before deploying."
+    )
+
+# Allow the configured browser origins to call the API (credentialed CORS).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
 API_V1 = "/api/v1"
+app.include_router(auth_router, prefix=API_V1)
 app.include_router(meta_router, prefix=API_V1)
 app.include_router(onboarding_router, prefix=API_V1)
 app.include_router(catalog_router, prefix=API_V1)
