@@ -38,6 +38,10 @@ if settings.env != "dev" and settings.jwt_secret_is_default:
         "JWT_SECRET is still the built-in dev default. Set a strong JWT_SECRET "
         "(env / Key Vault) before running outside dev."
     )
+# The dev auth bypass authenticates every request as a fixed admin — it must
+# never be enabled outside local dev.
+if settings.env != "dev" and settings.dev_auth_bypass:
+    raise RuntimeError("DEV_AUTH_BYPASS must be false outside dev.")
 if settings.jwt_secret_is_default:
     logging.getLogger("uvicorn.error").warning(
         "Using the default dev JWT secret — override JWT_SECRET before deploying."

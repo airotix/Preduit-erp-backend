@@ -10,9 +10,11 @@ ADMIN = "Admin"               # company owner — everything within their compan
 MANAGER = "Manager"
 MERCHANDISER = "Merchandiser"
 ACCOUNTANT = "Accountant"
+USER_OVERVIEW = "User Overview"   # read-only across the app
 LOGISTICS = "Logistics / Inventory"
 
-ROLES = [SUPER_ADMIN, ADMIN, MANAGER, MERCHANDISER, ACCOUNTANT, LOGISTICS]
+# Super Admin is platform-only; the rest are the assignable, per-company roles.
+ROLES = [SUPER_ADMIN, ADMIN, MANAGER, MERCHANDISER, ACCOUNTANT, USER_OVERVIEW, LOGISTICS]
 
 # Module read/write permission helpers.
 _MODULES = ["dashboard", "catalog", "inventory", "sales", "procurement",
@@ -38,6 +40,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
                  "production", "quality", "shipments") | _ro("finance", "ai"),
     MERCHANDISER: _rw("catalog", "inventory", "sales", "ai") | _ro("dashboard", "production"),
     ACCOUNTANT: _rw("finance") | _ro("dashboard", "sales", "procurement"),
+    USER_OVERVIEW: _ro(*_MODULES),  # read-only visibility across every module
     LOGISTICS: _rw("inventory", "shipments", "procurement", "production") | _ro("dashboard", "catalog"),
 }
 

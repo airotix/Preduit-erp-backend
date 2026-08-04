@@ -77,6 +77,19 @@ def _num(v) -> str:
     return f"{v:g}" if v is not None else "—"
 
 
+def _exporter_from_company(c: dict) -> dict:
+    """Build the invoice letterhead (our business) from the company profile."""
+    addr = ", ".join(p for p in [c.get("street"), c.get("city"), c.get("state"), c.get("postal")] if p)
+    return {
+        "name": c.get("name") or "",
+        "address": addr,
+        "country": c.get("country") or "",
+        "tel": c.get("phone") or c.get("support_line") or "",
+        "email": c.get("business_email") or "",
+        "taxId": c.get("tax_registration") or c.get("registration_number") or "",
+    }
+
+
 # ---------- Purchase orders ----------
 
 def pos_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
@@ -449,18 +462,17 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
     today = datetime.date.today().isoformat()
     # Document presentation: our business is the letterhead (top-left) card; the
     # supplier is shown as the counterparty in the right-hand box.
-    biz = repo.tenant_name(session) or ""
+    company = repo.company_info(session)
+    biz = company.get("name") or ""
     supplier_name = supplier.name if supplier else po.supplier_name
     return {
         "invoiceNo": "", "invoiceDate": today, "poNo": po.po_no or "",
         "orderDate": "", "deliveryDate": po.expected or "", "contact": "",
-        "incoterms": "FOB Karachi", "origin": "Pakistan", "currency": currency,
-        "terms": "T/T · L/C", "portLoading": "Karachi", "portDischarge": "",
-        # Left letterhead card = our business.
-        "exporter": {
-            "name": biz, "address": "", "country": "Pakistan",
-            "tel": "", "email": "", "taxId": "",
-        },
+        "incoterms": "FOB Karachi", "origin": company.get("country") or "Pakistan",
+        "currency": currency,
+        "terms": "T/T · L/C", "portLoading": company.get("city") or "Karachi", "portDischarge": "",
+        # Left letterhead card = our business (from the company profile).
+        "exporter": _exporter_from_company(company),
         # Right counterparty box = the supplier.
         "buyer": {
             "name": supplier_name,
@@ -469,7 +481,7 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
             "tel": (supplier.phone if supplier else "") or "",
             "email": (supplier.email if supplier else "") or "",
         },
-        "bank": {"beneficiary": biz, "bank": "", "branch": "",
+        "bank": {"beneficiary": company.get("legal_name") or biz, "bank": "", "branch": "",
                  "account": "", "swift": "", "corresp": ""},
         "articles": article_list,
         "totals": {

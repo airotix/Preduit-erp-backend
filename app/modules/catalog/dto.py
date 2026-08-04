@@ -17,6 +17,13 @@ class ProductCreate(BaseModel):
     onlinePrice: Decimal | None = None
     currency_code: str = "EUR"
     imageUrl: str | None = None
+    # Specifications
+    composition: str | None = Field(default=None, max_length=120)
+    gauge: str | None = Field(default=None, max_length=40)
+    care: str | None = Field(default=None, max_length=120)
+    origin: str | None = Field(default=None, max_length=80)
+    hsCode: str | None = Field(default=None, max_length=20)
+    weight: str | None = Field(default=None, max_length=20)
 
 
 class ProductUpdate(ProductCreate):

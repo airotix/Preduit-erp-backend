@@ -104,9 +104,12 @@ def save_product_matrix(session: Session, *, tenant_id, public_id: str, payload)
         color = (inv_repo.find_attr_value(session, attr_type="Color", value=name)
                  or inv_repo.create_color(session, tenant_id=tid, value=name, hex=col.hex))
         for cell in col.cells:
-            size = inv_repo.find_attr_value(session, attr_type="Size", value=cell.size)
-            if size is None:
+            if not (cell.size or "").strip():
                 continue
+            # Auto-create the size if the tenant hasn't set up its scale yet
+            # (mirrors colour creation) — otherwise the cell would be dropped.
+            size = (inv_repo.find_attr_value(session, attr_type="Size", value=cell.size)
+                    or inv_repo.create_size(session, tenant_id=tid, value=cell.size))
             variant = inv_repo.find_or_create_variant(
                 session, tenant_id=tid, product_id=product.id, color_id=color.id,
                 size_id=size.id, price=price, currency=currency)
@@ -124,6 +127,10 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
     def _minp(key: str) -> str:
         vals = [v[key] for v in variants if v.get(key) is not None]
         return f"€{min(vals):,.2f}" if vals else "—"
+
+    def _minraw(key: str) -> float | None:
+        vals = [v[key] for v in variants if v.get(key) is not None]
+        return float(min(vals)) if vals else None
 
     price_label = _minp("retail_price")
     prices = {"retail": _minp("retail_price"), "wholesale": _minp("wholesale_price"),
@@ -192,6 +199,23 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
             "specs": specs,
             "prices": prices,
             "image": prod.image_url or None,
+            # Raw values to prefill the in-place edit form.
+            "form": {
+                "title": prod.title,
+                "category": category or "",
+                "season": prod.season or "",
+                "status": prod.status,
+                "retailPrice": _minraw("retail_price"),
+                "wholesalePrice": _minraw("wholesale_price"),
+                "onlinePrice": _minraw("online_price"),
+                "imageUrl": prod.image_url or "",
+                "composition": prod.composition or "",
+                "gauge": prod.gauge or "",
+                "care": prod.care or "",
+                "origin": prod.origin or "",
+                "hsCode": prod.hs_code or "",
+                "weight": prod.weight or "",
+            },
         },
     }
 
@@ -225,7 +249,12 @@ def update_product(session: Session, *, tenant_id: str | UUID, public_id: str, p
         session, public_id=public_id, title=payload.title, category_id=category_id,
         season=payload.season, status=payload.status, retail=payload.retailPrice,
         wholesale=payload.wholesalePrice, online=payload.onlinePrice,
-        currency_code=payload.currency_code, image_url=payload.imageUrl,
+        currency_code=payload.currency_code,
+        # Pass the raw value ("" clears the image; None means "no change").
+        image_url=payload.imageUrl,
+        specs={"composition": payload.composition, "gauge": payload.gauge,
+               "care": payload.care, "origin": payload.origin,
+               "hsCode": payload.hsCode, "weight": payload.weight},
     )
     if product is not None:
         write_audit(session, tenant_id=tid, action="UPDATE", entity_type="product",

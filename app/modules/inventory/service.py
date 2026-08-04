@@ -159,9 +159,12 @@ def save_article_matrix(session: Session, *, tenant_id: str | UUID, public_id: s
         if color is None:
             color = repo.create_color(session, tenant_id=tid, value=name, hex=col.hex)
         for cell in col.cells:
-            size = repo.find_attr_value(session, attr_type="Size", value=cell.size)
-            if size is None:
+            if not (cell.size or "").strip():
                 continue
+            # Auto-create the size if the tenant hasn't configured its scale
+            # (mirrors colour creation) — otherwise the cell would be dropped.
+            size = (repo.find_attr_value(session, attr_type="Size", value=cell.size)
+                    or repo.create_size(session, tenant_id=tid, value=cell.size))
             variant = repo.find_or_create_variant(
                 session, tenant_id=tid, product_id=product.id, color_id=color.id,
                 size_id=size.id, price=price, currency=currency,

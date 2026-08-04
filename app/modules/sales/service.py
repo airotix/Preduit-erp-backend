@@ -398,6 +398,19 @@ def _size_rank(s: str) -> int:
     return _SIZE_ORDER.index(u) if u in _SIZE_ORDER else len(_SIZE_ORDER) + 1
 
 
+def _exporter_from_company(c: dict) -> dict:
+    """Build the invoice letterhead (our business) from the company profile."""
+    addr = ", ".join(p for p in [c.get("street"), c.get("city"), c.get("state"), c.get("postal")] if p)
+    return {
+        "name": c.get("name") or "",
+        "address": addr,
+        "country": c.get("country") or "",
+        "tel": c.get("phone") or c.get("support_line") or "",
+        "email": c.get("business_email") or "",
+        "taxId": c.get("tax_registration") or c.get("registration_number") or "",
+    }
+
+
 def _channel_price(variant: dict | None, invoice_type: str, fallback) -> float:
     """Pick the price for the selected invoice type; fall back to the variant's
     base price, then to the order line's recorded price."""
@@ -421,11 +434,12 @@ def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: 
     variants = repo.variants_by_sku(session, skus=[l["sku"] for l in lines])
     customer = repo._customer_by_id(session, order.customer_id)
     currency = order.currency_code or "USD"
-    biz = repo.tenant_name(session) or ""
+    company = repo.company_info(session)
+    biz = company.get("legal_name") or company.get("name") or ""
     today = datetime.date.today().isoformat()
     order_date = order.order_date.isoformat() if order.order_date else ""
 
-    exporter = {"name": biz, "address": "", "country": "", "tel": "", "email": "", "taxId": ""}
+    exporter = _exporter_from_company(company)
     buyer = {
         "name": customer.name if customer else order.customer_name,
         "phone": (customer.phone if customer else "") or "",

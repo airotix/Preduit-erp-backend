@@ -55,3 +55,19 @@ class AcceptInvitationRequest(BaseModel):
 class UpdateUserRequest(BaseModel):
     role: str | None = Field(default=None, max_length=60)
     isActive: bool | None = None
+
+
+class SetupInvite(BaseModel):
+    email: str = Field(min_length=3, max_length=256)
+    role: str = Field(min_length=1, max_length=60)
+
+
+class CompanySetupRequest(BaseModel):
+    """Payload for the post-signup company setup wizard (Outlets/Modules/Team)."""
+    companyName: str = Field(min_length=1, max_length=200)
+    country: str | None = Field(default=None, max_length=80)
+    city: str | None = Field(default=None, max_length=120)
+    currency: str = Field(min_length=3, max_length=3)
+    taxRegistration: str | None = Field(default=None, max_length=60)
+    modules: list[str] = Field(default_factory=list)
+    invites: list[SetupInvite] = Field(default_factory=list)

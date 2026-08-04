@@ -161,6 +161,16 @@ def tenant_name(session: Session) -> str | None:
     )).scalar()
 
 
+def company_info(session: Session) -> dict:
+    """Our own company's profile fields — for the invoice letterhead block."""
+    row = session.execute(text(
+        "SELECT name, legal_name, tax_registration, registration_number, base_currency_code, "
+        "country, city, [state], postal, street, business_email, phone, support_line, website, logo_doc_id "
+        "FROM dbo.tenants WHERE id = CAST(SESSION_CONTEXT(N'tenant_id') AS UNIQUEIDENTIFIER)"
+    )).mappings().first()
+    return dict(row) if row else {}
+
+
 def product_images(session: Session) -> dict[str, str]:
     """Map product title → image URL (for pulling article photos onto invoices)."""
     rows = session.execute(

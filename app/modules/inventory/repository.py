@@ -174,6 +174,30 @@ def create_color(session: Session, *, tenant_id: UUID, value: str, hex: str | No
     return av
 
 
+# Canonical apparel scale (matches the dev seed) — used to order auto-created sizes.
+_SIZE_ORDER = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL", "7XL"]
+
+
+def create_size(session: Session, *, tenant_id: UUID, value: str) -> AttributeValue:
+    """Create a Size attribute value on the fly (mirrors create_color) so saving
+    a product matrix works for tenants that haven't set up their size scale."""
+    v = (value or "").strip()
+    base = "".join(ch for ch in v.upper() if ch.isalnum())[:6] or "SZ"
+    code, n = base, 1
+    while session.execute(
+        select(AttributeValue.id).where(AttributeValue.code == code)
+    ).scalar_one_or_none() is not None:
+        n += 1
+        code = f"{base}{n}"
+    order = _SIZE_ORDER.index(v.upper()) + 1 if v.upper() in _SIZE_ORDER else 90
+    av = AttributeValue(tenant_id=tenant_id, attr_type="Size", value=v,
+                        code=code, sort_order=order)
+    session.add(av)
+    session.flush()
+    session.refresh(av)
+    return av
+
+
 def find_or_create_variant(session: Session, *, tenant_id: UUID, product_id: int,
                            color_id: int, size_id: int, price: Decimal,
                            currency: str) -> ProductVariant:

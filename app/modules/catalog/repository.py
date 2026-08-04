@@ -103,13 +103,21 @@ def list_colors(session: Session) -> list[dict]:
     )]
 
 
+# Fallback size scale when the tenant hasn't set up any Size attribute values —
+# so product matrices and PO/Order size breakdowns still show columns to fill.
+# Matches the dev tenant's seeded scale (seed_dev_sizes.sql): XS … 7XL.
+_DEFAULT_SIZES = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL", "7XL"]
+
+
 def list_sizes(session: Session) -> list[str]:
-    """All Size attribute values, in scale order (for PO size breakdowns)."""
-    return [r[0] for r in session.execute(
+    """All Size attribute values, in scale order (for PO size breakdowns).
+    Falls back to a default scale when none are configured."""
+    sizes = [r[0] for r in session.execute(
         select(AttributeValue.value)
         .where(AttributeValue.attr_type == "Size")
         .order_by(AttributeValue.sort_order, AttributeValue.value)
     )]
+    return sizes or list(_DEFAULT_SIZES)
 
 
 def default_price(session: Session) -> tuple[float | None, str | None]:
@@ -153,7 +161,8 @@ def create_product(session: Session, *, tenant_id: UUID, title: str,
 
 def update_product(session: Session, *, public_id: str, title: str, category_id: int | None,
                    season: str | None, status: str, retail=None, wholesale=None,
-                   online=None, currency_code: str = "EUR", image_url=None) -> Product | None:
+                   online=None, currency_code: str = "EUR", image_url=None,
+                   specs: dict | None = None) -> Product | None:
     product = session.execute(
         select(Product).where(Product.public_id == public_id,
                               Product.is_deleted == False)  # noqa: E712
@@ -166,6 +175,13 @@ def update_product(session: Session, *, public_id: str, title: str, category_id:
     product.status = status
     if image_url is not None:
         product.image_url = image_url or None
+    if specs is not None:
+        product.composition = (specs.get("composition") or "").strip() or None
+        product.gauge = (specs.get("gauge") or "").strip() or None
+        product.care = (specs.get("care") or "").strip() or None
+        product.origin = (specs.get("origin") or "").strip() or None
+        product.hs_code = (specs.get("hsCode") or "").strip() or None
+        product.weight = (specs.get("weight") or "").strip() or None
     session.flush()
     # If any price was supplied, apply it to the first variant (create one with an
     # auto SKU if none exists). Only the prices provided are changed.

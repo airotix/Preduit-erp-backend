@@ -5,6 +5,7 @@ because there's no tenant context until a token is issued.
 """
 import datetime
 import hashlib
+import json
 import re
 import secrets
 import uuid
@@ -91,7 +92,9 @@ def _profile(db, user: User) -> dict:
         "isPlatformAdmin": bool(user.is_platform_admin),
         "isOwner": bool(user.is_owner),
         "company": {"id": str(user.tenant_id) if user.tenant_id else None,
-                    "name": tenant.name if tenant else None},
+                    "name": tenant.name if tenant else None,
+                    "currency": tenant.base_currency_code if tenant else None,
+                    "setupComplete": bool(tenant.setup_complete) if tenant else True},
     }
 
 
@@ -302,6 +305,122 @@ def register_company(*, company_name: str, owner_name: str, email: str,
         if _dev_reveal():
             issued["devVerifyCode"] = code
         return issued
+
+
+def complete_company_setup(*, tenant_id: str, actor_public_id: str | None,
+                           company_name: str, country: str | None, city: str | None,
+                           currency: str, tax_registration: str | None,
+                           modules: list[str]) -> dict:
+    """Persist the post-signup wizard's Outlets + Modules steps and mark the
+    company set up. Team invites (step 3) are created separately via
+    create_invitation so each gets its own token/email. Returns the refreshed
+    profile so the client can update the signed-in user."""
+    with system_session() as db:
+        _set_tenant(db, tenant_id)
+        tenant = db.get(Tenant, _tid(tenant_id))
+        if tenant is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found.")
+        tenant.name = company_name.strip()
+        tenant.base_currency_code = (currency or tenant.base_currency_code).upper()[:3]
+        tenant.country = (country or "").strip() or None
+        tenant.city = (city or "").strip() or None
+        tenant.tax_registration = (tax_registration or "").strip() or None
+        tenant.setup_complete = True
+        # Persist enabled modules as a JSON list in system_settings (idempotent).
+        db.execute(text("DELETE FROM dbo.system_settings WHERE tenant_id=:t AND [key]='enabled_modules'"),
+                   {"t": str(tenant_id)})
+        db.execute(text("INSERT INTO dbo.system_settings (tenant_id,[key],value) VALUES (:t,'enabled_modules',:v)"),
+                   {"t": str(tenant_id), "v": json.dumps(modules or [])})
+        user = None
+        if actor_public_id:
+            user = db.execute(select(User).where(User.public_id == actor_public_id)).scalars().first()
+        return _profile(db, user) if user else {"company": {"id": str(tenant_id), "name": tenant.name,
+                                                            "currency": tenant.base_currency_code,
+                                                            "setupComplete": True}}
+
+
+def _profile_from_tenant(t: Tenant) -> dict:
+    """Project the company-profile columns into the frontend's JSON shape."""
+    return {
+        "companyName": t.name or "",
+        "about": t.about or "",
+        "logoDocId": t.logo_doc_id,
+        "coverDocId": t.cover_doc_id,
+        "industry": t.industry or "",
+        "businessType": t.business_type or "",
+        "salesModel": t.sales_model or "",
+        "founded": t.founded or "",
+        "street": t.street or "",
+        "country": t.country or "",
+        "city": t.city or "",
+        "state": t.state or "",
+        "postal": t.postal or "",
+        "businessEmail": t.business_email or "",
+        "phone": t.phone or "",
+        "supportLine": t.support_line or "",
+        "openingHours": t.opening_hours or "",
+        "website": t.website or "",
+        "linkedin": t.social_linkedin or "",
+        "instagram": t.social_instagram or "",
+        "facebook": t.social_facebook or "",
+        "x": t.social_x or "",
+        "legalName": t.legal_name or "",
+        "sameAsCompany": bool(t.legal_same_as_company),
+        "registrationNumber": t.registration_number or "",
+        "taxNumber": t.tax_registration or "",
+    }
+
+
+def _clean(v) -> str | None:
+    """Trimmed string, or None when empty — keeps columns clean/queryable."""
+    s = (v or "").strip() if isinstance(v, str) else v
+    return s or None
+
+
+def get_company_profile(tenant_id: str) -> dict:
+    with system_session() as db:
+        _set_tenant(db, tenant_id)
+        tenant = db.get(Tenant, _tid(tenant_id))
+        if tenant is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found.")
+        return _profile_from_tenant(tenant)
+
+
+def save_company_profile(tenant_id: str, p: dict) -> dict:
+    with system_session() as db:
+        _set_tenant(db, tenant_id)
+        t = db.get(Tenant, _tid(tenant_id))
+        if t is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found.")
+        if (p.get("companyName") or "").strip():
+            t.name = p["companyName"].strip()
+        t.about = _clean(p.get("about"))
+        t.logo_doc_id = _clean(p.get("logoDocId"))
+        t.cover_doc_id = _clean(p.get("coverDocId"))
+        t.industry = _clean(p.get("industry"))
+        t.business_type = _clean(p.get("businessType"))
+        t.sales_model = _clean(p.get("salesModel"))
+        t.founded = _clean(p.get("founded"))
+        t.street = _clean(p.get("street"))
+        t.country = _clean(p.get("country"))
+        t.city = _clean(p.get("city"))
+        t.state = _clean(p.get("state"))
+        t.postal = _clean(p.get("postal"))
+        t.business_email = _clean(p.get("businessEmail"))
+        t.phone = _clean(p.get("phone"))
+        t.support_line = _clean(p.get("supportLine"))
+        t.opening_hours = _clean(p.get("openingHours"))
+        t.website = _clean(p.get("website"))
+        t.social_linkedin = _clean(p.get("linkedin"))
+        t.social_instagram = _clean(p.get("instagram"))
+        t.social_facebook = _clean(p.get("facebook"))
+        t.social_x = _clean(p.get("x"))
+        t.legal_name = _clean(p.get("legalName"))
+        t.legal_same_as_company = bool(p.get("sameAsCompany"))
+        t.registration_number = _clean(p.get("registrationNumber"))
+        t.tax_registration = _clean(p.get("taxNumber"))
+        db.flush()
+        return _profile_from_tenant(t)
 
 
 def dev_bootstrap() -> dict:
