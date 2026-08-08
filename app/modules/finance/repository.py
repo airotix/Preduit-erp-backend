@@ -27,16 +27,20 @@ def _sum_accounts(session, *conds) -> float:
 
 
 def overview_metrics(session: Session) -> dict:
-    """Consolidated finance position for the Overview screen (all real data)."""
-    # Cash & bank — asset accounts named cash/bank.
-    cash_rows = session.execute(
-        select(Account.balance).where(
-            Account.is_deleted == False,  # noqa: E712
-            Account.acct_type == "Asset",
-            or_(Account.name.ilike("%cash%"), Account.name.ilike("%bank%")),
-        )
-    ).scalars().all()
-    cash_total = float(sum(cash_rows) or 0)
+    """Consolidated finance position for the Overview screen — cash & P&L derived
+    from posted GL (trial balance) so they match the statements; AR/AP from the
+    open subledger documents."""
+    mags = account_magnitudes(session)
+
+    def _sum(pred) -> float:
+        return round(sum(m["amount"] for m in mags if pred(m)), 2)
+
+    def _is_cash(m) -> bool:
+        n = (m["name"] or "").lower()
+        return m["acct_type"] == "Asset" and ("cash" in n or "bank" in n)
+
+    cash_total = _sum(_is_cash)
+    cash_count = sum(1 for m in mags if _is_cash(m))
 
     # AR — unpaid customer invoices.
     ar_rows = session.execute(
@@ -56,15 +60,17 @@ def overview_metrics(session: Session) -> dict:
     ).scalars().all()
     ap_total = float(sum(ap_rows) or 0)
 
-    revenue = _sum_accounts(session, Account.acct_type.in_(["Income", "Revenue"]))
-    cogs = _sum_accounts(session, Account.acct_type == "Expense",
-                         or_(Account.name.ilike("%cost of goods%"), Account.name.ilike("%cogs%")))
-    expense_total = _sum_accounts(session, Account.acct_type == "Expense")
+    revenue = _sum(lambda m: m["acct_type"] in ("Income", "Revenue"))
+    cogs = _sum(lambda m: m["acct_type"] == "Expense"
+                and ("cost of goods" in (m["name"] or "").lower()
+                     or "cogs" in (m["name"] or "").lower()))
+    expense_total = _sum(lambda m: m["acct_type"] == "Expense")
     opex = max(expense_total - cogs, 0.0)
-    tax = _sum_accounts(session, or_(Account.name.ilike("%vat%"), Account.name.ilike("%income tax%")))
+    tax = _sum(lambda m: "vat" in (m["name"] or "").lower()
+               or "income tax" in (m["name"] or "").lower())
 
     return {
-        "cash_total": cash_total, "cash_count": len(cash_rows),
+        "cash_total": cash_total, "cash_count": cash_count,
         "ar_total": ar_total, "ar_count": len(ar_rows),
         "ap_total": ap_total, "ap_count": len(ap_rows),
         "revenue": revenue, "cogs": cogs, "opex": opex, "tax": tax,
@@ -701,6 +707,18 @@ def trial_balance(session: Session) -> list[dict]:
             "credit": -net if net < 0 else 0.0,
         })
     return rows
+
+
+def account_magnitudes(session: Session) -> list[dict]:
+    """Each account's balance as a positive magnitude (posted journals + opening),
+    the single source of truth used by the Overview KPIs and finance dashboards.
+    Derived from `trial_balance` so it always matches the financial statements."""
+    out = []
+    for r in trial_balance(session):
+        mag = r["net"] if r["normal_side"] == "D" else -r["net"]
+        out.append({"code": r["code"], "name": r["name"],
+                    "acct_type": r["acct_type"], "amount": round(mag, 2)})
+    return out
 
 
 def get_or_create_account(session: Session, *, tenant_id: UUID, code: str, name: str,

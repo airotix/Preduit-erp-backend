@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.finance import Account, SupplierBill as APBill
+from app.modules.finance import repository as fin_repo
 from app.models.inventory import Location, ReorderAlert, StockLevel, StockTransfer
 from app.models.procurement import PurchaseOrder
 from app.models.production import ProductionOrder
@@ -168,7 +169,8 @@ def overview(session: Session) -> dict:
         select(func.count()).select_from(StockLevel)
         .where((StockLevel.on_hand - StockLevel.reserved) <= 0)
     ).scalar_one()
-    health = 100 if not total_stock else round((1 - out_stock / total_stock) * 100)
+    # No stock on hand → 0% health (an empty catalog isn't "100% healthy").
+    health = 0 if not total_stock else round((1 - out_stock / total_stock) * 100)
 
     donut, total_orders = _channel_donut(session)
 
@@ -204,10 +206,13 @@ def overview(session: Session) -> dict:
 
     return {
         "metricsList": [
-            {"label": "Net revenue", "value": _eurc(revenue), "delta": d_val, "up": d_up},
-            {"label": "Open orders", "value": f"{open_orders:,}"},
-            {"label": "Units shipped", "value": f"{units_shipped:,}"},
-            {"label": "Stock health", "value": f"{health}%"},
+            {"label": "Net revenue", "value": _eurc(revenue), "delta": d_val, "up": d_up,
+             "sub": "Year to date"},
+            {"label": "Open orders", "value": f"{open_orders:,}", "sub": "Awaiting fulfilment"},
+            {"label": "Units shipped", "value": f"{units_shipped:,}", "sub": "Shipped orders"},
+            {"label": "Stock health", "value": f"{health}%",
+             "sub": ("No stock on hand" if not total_stock
+                     else f"{reorder} SKU{'' if reorder == 1 else 's'} low")},
         ],
         "bars": bars,
         "donut": donut, "donutTotal": f"{total_orders:,}",
@@ -419,22 +424,35 @@ def proddash(session: Session) -> dict:
 # --------------------------------------------------------------------------- #
 def findash(session: Session) -> dict:
     bars, _totals = _monthly_revenue(session)
-    cash = _bal(session, "1000")
-    ar = _bal(session, "1100")
-    ap = _bal(session, "2000")
-    revenue = _bal(session, "4000")
+    # Cash & revenue from posted GL (trial balance) — matches the finance module;
+    # AR/AP from the open subledger documents (the source of truth for those).
+    mags = fin_repo.account_magnitudes(session)
 
-    # Donut: top asset accounts (cash & assets)
-    asset_rows = session.execute(
-        select(Account.name, Account.balance)
-        .where(Account.acct_type == "Asset", Account.is_deleted == False)  # noqa: E712
-        .order_by(Account.balance.desc()).limit(4)
-    ).all()
-    assets_total = sum(float(b or 0) for _, b in asset_rows) or 0.0
-    donut = [{"label": n,
-              "value": f"{round(float(b or 0) / assets_total * 100) if assets_total else 0}%",
-              "pct": round(float(b or 0) / assets_total * 100) if assets_total else 0}
-             for n, b in asset_rows]
+    def _name(m):
+        return (m["name"] or "").lower()
+
+    def _summ(pred):
+        return round(sum(m["amount"] for m in mags if pred(m)), 2)
+
+    cash = _summ(lambda m: m["acct_type"] == "Asset" and ("cash" in _name(m) or "bank" in _name(m)))
+    revenue = _summ(lambda m: m["acct_type"] in ("Income", "Revenue"))
+    ar = float(session.execute(
+        select(func.coalesce(func.sum(ARInvoice.amount), 0))
+        .where(ARInvoice.is_deleted == False, ARInvoice.status.notin_(["Paid", "Void"]))  # noqa: E712
+    ).scalar_one() or 0)
+    ap = float(session.execute(
+        select(func.coalesce(func.sum(APBill.amount), 0))
+        .where(APBill.is_deleted == False, APBill.status != "Paid")  # noqa: E712
+    ).scalar_one() or 0)
+
+    # Donut: top asset accounts (cash & assets) from posted balances.
+    assets = sorted((m for m in mags if m["acct_type"] == "Asset"),
+                    key=lambda m: m["amount"], reverse=True)[:4]
+    assets_total = sum(m["amount"] for m in assets) or 0.0
+    donut = [{"label": m["name"],
+              "value": f"{round(m['amount'] / assets_total * 100) if assets_total else 0}%",
+              "pct": round(m["amount"] / assets_total * 100) if assets_total else 0}
+             for m in assets]
 
     # Table: largest open balances (AR + AP)
     today = datetime.date.today()

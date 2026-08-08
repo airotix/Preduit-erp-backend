@@ -33,16 +33,17 @@ def _tid(tenant_id: str | UUID) -> UUID:
 
 def customers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
     rows, total = repo.list_customers(session, limit=limit, offset=offset)
-    grid = [
-        [
+    stats = repo.order_stats_by_customer(session)
+    grid = []
+    for r in rows:
+        orders, lifetime = stats.get(r["name"], (0, 0.0))
+        grid.append([
             text_cell(r["name"], avatar=True, sub=r["email"]),
             text_cell(r["kind"], badge=_TYPE_TONE.get(r["kind"], "neutral")),
             r["region"] or "—",
-            text_cell("0", align="center", mono=True),   # orders — wired when Orders lands
-            text_cell("—", align="right", mono=True, strong=True),  # lifetime value
-        ]
-        for r in rows
-    ]
+            text_cell(str(orders), align="center", mono=True),
+            text_cell(_money(lifetime) if orders else "—", align="right", mono=True, strong=True),
+        ])
     return list_config(
         columns=[
             {"label": "Customer"}, {"label": "Type"}, {"label": "Region"},
@@ -104,14 +105,43 @@ def orders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict
 
 def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreate):
     tid = _tid(tenant_id)
-    customer_id = repo.find_customer_id(session, name=payload.customer)
+    name = payload.customer.strip()
+    customer_id = repo.find_customer_id(session, name=name)
+    if customer_id is None:
+        # Auto-register a customer we haven't seen before, so they show up in
+        # the Customers tab and can be reused on future orders.
+        kind = "Wholesale" if payload.channel == "Wholesale" else "Retail"
+        cust = repo.create_customer(
+            session, tenant_id=tid, name=name, email="", kind=kind,
+            region=None, phone=None, address=None,
+        )
+        customer_id = cust.id
     lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku,
               "qty": l.qty, "price": l.price}
              for l in payload.lines]
-    return repo.create_order(
+    order = repo.create_order(
         session, tenant_id=tid, customer_id=customer_id, customer_name=payload.customer,
         channel=payload.channel, lines=lines,
     )
+    # Kick off production: one work order for the whole sales order, linked back
+    # to it so its detail can show the order's line items (Production → Orders).
+    from app.modules.production import repository as prod_repo
+    total_qty = sum(int(l["qty"] or 0) for l in lines)
+    names: list[str] = []
+    for l in lines:
+        nm = (l["name"] or "").strip()
+        if nm and nm not in names:
+            names.append(nm)
+    if total_qty > 0:
+        if len(names) == 1:
+            style_label = names[0]
+        elif names:
+            style_label = f"{names[0]} +{len(names) - 1} more"
+        else:
+            style_label = order.order_no or "Order"
+        prod_repo.create_porder(session, tenant_id=tid, style=style_label, factory=None,
+                                qty=total_qty, sales_order_id=order.id)
+    return order
 
 
 # ---------- Fulfillment board ----------
@@ -180,10 +210,15 @@ def create_invoice(session: Session, *, tenant_id: str | UUID, payload: InvoiceC
     customer_id = repo.find_customer_id(session, name=payload.customer)
     due_on = _parse_date(payload.dueDate)
     due_display = due_on.strftime("%d %b %Y") if due_on else payload.dueDate
-    return repo.create_invoice(
+    inv = repo.create_invoice(
         session, tenant_id=tid, customer_id=customer_id, customer_name=payload.customer,
         amount=payload.amount, due_date=due_display, due_on=due_on,
     )
+    # Post the new receivable to the GL at transaction time (local import avoids
+    # a module-load cycle: finance depends on sales models).
+    from app.modules.finance import service as fin_service
+    fin_service.post_unposted(session, tenant_id=tid)
+    return inv
 
 
 # ---------- Returns ----------

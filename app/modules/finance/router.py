@@ -16,8 +16,11 @@ router = APIRouter(prefix="/finance", tags=["finance"])
 
 
 @router.get("/overview")
-def finance_overview(currency: str = Query("PKR"), db: Session = Depends(tenant_db)):
-    return service.convert(db, service.overview_screen(db), currency=currency)
+def finance_overview(currency: str = Query("PKR"),
+                     principal: Principal = Depends(require_tenant),
+                     db: Session = Depends(tenant_db)):
+    return service.convert(db, service.overview_screen(db, tenant_id=principal.tenant_id),
+                           currency=currency)
 
 
 # ---- Exchange rates (dated; keeps the currency conversion current) ----

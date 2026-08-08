@@ -256,8 +256,12 @@ def statements(session: Session, *, tenant_id) -> dict:
     }
 
 
-def overview_screen(session: Session) -> dict:
-    """Finance Overview payload: KPIs, revenue/COGS series, margin waterfall, recent JEs."""
+def overview_screen(session: Session, *, tenant_id=None) -> dict:
+    """Finance Overview payload: KPIs, revenue/COGS series, margin waterfall, recent JEs.
+    Auto-posts unposted subledger docs first (like statements) so the numbers are
+    current and consistent with the Reports screen."""
+    if tenant_id is not None:
+        post_unposted(session, tenant_id=tenant_id)
     m = repo.overview_metrics(session)
     revenue, cogs, opex, tax = m["revenue"], m["cogs"], m["opex"], m["tax"]
     gross = revenue - cogs
@@ -798,7 +802,9 @@ def _payment_fields(p) -> dict:
 
 
 def create_payment(session, *, tenant_id, payload: PaymentCreate):
-    return repo.create_payment(session, tenant_id=_tid(tenant_id), **_payment_fields(payload))
+    p = repo.create_payment(session, tenant_id=_tid(tenant_id), **_payment_fields(payload))
+    post_unposted(session, tenant_id=tenant_id)  # post to the GL at transaction time
+    return p
 
 
 def update_payment(session, *, public_id: str, payload: PaymentUpdate):
@@ -910,7 +916,9 @@ def _bill_fields(p) -> dict:
 
 
 def create_bill(session, *, tenant_id, payload: BillCreate):
-    return repo.create_bill(session, tenant_id=_tid(tenant_id), **_bill_fields(payload))
+    bill = repo.create_bill(session, tenant_id=_tid(tenant_id), **_bill_fields(payload))
+    post_unposted(session, tenant_id=tenant_id)  # post to the GL at transaction time
+    return bill
 
 
 def update_bill(session, *, public_id: str, payload: BillUpdate):

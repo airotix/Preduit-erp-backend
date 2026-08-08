@@ -65,6 +65,17 @@ def find_customer_id(session: Session, *, name: str) -> int | None:
     ).scalar_one_or_none()
 
 
+def order_stats_by_customer(session: Session) -> dict[str, tuple[int, float]]:
+    """Per-customer order count + lifetime value, keyed by customer name."""
+    rows = session.execute(
+        select(SalesOrder.customer_name, func.count(),
+               func.coalesce(func.sum(SalesOrder.total), 0))
+        .where(SalesOrder.is_deleted == False)  # noqa: E712
+        .group_by(SalesOrder.customer_name)
+    ).all()
+    return {name: (int(cnt), float(tot or 0)) for name, cnt, tot in rows}
+
+
 # ---------- Orders ----------
 
 def list_orders(session: Session, *, limit: int, offset: int) -> tuple[list[dict], int]:

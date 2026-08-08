@@ -35,9 +35,18 @@ def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
             price, ccy = float(r["price"]), r["currency_code"]
         else:  # product has no priced variant yet → tenant default
             price, ccy = (fallback_price or 0.0), fallback_ccy
+        # Per-channel prices for order-line pricing; fall back to the base price.
+        def _chan(key: str) -> float:
+            v = r.get(key)
+            return float(v) if v is not None else price
         out.append({
             "name": r["title"], "price": price, "currency": ccy or "EUR",
             "colors": r.get("colors", []),
+            "prices": {
+                "retail": _chan("retail"),
+                "online": _chan("online"),
+                "wholesale": _chan("wholesale"),
+            },
         })
     return out
 

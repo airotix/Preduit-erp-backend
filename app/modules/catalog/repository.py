@@ -66,6 +66,9 @@ def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
             Product.id,
             Product.title,
             func.min(ProductVariant.price).label("price"),
+            func.min(ProductVariant.retail_price).label("retail"),
+            func.min(ProductVariant.online_price).label("online"),
+            func.min(ProductVariant.wholesale_price).label("wholesale"),
             func.min(ProductVariant.currency_code).label("currency_code"),
         )
         .outerjoin(ProductVariant, ProductVariant.product_id == Product.id)

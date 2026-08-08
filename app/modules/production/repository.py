@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.production import BomLine, ProductionOrder, ProductionStage
+from app.models.sales import SalesOrder, SalesOrderLine
 from app.models.shipments import Shipment
 
 
@@ -59,9 +60,10 @@ def list_porders_all(session):
     )]
 
 
-def create_porder(session: Session, *, tenant_id: UUID, style, factory, qty) -> ProductionOrder:
+def create_porder(session: Session, *, tenant_id: UUID, style, factory, qty,
+                  sales_order_id: int | None = None) -> ProductionOrder:
     po = ProductionOrder(tenant_id=tenant_id, style=style, factory=factory, qty=qty,
-                         stage="Trims", progress=0)
+                         stage="Trims", progress=0, sales_order_id=sales_order_id)
     session.add(po)
     session.flush()
     po.order_no = f"MO-{3300 + po.id}"
@@ -111,7 +113,18 @@ def get_porder_detail(session: Session, *, public_id: str) -> dict | None:
         select(BomLine.component, BomLine.material, BomLine.qty_per_unit, BomLine.cost)
         .where(BomLine.style == po.style, BomLine.is_deleted == False)  # noqa: E712
     )]
-    return {"order": po, "materials": materials, "stages": list_stages(session, po.id)}
+    # The originating sales order + its line items (for the Summary tab).
+    sales_order, order_lines = None, []
+    if po.sales_order_id:
+        sales_order = session.get(SalesOrder, po.sales_order_id)
+        order_lines = [dict(r._mapping) for r in session.execute(
+            select(SalesOrderLine.name, SalesOrderLine.color, SalesOrderLine.size,
+                   SalesOrderLine.qty, SalesOrderLine.price, SalesOrderLine.line_total)
+            .where(SalesOrderLine.order_id == po.sales_order_id)
+            .order_by(SalesOrderLine.id)
+        )]
+    return {"order": po, "materials": materials, "stages": list_stages(session, po.id),
+            "sales_order": sales_order, "order_lines": order_lines}
 
 
 # ---------- Production stage timeline ----------

@@ -145,7 +145,18 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
     if data is None:
         return None
     po, mats, stages = data["order"], data["materials"], data["stages"]
+    sales_order, order_lines = data.get("sales_order"), data.get("order_lines") or []
     today = datetime.date.today()
+
+    def _money(v) -> str:
+        return f"€{float(v or 0):,.2f}"
+
+    order_lines_out = [
+        {"item": l["name"], "color": (l["color"] or ""), "size": (l["size"] or "—"),
+         "qty": int(l["qty"] or 0), "price": _money(l["price"]), "total": _money(l["line_total"])}
+        for l in order_lines
+    ]
+    order_total = _money(sum(float(l["line_total"] or 0) for l in order_lines))
     started = len(stages) > 0
     completed = sum(1 for s in stages if s.status == "Completed")
     progress = round(completed / len(stages) * 100) if stages else 0
@@ -186,17 +197,26 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
                 alert = {"type": "waiting",
                          "message": f"“{active.name}” is waiting to start."}
 
+    meta = []
+    if sales_order is not None:
+        meta.append({"k": "Order", "v": sales_order.order_no or "—"})
+        meta.append({"k": "Customer", "v": sales_order.customer_name or "—"})
+    else:
+        meta.append({"k": "Factory", "v": po.factory or "—"})
+    meta += [
+        {"k": "Qty", "v": f"{po.qty:,}"},
+        {"k": "Stage", "v": po.stage},
+        {"k": "Progress", "v": f"{progress}%"},
+    ]
+
     return {
         "ref": po.order_no or "—",
         "title": po.style,
         "statusLabel": status_label,
         "statusTone": _STAGE_TONE.get(po.stage, "amber") if started else "neutral",
-        "meta": [
-            {"k": "Factory", "v": po.factory or "—"},
-            {"k": "Qty", "v": f"{po.qty:,}"},
-            {"k": "Stage", "v": po.stage},
-            {"k": "Progress", "v": f"{progress}%"},
-        ],
+        "meta": meta,
+        "orderLines": order_lines_out,
+        "orderTotal": order_total,
         "started": started,
         "progress": progress,
         "alert": alert,
