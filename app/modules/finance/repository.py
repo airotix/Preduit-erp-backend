@@ -2,13 +2,13 @@
 import datetime
 from uuid import UUID
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.models.catalog import Category, Product
 from app.models.finance import (
     Account, BankAccount, BankTransaction, BudgetLine, CreditNote, FiscalPeriod,
-    FixedAsset, JournalEntry, JournalLine, Payment, SupplierBill,
+    FixedAsset, JournalEntry, JournalLine, LedgerEntry, Payment, SupplierBill,
 )
 from app.models.procurement import Supplier
 from app.models.sales import Customer, Invoice, SalesOrderLine
@@ -426,18 +426,28 @@ def _parse_dm(s) -> datetime.date | None:
     return None
 
 
-def _customer_entries(session: Session, customer_id: int) -> list[dict]:
+def _customer_entries(session: Session, customer_id: int, customer_name: str | None = None) -> list[dict]:
+    """Ledger entries for a customer. Match invoices/receipts by customer_id OR
+    matching customer name, so documents that were only name-linked (customer_id
+    null or set before the customer existed) still appear on the ledger."""
     entries: list[dict] = []
+    inv_match = [Invoice.customer_id == customer_id]
+    pay_match = [and_(Payment.party_type == "customer", Payment.party_id == customer_id)]
+    if customer_name:
+        inv_match.append(Invoice.customer_name == customer_name)
+        pay_match.append(Payment.party == customer_name)
     for inv in session.execute(
-        select(Invoice).where(Invoice.is_deleted == False,  # noqa: E712
-                              Invoice.customer_id == customer_id)
+        select(Invoice).where(Invoice.is_deleted == False, or_(*inv_match))  # noqa: E712
     ).scalars():
         entries.append({"date": inv.issued_date, "ref": inv.invoice_no or "INV",
-                        "desc": "Sales invoice", "debit": float(inv.amount or 0), "credit": 0.0})
+                        "desc": "Sales invoice", "debit": float(inv.amount or 0), "credit": 0.0,
+                        "kind": "invoice", "public_id": str(inv.public_id),
+                        "paid": inv.status == "Paid", "base_amount": float(inv.amount or 0)})
     for p in session.execute(
-        select(Payment).where(Payment.is_deleted == False,  # noqa: E712
-                              Payment.party_type == "customer", Payment.party_id == customer_id,
-                              Payment.pay_type == "Receipt")
+        select(Payment).where(
+            Payment.is_deleted == False, Payment.pay_type == "Receipt",  # noqa: E712
+            or_(*pay_match),
+        )
     ).scalars():
         entries.append({"date": _parse_dm(p.pay_date), "ref": p.payment_no or "RCPT",
                         "desc": p.notes or "Payment received", "debit": 0.0,
@@ -449,6 +459,13 @@ def _customer_entries(session: Session, customer_id: int) -> list[dict]:
         entries.append({"date": cn.cn_date, "ref": cn.cn_no or "CN",
                         "desc": cn.reason or "Credit note", "debit": 0.0,
                         "credit": float(cn.amount or 0)})
+    for le in session.execute(
+        select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
+                                  LedgerEntry.customer_id == customer_id)
+    ).scalars():
+        entries.append({"date": le.entry_date, "ref": "ENTRY",
+                        "desc": le.description or "Ledger entry",
+                        "debit": float(le.debit or 0), "credit": float(le.credit or 0)})
     entries.sort(key=lambda e: e["date"] or datetime.date.max)
     return entries
 
@@ -478,7 +495,7 @@ def customer_parties(session: Session) -> list[dict]:
     for c in session.execute(
         select(Customer).where(Customer.is_deleted == False).order_by(Customer.name)  # noqa: E712
     ).scalars():
-        entries = _customer_entries(session, c.id)
+        entries = _customer_entries(session, c.id, c.name)
         debit = sum(e["debit"] for e in entries)
         credit = sum(e["credit"] for e in entries)
         bal = float(c.opening_balance or 0) + debit - credit
@@ -513,8 +530,128 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
             Invoice.due_on < datetime.date.today(),
         )
     ).scalar_one()
+    # Consolidated per-invoice view: each invoice carries the sum of receipts
+    # allocated to it, so payments accumulate on the same line as their debit.
+    inv_match = [Invoice.customer_id == c.id, Invoice.customer_name == c.name]
+    invoices = session.execute(
+        select(Invoice).where(Invoice.is_deleted == False, or_(*inv_match))  # noqa: E712
+        .order_by(Invoice.issued_date, Invoice.id)
+    ).scalars().all()
+    inv_nos = {inv.invoice_no for inv in invoices if inv.invoice_no}
+
+    receipts = session.execute(
+        select(Payment).where(
+            Payment.is_deleted == False, Payment.pay_type == "Receipt",  # noqa: E712
+            or_(and_(Payment.party_type == "customer", Payment.party_id == c.id),
+                Payment.party == c.name),
+        )
+    ).scalars().all()
+    credit_by_inv: dict[str, float] = {}
+    extras: list[dict] = []
+    for p in receipts:
+        alloc = (p.allocated_to or "").strip()
+        amt = float(p.amount or 0)
+        allocated = bool(alloc and alloc in inv_nos)
+        if allocated:  # tracked only to compute the invoice's paid/remaining status
+            credit_by_inv[alloc] = credit_by_inv.get(alloc, 0.0) + amt
+        # Every receipt is its own credit line, dated when it was recorded and
+        # referencing the original invoice it was paid against.
+        extras.append({"date": _parse_dm(p.pay_date),
+                       "ref": alloc if allocated else (p.payment_no or "RCPT"),
+                       "desc": p.notes or "Payment received", "debit": 0.0,
+                       "credit": amt, "editType": "payment", "editId": str(p.public_id)})
+    for cn in session.execute(
+        select(CreditNote).where(CreditNote.is_deleted == False,  # noqa: E712
+                                 CreditNote.customer_id == c.id)
+    ).scalars():
+        extras.append({"date": cn.cn_date, "ref": cn.cn_no or "CN",
+                       "desc": cn.reason or "Credit note", "debit": 0.0,
+                       "credit": float(cn.amount or 0), "editType": "cn",
+                       "editId": str(cn.public_id)})
+    # Manual ledger entries (New entry): free-form debit/credit + description.
+    for le in session.execute(
+        select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
+                                  LedgerEntry.customer_id == c.id)
+    ).scalars():
+        extras.append({"date": le.entry_date, "ref": "ENTRY",
+                       "desc": le.description or "Ledger entry",
+                       "debit": float(le.debit or 0), "credit": float(le.credit or 0),
+                       "editType": "manual", "editId": str(le.public_id)})
+
+    inv_rows = []
+    for inv in invoices:
+        amt = float(inv.amount or 0)
+        applied = round(credit_by_inv.get(inv.invoice_no or "", 0.0), 2)
+        inv_rows.append({
+            # Invoice line shows the debit only — payments are their own credit
+            # lines. `applied`/`remaining` drive the Record payment button/default.
+            "date": inv.issued_date, "ref": inv.invoice_no or "INV",
+            "desc": inv.memo or "Sales invoice",
+            "debit": amt, "credit": 0.0, "remaining": round(amt - applied, 2),
+            "public_id": str(inv.public_id), "editType": "invoice", "editId": str(inv.public_id),
+            "paid": (inv.status == "Paid") or (amt > 0 and applied >= amt),
+        })
+    extras.sort(key=lambda e: e["date"] or datetime.date.max)
     return {"party": c, "opening": float(c.opening_balance or 0),
-            "entries": _customer_entries(session, c.id), "overdue": overdue}
+            "invoices": inv_rows, "extras": extras, "overdue": overdue}
+
+
+def create_ledger_entry(session: Session, *, tenant_id: UUID, customer_id: int | None,
+                        description: str, debit, credit) -> LedgerEntry:
+    le = LedgerEntry(tenant_id=tenant_id, customer_id=customer_id,
+                     entry_date=datetime.date.today(), description=description,
+                     debit=debit or 0, credit=credit or 0)
+    session.add(le)
+    session.flush()
+    session.refresh(le)
+    return le
+
+
+def customer_by_public(session: Session, *, public_id: str) -> Customer | None:
+    return session.execute(
+        select(Customer).where(Customer.public_id == public_id,
+                               Customer.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
+
+
+def update_ledger_description(session: Session, *, edit_type: str, public_id: str,
+                              description: str) -> bool:
+    """Edit the description of any ledger row, routed to its source record."""
+    model_field = {
+        "invoice": (Invoice, "memo"),
+        "manual": (LedgerEntry, "description"),
+        "payment": (Payment, "notes"),
+        "cn": (CreditNote, "reason"),
+    }.get(edit_type)
+    if model_field is None:
+        return False
+    model, field = model_field
+    obj = session.execute(
+        select(model).where(model.public_id == public_id,
+                            model.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
+    if obj is None:
+        return False
+    setattr(obj, field, description)
+    session.flush()
+    return True
+
+
+def receipts_applied_to_invoice(session: Session, *, invoice_no: str | None,
+                                customer_id: int | None, customer_name: str | None) -> float:
+    """Total receipts already allocated to a specific invoice for a customer."""
+    if not invoice_no:
+        return 0.0
+    party = [and_(Payment.party_type == "customer", Payment.party_id == customer_id)]
+    if customer_name:
+        party.append(Payment.party == customer_name)
+    total = session.execute(
+        select(func.coalesce(func.sum(Payment.amount), 0)).where(
+            Payment.is_deleted == False, Payment.pay_type == "Receipt",  # noqa: E712
+            Payment.allocated_to == invoice_no, or_(*party),
+        )
+    ).scalar_one()
+    return float(total or 0)
 
 
 def supplier_statement(session: Session, *, public_id: str) -> dict | None:

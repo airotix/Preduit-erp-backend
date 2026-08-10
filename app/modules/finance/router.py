@@ -9,7 +9,8 @@ from app.modules.finance import fx as fx_service
 from app.modules.finance.dto import (
     AccountCreate, AccountUpdate, BankAccountCreate, BankTxnCreate, BillCreate,
     BillUpdate, BudgetLineCreate, FixedAssetCreate, JournalEntryCreate,
-    JournalEntryUpdate, JournalFull, PaymentCreate, PaymentUpdate, PeriodCreate,
+    JournalEntryUpdate, JournalFull, LedgerDescriptionIn, LedgerEntryIn,
+    PaymentCreate, PaymentUpdate, PeriodCreate,
 )
 
 router = APIRouter(prefix="/finance", tags=["finance"])
@@ -205,6 +206,27 @@ def customer_ledger_statement(public_id: str, currency: str = Query("PKR"),
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Customer not found")
     return service.convert(db, d, currency=currency)
+
+
+@router.post("/customer-ledger/{public_id}/entries", status_code=status.HTTP_201_CREATED)
+def create_ledger_entry(public_id: str, payload: LedgerEntryIn,
+                        principal: Principal = Depends(require_tenant),
+                        db: Session = Depends(tenant_db)):
+    le = service.create_ledger_entry(
+        db, tenant_id=principal.tenant_id, customer_public_id=public_id,
+        description=payload.description, debit=payload.debit, credit=payload.credit)
+    return {"public_id": str(le.public_id)}
+
+
+@router.put("/ledger-entries/description")
+def update_ledger_description(payload: LedgerDescriptionIn,
+                              principal: Principal = Depends(require_tenant),
+                              db: Session = Depends(tenant_db)):
+    ok = service.update_ledger_description(
+        db, edit_type=payload.type, public_id=payload.publicId, description=payload.description)
+    if not ok:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ledger row not found")
+    return {"ok": True}
 
 
 @router.get("/profitability")

@@ -348,9 +348,15 @@ def _build_statement(data: dict, *, kind: str) -> dict:
             bal += e["credit"] - e["debit"]
         debit_total += e["debit"]
         credit_total += e["credit"]
+        settleable = (kind == "customer" and e.get("kind") == "invoice" and not e.get("paid"))
         rows.append({
             "date": _fmt_date(e["date"]), "ref": e["ref"], "desc": e["desc"],
             "debit": e["debit"] or None, "credit": e["credit"] or None, "balance": bal,
+            # Handle for the per-row "Record payment" action (unpaid customer
+            # invoices only). base_amount is intentionally NOT a money key, so it
+            # is not currency-scaled — the settle endpoint records in base currency.
+            "invoicePublicId": e.get("public_id") if settleable else None,
+            "baseAmount": e.get("base_amount") if settleable else None,
         })
 
     if kind == "customer":
@@ -610,9 +616,67 @@ def reconcile_bank(session: Session, *, public_id):
     return repo.reconcile_matched(session, bank_account_id=a.id)
 
 
+def _build_customer_statement(data: dict) -> dict:
+    """Running-balance customer statement. Invoice rows show their debit plus the
+    payments allocated to them (credit accumulates on the same line); manual
+    entries and unallocated receipts / credit notes are their own lines. Every
+    row carries an editType/editId so its description is inline-editable."""
+    party, opening = data["party"], data["opening"]
+    items = [{**r, "kind": "invoice"} for r in data["invoices"]]
+    items += [{**e, "kind": "extra"} for e in data["extras"]]
+    items.sort(key=lambda x: x.get("date") or datetime.date.max)
+
+    rows = []
+    running = opening
+    total_debit = total_credit = 0.0
+    for it in items:
+        debit = float(it.get("debit") or 0)
+        credit = float(it.get("credit") or 0)
+        running += debit - credit
+        total_debit += debit
+        total_credit += credit
+        open_inv = (it["kind"] == "invoice" and not it.get("paid")
+                    and float(it.get("remaining") or 0) > 0)
+        rows.append({
+            "date": _fmt_date(it.get("date")), "ref": it["ref"], "desc": it["desc"],
+            "debit": debit or None, "credit": credit or None, "balance": round(running, 2),
+            "editType": it.get("editType"), "editId": it.get("editId"),
+            # Record-payment handle (unpaid invoices) targets the remaining balance.
+            "invoicePublicId": it["public_id"] if open_inv else None,
+            "baseAmount": round(float(it.get("remaining") or 0), 2) if open_inv else None,
+        })
+    closing = round(running, 2)
+    if data.get("overdue"):
+        standing_label, standing_tone = "Payment due", "amber"
+    else:
+        standing_label, standing_tone = "In good standing", "green"
+    return {
+        "name": party.name, "code": party.code or "—", "terms": party.terms or "—",
+        "email": getattr(party, "email", "") or "", "initials": initials(party.name),
+        "standingLabel": standing_label, "standingTone": standing_tone,
+        "opening": opening, "totalDebit": total_debit, "totalCredit": total_credit,
+        "closing": closing, "balanceLabel": "Receivable", "balanceTone": "orange",
+        "rows": rows,
+    }
+
+
 def customer_statement(session: Session, *, public_id: str) -> dict | None:
     data = repo.customer_statement(session, public_id=public_id)
-    return _build_statement(data, kind="customer") if data else None
+    return _build_customer_statement(data) if data else None
+
+
+def create_ledger_entry(session: Session, *, tenant_id, customer_public_id: str,
+                        description: str, debit, credit):
+    c = repo.customer_by_public(session, public_id=customer_public_id)
+    return repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id),
+                                    customer_id=c.id if c else None,
+                                    description=description, debit=debit, credit=credit)
+
+
+def update_ledger_description(session: Session, *, edit_type: str, public_id: str,
+                              description: str) -> bool:
+    return repo.update_ledger_description(session, edit_type=edit_type,
+                                          public_id=public_id, description=description)
 
 
 def supplier_statement(session: Session, *, public_id: str) -> dict | None:

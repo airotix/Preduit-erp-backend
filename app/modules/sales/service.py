@@ -123,25 +123,45 @@ def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreat
         session, tenant_id=tid, customer_id=customer_id, customer_name=payload.customer,
         channel=payload.channel, lines=lines,
     )
-    # Kick off production: one work order for the whole sales order, linked back
-    # to it so its detail can show the order's line items (Production → Orders).
+    # Raise a receivable for the order so it lands on the customer ledger as a
+    # Debit (posted to the GL). Payment (Credit) is confirmed separately via the
+    # settle endpoint from the New Order payment modal.
+    order_total = float(order.total or 0)
+    invoice = None
+    if order_total > 0:
+        due_on = datetime.date.today() + datetime.timedelta(days=30)
+        invoice = repo.create_invoice(
+            session, tenant_id=tid, customer_id=customer_id, customer_name=payload.customer,
+            amount=order.total, due_date=due_on.strftime("%d %b %Y"), due_on=due_on,
+            order_no=order.order_no,
+        )
+        from app.modules.finance import service as fin_service
+        fin_service.post_unposted(session, tenant_id=tid)
+    # Kick off production: one work order for the whole sales order, with one
+    # production line per distinct style (each gets its own timeline), linked
+    # back so its detail can show the order's line items (Production → Orders).
     from app.modules.production import repository as prod_repo
     total_qty = sum(int(l["qty"] or 0) for l in lines)
-    names: list[str] = []
+    style_qty: dict[str, int] = {}
     for l in lines:
         nm = (l["name"] or "").strip()
-        if nm and nm not in names:
-            names.append(nm)
-    if total_qty > 0:
-        if len(names) == 1:
-            style_label = names[0]
-        elif names:
-            style_label = f"{names[0]} +{len(names) - 1} more"
-        else:
-            style_label = order.order_no or "Order"
-        prod_repo.create_porder(session, tenant_id=tid, style=style_label, factory=None,
-                                qty=total_qty, sales_order_id=order.id)
-    return order
+        if nm:
+            style_qty[nm] = style_qty.get(nm, 0) + int(l["qty"] or 0)
+    if total_qty > 0 and style_qty:
+        names = list(style_qty)
+        style_label = names[0] if len(names) == 1 else f"{names[0]} +{len(names) - 1} more"
+        po = prod_repo.create_porder(session, tenant_id=tid, style=style_label, factory=None,
+                                     qty=total_qty, sales_order_id=order.id)
+        for style, qty in style_qty.items():
+            prod_repo.create_porder_line(session, tenant_id=tid, order_id=po.id,
+                                         name=style, qty=qty)
+    return {
+        "order": order,
+        "total": order_total,
+        "customer": payload.customer,
+        "invoice_public_id": str(invoice.public_id) if invoice else None,
+        "invoice_no": invoice.invoice_no if invoice else None,
+    }
 
 
 # ---------- Fulfillment board ----------
@@ -218,6 +238,44 @@ def create_invoice(session: Session, *, tenant_id: str | UUID, payload: InvoiceC
     # a module-load cycle: finance depends on sales models).
     from app.modules.finance import service as fin_service
     fin_service.post_unposted(session, tenant_id=tid)
+    return inv
+
+
+def record_invoice_payment(session: Session, *, tenant_id: str | UUID, public_id: str,
+                           amount_paid, paid: bool):
+    """Settle (all or part of) a receivable: record a customer receipt so the
+    payment shows as a Credit on the customer ledger and keeps the balance
+    correct. Marks the invoice Paid when fully settled. Posts to the GL."""
+    from app.modules.finance import repository as fin_repo
+    from app.modules.finance import service as fin_service
+    tid = _tid(tenant_id)
+    inv = repo.get_invoice_by_public(session, public_id=public_id)
+    if inv is None:
+        return None
+    invoice_amt = float(inv.amount or 0)
+    # Receipts already applied to this invoice → new payments accumulate on the
+    # same ledger line until the credit matches the debit (never over-credit).
+    already = fin_repo.receipts_applied_to_invoice(
+        session, invoice_no=inv.invoice_no, customer_id=inv.customer_id,
+        customer_name=inv.customer_name)
+    remaining = max(invoice_amt - already, 0.0)
+    amt = float(amount_paid or 0)
+    # "Paid in full" with no explicit amount → settle the whole remaining balance.
+    if paid and amt <= 0:
+        amt = remaining
+    amt = min(amt, remaining) if remaining > 0 else 0.0
+    if amt > 0:
+        today = datetime.date.today()
+        fin_repo.create_payment(
+            session, tenant_id=tid, party=inv.customer_name, amount=amt,
+            pay_type="Receipt", method="Cash", reference=inv.invoice_no,
+            allocated_to=inv.invoice_no, pay_date=today.isoformat(),
+            status="Cleared", notes=f"Payment for {inv.order_no or inv.invoice_no or 'order'}",
+        )
+        if already + amt >= invoice_amt and invoice_amt > 0:
+            inv.status = "Paid"
+        session.flush()
+        fin_service.post_unposted(session, tenant_id=tid)
     return inv
 
 

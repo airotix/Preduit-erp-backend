@@ -32,6 +32,8 @@ class StageDaysIn(BaseModel):
 
 class StartProductionIn(BaseModel):
     stages: list[StageDaysIn] = Field(min_length=1)
+    # When set, only this production line's timeline is started (others keep theirs).
+    line_id: str | None = Field(default=None, max_length=64)
 
 
 class StageExtendIn(BaseModel):

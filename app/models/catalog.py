@@ -74,5 +74,6 @@ class ProductVariant(Base):
     retail_price: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
     wholesale_price: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
     online_price: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
+    supplier_price: Mapped[Decimal | None] = mapped_column(Numeric(19, 4), nullable=True)
     currency_code: Mapped[str] = mapped_column(String(3))
     status: Mapped[str] = mapped_column(String(20), default="Active")

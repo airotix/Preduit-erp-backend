@@ -117,6 +117,22 @@ class CreditNote(Base):
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class LedgerEntry(Base):
+    """Manual customer-ledger entry (a debit and/or credit with a description),
+    created from the customer ledger 'New entry' button. Ledger-only — affects
+    the customer's running balance but is not posted to the GL."""
+    __tablename__ = "ledger_entries"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    customer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    entry_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    description: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    debit: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
+    credit: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class FiscalPeriod(Base):
     __tablename__ = "fiscal_periods"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

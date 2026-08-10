@@ -55,6 +55,12 @@ class InvoiceCreate(BaseModel):
     dueDate: str = Field(min_length=1, max_length=40)
 
 
+class InvoiceSettleIn(BaseModel):
+    """Payment confirmation for a receivable (New Order → payment modal)."""
+    amountPaid: Decimal = Field(default=0, ge=0)
+    paid: bool = False
+
+
 class ReturnCreate(BaseModel):
     """Matches the frontend 'New return' form."""
     order: str = Field(min_length=1, max_length=40)

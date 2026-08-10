@@ -4,6 +4,20 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 
+class LedgerEntryIn(BaseModel):
+    """Manual customer-ledger entry from the 'New entry' button."""
+    description: str = Field(min_length=1, max_length=400)
+    debit: Decimal = Field(default=0, ge=0)
+    credit: Decimal = Field(default=0, ge=0)
+
+
+class LedgerDescriptionIn(BaseModel):
+    """Inline edit of a ledger row's description."""
+    type: str = Field(pattern="^(invoice|manual|payment|cn)$")
+    publicId: str = Field(min_length=1, max_length=64)
+    description: str = Field(default="", max_length=400)
+
+
 class AccountCreate(BaseModel):
     code: str = Field(min_length=1, max_length=20)
     name: str = Field(min_length=1, max_length=200)

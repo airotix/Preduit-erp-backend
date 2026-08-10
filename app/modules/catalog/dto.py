@@ -15,6 +15,7 @@ class ProductCreate(BaseModel):
     retailPrice: Decimal | None = None
     wholesalePrice: Decimal | None = None
     onlinePrice: Decimal | None = None
+    supplierPrice: Decimal | None = None
     currency_code: str = "EUR"
     imageUrl: str | None = None
     # Specifications

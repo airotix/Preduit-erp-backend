@@ -31,6 +31,7 @@ def porders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dic
         [
             text_cell(r["order_no"] or "—", strong=True, mono=True),
             r["style"],
+            r.get("customer") or "—",
             r["factory"] or "—",
             text_cell(f"{r['qty']:,}", align="right", mono=True),
             text_cell(r["stage"], badge=_STAGE_TONE.get(r["stage"], "neutral")),
@@ -39,7 +40,8 @@ def porders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dic
         for r in rows
     ]
     return list_config(
-        columns=[{"label": "Order"}, {"label": "Style"}, {"label": "Factory"},
+        columns=[{"label": "Order"}, {"label": "Style"}, {"label": "Customer"},
+                 {"label": "Factory"},
                  {"label": "Qty", "align": "right"}, {"label": "Stage"},
                  {"label": "Progress", "align": "right"}],
         rows=grid, total=total,
@@ -139,6 +141,56 @@ def _fmt(d) -> str:
     return d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else "—"
 
 
+_LINE_TONE = {"Completed": "green", "In Progress": "accent", "Planned": "neutral"}
+
+
+def _stage_rows(stages, today) -> list[dict]:
+    return [
+        {
+            "public_id": str(s.public_id), "seq": s.seq, "name": s.name,
+            "duration_days": s.duration_days, "status": s.status,
+            "overdue": s.status != "Completed" and s.end_on is not None and s.end_on < today,
+            "start": _fmt(s.start_on), "end": _fmt(s.end_on),
+            "worker": s.worker or "Unassigned", "notes": s.notes or "",
+        }
+        for s in stages
+    ]
+
+
+def _timeline_alert(stages, today, *, started: bool, all_done: bool):
+    if all_done:
+        return {"type": "done", "message": "All stages completed — production is finished."}
+    if not started:
+        return None
+    active = next((s for s in stages if s.status != "Completed"), None)
+    if active is None:
+        return None
+    if active.status == "In Progress":
+        if active.end_on and active.end_on < today:
+            return {"type": "overdue",
+                    "message": f"“{active.name}” is overdue — its {active.duration_days} "
+                               f"days elapsed on {_fmt(active.end_on)}. Mark it complete or extend."}
+        if active.end_on == today:
+            return {"type": "due",
+                    "message": f"“{active.name}” is due today — complete it to move to the next stage."}
+        return {"type": "progress", "message": f"“{active.name}” is in progress — due {_fmt(active.end_on)}."}
+    return {"type": "waiting", "message": f"“{active.name}” is waiting to start."}
+
+
+def _timeline(stages, today) -> dict:
+    started = len(stages) > 0
+    completed = sum(1 for s in stages if s.status == "Completed")
+    progress = round(completed / len(stages) * 100) if stages else 0
+    all_done = started and completed == len(stages)
+    status_label = "Completed" if all_done else ("In Progress" if started else "Planned")
+    return {
+        "started": started, "progress": progress, "statusLabel": status_label,
+        "statusTone": _LINE_TONE.get(status_label, "neutral"),
+        "stages": _stage_rows(stages, today),
+        "alert": _timeline_alert(stages, today, started=started, all_done=all_done),
+    }
+
+
 def porder_detail(session: Session, *, public_id: str) -> dict | None:
     import datetime
     data = repo.get_porder_detail(session, public_id=public_id)
@@ -157,45 +209,18 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         for l in order_lines
     ]
     order_total = _money(sum(float(l["line_total"] or 0) for l in order_lines))
-    started = len(stages) > 0
-    completed = sum(1 for s in stages if s.status == "Completed")
-    progress = round(completed / len(stages) * 100) if stages else 0
-    all_done = started and completed == len(stages)
-    status_label = "Completed" if all_done else ("In Progress" if started else "Planned")
 
-    stage_rows = [
-        {
-            "public_id": str(s.public_id), "seq": s.seq, "name": s.name,
-            "duration_days": s.duration_days, "status": s.status,
-            # Overdue = the stage's allotted days have elapsed but it isn't complete.
-            "overdue": s.status != "Completed" and s.end_on is not None and s.end_on < today,
-            "start": _fmt(s.start_on), "end": _fmt(s.end_on),
-            "worker": s.worker or "Unassigned", "notes": s.notes or "",
-        }
-        for s in stages
+    # Overall (all lines' stages) drives the header + Start button.
+    overall = _timeline(stages, today)
+    started, progress = overall["started"], overall["progress"]
+    status_label, alert = overall["statusLabel"], overall["alert"]
+
+    # One timeline per production line (style) → tabs on the detail page.
+    lines_out = [
+        {"publicId": str(ld["line"].public_id), "name": ld["line"].name,
+         "qty": int(ld["line"].qty or 0), **_timeline(ld["stages"], today)}
+        for ld in (data.get("lines") or [])
     ]
-
-    # Order-level alert: nudge the user to advance the timeline.
-    alert = None
-    if all_done:
-        alert = {"type": "done", "message": "All stages completed — production is finished."}
-    elif started:
-        active = next((s for s in stages if s.status != "Completed"), None)
-        if active is not None:
-            if active.status == "In Progress":
-                if active.end_on and active.end_on < today:
-                    alert = {"type": "overdue",
-                             "message": f"“{active.name}” is overdue — its {active.duration_days} "
-                                        f"days elapsed on {_fmt(active.end_on)}. Mark it complete or extend."}
-                elif active.end_on == today:
-                    alert = {"type": "due",
-                             "message": f"“{active.name}” is due today — complete it to move to the next stage."}
-                else:
-                    alert = {"type": "progress",
-                             "message": f"“{active.name}” is in progress — due {_fmt(active.end_on)}."}
-            else:  # Pending — a previous stage finished and this one hasn't started
-                alert = {"type": "waiting",
-                         "message": f"“{active.name}” is waiting to start."}
 
     meta = []
     if sales_order is not None:
@@ -221,7 +246,8 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         "progress": progress,
         "alert": alert,
         "stageNames": STAGES,
-        "stages": stage_rows,
+        "stages": overall["stages"],
+        "lines": lines_out,
         "materials": [
             {"component": m["component"], "material": m["material"] or "—",
              "qty": m["qty_per_unit"] or "—", "cost": f"€{m['cost']:,.2f}"}
@@ -230,8 +256,9 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
     }
 
 
-def start_production(session, *, tenant_id, public_id, stages):
-    return repo.start_production(session, order_public_id=public_id, stages=stages)
+def start_production(session, *, tenant_id, public_id, stages, line_id=None):
+    return repo.start_production(session, order_public_id=public_id, stages=stages,
+                                 line_public_id=line_id)
 
 
 def stage_action(session, *, action, public_id, days=None, worker=None, notes=None):

@@ -46,6 +46,7 @@ def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
                 "retail": _chan("retail"),
                 "online": _chan("online"),
                 "wholesale": _chan("wholesale"),
+                "supplier": _chan("supplier"),
             },
         })
     return out
@@ -75,6 +76,7 @@ def products_screen(session: Session, *, limit: int = 25, offset: int = 0) -> di
             text_cell(_money(r["retail"]), align="right", mono=True, strong=True),
             text_cell(_money(r["online"]), align="right", mono=True),
             text_cell(_money(r["wholesale"]), align="right", mono=True),
+            text_cell(_money(r["supplier"]), align="right", mono=True),
             text_cell(str(r["variant_count"]), align="center", mono=True),
             text_cell(r["status"], badge=_STATUS_TONE.get(r["status"], "gray")),
         ])
@@ -84,6 +86,7 @@ def products_screen(session: Session, *, limit: int = 25, offset: int = 0) -> di
             {"label": "Retail Price", "align": "right"},
             {"label": "Online Price", "align": "right"},
             {"label": "Wholesale Price", "align": "right"},
+            {"label": "Supplier Price", "align": "right"},
             {"label": "Variants", "align": "center"}, {"label": "Status"},
         ],
         rows=grid, total=total,
@@ -143,7 +146,7 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
 
     price_label = _minp("retail_price")
     prices = {"retail": _minp("retail_price"), "wholesale": _minp("wholesale_price"),
-              "online": _minp("online_price")}
+              "online": _minp("online_price"), "supplier": _minp("supplier_price")}
 
     # Full catalog size scale (XS…7XL) so the matrix shows every size column,
     # with 0 where this product has no variant — matching the stock editor.
@@ -217,6 +220,7 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
                 "retailPrice": _minraw("retail_price"),
                 "wholesalePrice": _minraw("wholesale_price"),
                 "onlinePrice": _minraw("online_price"),
+                "supplierPrice": _minraw("supplier_price"),
                 "imageUrl": prod.image_url or "",
                 "composition": prod.composition or "",
                 "gauge": prod.gauge or "",
@@ -238,11 +242,13 @@ def create_product(session: Session, *, tenant_id: str | UUID, payload: ProductC
         image_url=payload.imageUrl,
     )
     # Seed the first variant with an auto-generated SKU when any price is given.
-    if any(p is not None for p in (payload.retailPrice, payload.wholesalePrice, payload.onlinePrice)):
+    if any(p is not None for p in (payload.retailPrice, payload.wholesalePrice,
+                                   payload.onlinePrice, payload.supplierPrice)):
         repo.create_variant(
             session, tenant_id=tid, product_id=product.id,
             retail=payload.retailPrice, wholesale=payload.wholesalePrice,
-            online=payload.onlinePrice, currency_code=payload.currency_code,
+            online=payload.onlinePrice, supplier=payload.supplierPrice,
+            currency_code=payload.currency_code,
         )
     write_audit(
         session, tenant_id=tid, action="CREATE", entity_type="product",
@@ -258,6 +264,7 @@ def update_product(session: Session, *, tenant_id: str | UUID, public_id: str, p
         session, public_id=public_id, title=payload.title, category_id=category_id,
         season=payload.season, status=payload.status, retail=payload.retailPrice,
         wholesale=payload.wholesalePrice, online=payload.onlinePrice,
+        supplier=payload.supplierPrice,
         currency_code=payload.currency_code,
         # Pass the raw value ("" clears the image; None means "no change").
         image_url=payload.imageUrl,

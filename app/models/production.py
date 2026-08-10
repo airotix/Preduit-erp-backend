@@ -15,8 +15,11 @@ class ProductionOrder(Base):
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     order_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Summary style label for the order (e.g. "Merino Crew Knit +1 more"); the
+    # per-item breakdown lives in ProductionOrderLine.
+    style: Mapped[str] = mapped_column(String(200))
     factory: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    qty: Mapped[int] = mapped_column(Integer, default=0)          -- total qty across all lines
+    qty: Mapped[int] = mapped_column(Integer, default=0)          # total qty across all lines
     stage: Mapped[str] = mapped_column(String(20), default="Trims")
     progress: Mapped[int] = mapped_column(Integer, default=0)
     sales_order_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -37,12 +40,15 @@ class ProductionOrderLine(Base):
     order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("production_orders.id"))
     sales_order_line_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     sku: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    name: Mapped[str] = mapped_column(String(200))         -- style / product name
+    name: Mapped[str] = mapped_column(String(200))         # style / product name
     color: Mapped[str | None] = mapped_column(String(60), nullable=True)
     size: Mapped[str | None] = mapped_column(String(60), nullable=True)
     qty: Mapped[int] = mapped_column(Integer, default=0)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
-    row_version: Mapped[bytes | None] = mapped_column(nullable=True)
+    # NOTE: the table has a ROWVERSION column, but it is intentionally NOT mapped.
+    # ROWVERSION is server-generated and cannot appear in an INSERT/UPDATE column
+    # list — mapping it makes SQLAlchemy emit an explicit NULL and SQL Server
+    # rejects it ("Cannot insert an explicit value into a timestamp column").
 
     order: Mapped["ProductionOrder"] = relationship(back_populates="lines")
     stages: Mapped[list["ProductionStage"]] = relationship(

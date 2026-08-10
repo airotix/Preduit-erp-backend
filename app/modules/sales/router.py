@@ -6,7 +6,8 @@ from app.core.deps import tenant_db
 from app.core.security import Principal, require_tenant
 from app.modules.sales import service
 from app.modules.sales.dto import (
-    CustomerCreate, CustomerUpdate, InvoiceCreate, OrderCreate, ReturnCreate, StatusUpdate,
+    CustomerCreate, CustomerUpdate, InvoiceCreate, InvoiceSettleIn, OrderCreate,
+    ReturnCreate, StatusUpdate,
 )
 
 router = APIRouter(prefix="/sales", tags=["sales"])
@@ -54,8 +55,25 @@ def create_order(
     principal: Principal = Depends(require_tenant),
     db: Session = Depends(tenant_db),
 ):
-    o = service.create_order(db, tenant_id=principal.tenant_id, payload=payload)
-    return {"public_id": str(o.public_id), "order_no": o.order_no}
+    res = service.create_order(db, tenant_id=principal.tenant_id, payload=payload)
+    o = res["order"]
+    return {
+        "public_id": str(o.public_id), "order_no": o.order_no,
+        "total": res["total"], "customer": res["customer"],
+        "invoice_public_id": res["invoice_public_id"], "invoice_no": res["invoice_no"],
+    }
+
+
+@router.post("/invoices/{public_id}/settle")
+def settle_invoice(public_id: str, payload: InvoiceSettleIn,
+                   principal: Principal = Depends(require_tenant),
+                   db: Session = Depends(tenant_db)):
+    inv = service.record_invoice_payment(
+        db, tenant_id=principal.tenant_id, public_id=public_id,
+        amount_paid=payload.amountPaid, paid=payload.paid)
+    if inv is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
+    return {"public_id": str(inv.public_id), "status": inv.status}
 
 
 @router.get("/customers/{public_id}/detail")

@@ -140,10 +140,12 @@ def list_invoices(session: Session, *, limit: int, offset: int) -> tuple[list[di
 
 
 def create_invoice(session: Session, *, tenant_id: UUID, customer_id: int | None,
-                   customer_name: str, amount, due_date: str, due_on=None) -> Invoice:
+                   customer_name: str, amount, due_date: str, due_on=None,
+                   order_no: str | None = None) -> Invoice:
     invoice = Invoice(
         tenant_id=tenant_id, customer_id=customer_id, customer_name=customer_name,
         amount=amount, due_date=due_date, due_on=due_on, status="Open",
+        order_no=order_no,
     )
     session.add(invoice)
     session.flush()
@@ -240,6 +242,13 @@ def set_order_status(session, *, public_id, status):
 
 def set_invoice_status(session, *, public_id, status):
     return _set_status(session, Invoice, public_id, status)
+
+
+def get_invoice_by_public(session, *, public_id: str) -> Invoice | None:
+    return session.execute(
+        select(Invoice).where(Invoice.public_id == public_id,
+                              Invoice.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
 
 
 def set_return_status(session, *, public_id, status):

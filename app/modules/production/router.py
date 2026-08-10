@@ -49,7 +49,8 @@ def start_production(public_id: str, payload: StartProductionIn,
                      principal: Principal = Depends(require_tenant),
                      db: Session = Depends(tenant_db)):
     po = service.start_production(db, tenant_id=principal.tenant_id, public_id=public_id,
-                                  stages=[s.model_dump() for s in payload.stages])
+                                  stages=[s.model_dump() for s in payload.stages],
+                                  line_id=payload.line_id)
     if po is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Production order not found")
     return {"public_id": str(po.public_id), "stage": po.stage}

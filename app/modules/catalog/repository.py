@@ -41,6 +41,7 @@ def list_products(session: Session, *, limit: int, offset: int) -> tuple[list[di
             func.min(ProductVariant.retail_price).label("retail"),
             func.min(ProductVariant.online_price).label("online"),
             func.min(ProductVariant.wholesale_price).label("wholesale"),
+            func.min(ProductVariant.supplier_price).label("supplier"),
         )
         .outerjoin(ProductVariant, ProductVariant.product_id == Product.id)
         .outerjoin(Category, Category.id == Product.category_id)
@@ -69,6 +70,7 @@ def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
             func.min(ProductVariant.retail_price).label("retail"),
             func.min(ProductVariant.online_price).label("online"),
             func.min(ProductVariant.wholesale_price).label("wholesale"),
+            func.min(ProductVariant.supplier_price).label("supplier"),
             func.min(ProductVariant.currency_code).label("currency_code"),
         )
         .outerjoin(ProductVariant, ProductVariant.product_id == Product.id)
@@ -164,7 +166,7 @@ def create_product(session: Session, *, tenant_id: UUID, title: str,
 
 def update_product(session: Session, *, public_id: str, title: str, category_id: int | None,
                    season: str | None, status: str, retail=None, wholesale=None,
-                   online=None, currency_code: str = "EUR", image_url=None,
+                   online=None, supplier=None, currency_code: str = "EUR", image_url=None,
                    specs: dict | None = None) -> Product | None:
     product = session.execute(
         select(Product).where(Product.public_id == public_id,
@@ -188,7 +190,7 @@ def update_product(session: Session, *, public_id: str, title: str, category_id:
     session.flush()
     # If any price was supplied, apply it to the first variant (create one with an
     # auto SKU if none exists). Only the prices provided are changed.
-    if any(p is not None for p in (retail, wholesale, online)):
+    if any(p is not None for p in (retail, wholesale, online, supplier)):
         variant = session.execute(
             select(ProductVariant).where(ProductVariant.product_id == product.id)
             .order_by(ProductVariant.id)
@@ -196,7 +198,7 @@ def update_product(session: Session, *, public_id: str, title: str, category_id:
         if variant is None:
             create_variant(session, tenant_id=product.tenant_id, product_id=product.id,
                            retail=retail, wholesale=wholesale, online=online,
-                           currency_code=currency_code)
+                           supplier=supplier, currency_code=currency_code)
         else:
             if retail is not None:
                 variant.retail_price = retail
@@ -205,6 +207,8 @@ def update_product(session: Session, *, public_id: str, title: str, category_id:
                 variant.wholesale_price = wholesale
             if online is not None:
                 variant.online_price = online
+            if supplier is not None:
+                variant.supplier_price = supplier
         session.flush()
     session.refresh(product)
     return product
@@ -237,6 +241,7 @@ def get_product_detail(session: Session, *, public_id: str) -> dict | None:
         select(
             ProductVariant.sku, ProductVariant.price, ProductVariant.currency_code,
             ProductVariant.retail_price, ProductVariant.wholesale_price, ProductVariant.online_price,
+            ProductVariant.supplier_price,
             ProductVariant.status, ProductVariant.qty_on_hand,
             Color.value.label("color"), Color.hex.label("color_hex"),
             Size.value.label("size"), Size.sort_order.label("size_sort"),
@@ -251,14 +256,15 @@ def get_product_detail(session: Session, *, public_id: str) -> dict | None:
 
 
 def create_variant(session: Session, *, tenant_id: UUID, product_id: int, sku: str | None = None,
-                    retail=None, wholesale=None, online=None, currency_code: str,
+                    retail=None, wholesale=None, online=None, supplier=None, currency_code: str,
                     status: str = "Active") -> ProductVariant:
     r = retail if retail is not None else 0
     w = wholesale if wholesale is not None else r
     o = online if online is not None else r
+    sup = supplier if supplier is not None else r
     variant = ProductVariant(
         tenant_id=tenant_id, product_id=product_id, sku=sku or next_sku(session),
-        price=r, retail_price=r, wholesale_price=w, online_price=o,
+        price=r, retail_price=r, wholesale_price=w, online_price=o, supplier_price=sup,
         currency_code=currency_code, status=status,
     )
     session.add(variant)

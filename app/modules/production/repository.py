@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models.production import BomLine, ProductionOrder, ProductionStage
+from app.models.production import BomLine, ProductionOrder, ProductionOrderLine, ProductionStage
 from app.models.sales import SalesOrder, SalesOrderLine
 from app.models.shipments import Shipment
 
@@ -31,10 +31,16 @@ def list_porders(session, *, limit, offset):
                Shipment.is_deleted == False)  # noqa: E712
         .correlate(ProductionOrder).scalar_subquery()
     )
+    customer = (
+        select(SalesOrder.customer_name)
+        .where(SalesOrder.id == ProductionOrder.sales_order_id)
+        .correlate(ProductionOrder).scalar_subquery()
+    )
     stmt = (
         select(ProductionOrder.public_id, ProductionOrder.order_no, ProductionOrder.style,
                ProductionOrder.factory, ProductionOrder.qty, ProductionOrder.stage,
-               ProductionOrder.progress, stage_count.label("stage_count"),
+               ProductionOrder.progress, customer.label("customer"),
+               stage_count.label("stage_count"),
                done_count.label("done_count"), shipped_count.label("shipped_count"))
         .where(ProductionOrder.is_deleted == False)  # noqa: E712
         .order_by(ProductionOrder.id.desc()).limit(limit).offset(offset)
@@ -70,6 +76,35 @@ def create_porder(session: Session, *, tenant_id: UUID, style, factory, qty,
     session.flush()
     session.refresh(po)
     return po
+
+
+def create_porder_line(session: Session, *, tenant_id: UUID, order_id: int, name: str,
+                       qty: int, sales_order_line_id: int | None = None, sku: str | None = None,
+                       color: str | None = None, size: str | None = None) -> ProductionOrderLine:
+    ln = ProductionOrderLine(
+        tenant_id=tenant_id, order_id=order_id, name=name, qty=qty,
+        sales_order_line_id=sales_order_line_id, sku=sku, color=color, size=size,
+    )
+    session.add(ln)
+    session.flush()
+    session.refresh(ln)
+    return ln
+
+
+def list_lines(session: Session, order_id: int) -> list[ProductionOrderLine]:
+    return list(session.execute(
+        select(ProductionOrderLine).where(ProductionOrderLine.order_id == order_id,
+                                          ProductionOrderLine.is_deleted == False)  # noqa: E712
+        .order_by(ProductionOrderLine.id)
+    ).scalars())
+
+
+def list_line_stages(session: Session, line_id: int) -> list[ProductionStage]:
+    return list(session.execute(
+        select(ProductionStage).where(ProductionStage.line_id == line_id,
+                                      ProductionStage.is_deleted == False)  # noqa: E712
+        .order_by(ProductionStage.seq)
+    ).scalars())
 
 
 def set_stage(session: Session, *, public_id: str, stage: str) -> ProductionOrder | None:
@@ -123,8 +158,11 @@ def get_porder_detail(session: Session, *, public_id: str) -> dict | None:
             .where(SalesOrderLine.order_id == po.sales_order_id)
             .order_by(SalesOrderLine.id)
         )]
+    # Per-style production lines, each with its own stage timeline.
+    lines = [{"line": ln, "stages": list_line_stages(session, ln.id)}
+             for ln in list_lines(session, po.id)]
     return {"order": po, "materials": materials, "stages": list_stages(session, po.id),
-            "sales_order": sales_order, "order_lines": order_lines}
+            "sales_order": sales_order, "order_lines": order_lines, "lines": lines}
 
 
 # ---------- Production stage timeline ----------
@@ -162,37 +200,60 @@ def _recompute_order(session: Session, order_id: int) -> None:
     po.stage = current.name if current else stages[-1].name
 
 
-def _shift_downstream(session: Session, order_id: int, after_seq: int, days: int) -> None:
+def _shift(session: Session, stage: ProductionStage, days: int) -> None:
+    """Shift the downstream (not-yet-complete) stages of this stage's line."""
     if not days:
         return
-    for s in list_stages(session, order_id):
-        if s.seq > after_seq and s.status != "Completed":
+    siblings = (list_line_stages(session, stage.line_id) if stage.line_id
+                else list_stages(session, stage.order_id))
+    for s in siblings:
+        if s.seq > stage.seq and s.status != "Completed":
             if s.start_on:
                 s.start_on = s.start_on + datetime.timedelta(days=days)
             if s.end_on:
                 s.end_on = s.end_on + datetime.timedelta(days=days)
 
 
-def start_production(session: Session, *, order_public_id: str, stages: list[dict]) -> ProductionOrder | None:
+def start_production(session: Session, *, order_public_id: str, stages: list[dict],
+                     line_public_id: str | None = None) -> ProductionOrder | None:
+    """Lay out the stage timeline. If ``line_public_id`` is given, only that line
+    is (re)started — the other lines keep their own independent timelines. When
+    omitted, every line of the order is started at once (used for manual orders
+    and the whole-order start button)."""
     po = order_by_public(session, order_public_id)
     if po is None:
         return None
-    for s in list_stages(session, po.id):  # clear any prior run
-        s.is_deleted = True
+    all_lines = list_lines(session, po.id)
+    if not all_lines:
+        # Manual order with no lines → mirror the order as a single line.
+        all_lines = [create_porder_line(session, tenant_id=po.tenant_id, order_id=po.id,
+                                        name=po.style, qty=po.qty)]
+    if line_public_id:
+        target = [ln for ln in all_lines if str(ln.public_id) == str(line_public_id)]
+        if not target:
+            return None
+    else:
+        target = all_lines
+    # Clear only the prior run of the target line(s) — leave the rest untouched.
+    for line in target:
+        for s in list_line_stages(session, line.id):
+            s.is_deleted = True
     session.flush()
-    cursor = datetime.date.today()
-    for i, st in enumerate(stages):
-        days = int(st.get("days") or 0)
-        start = cursor
-        end = start + datetime.timedelta(days=days)
-        session.add(ProductionStage(
-            tenant_id=po.tenant_id, order_id=po.id, seq=i + 1, name=st["name"],
-            duration_days=days, status="In Progress" if i == 0 else "Pending",
-            start_on=start, end_on=end,
-        ))
-        cursor = end
-    po.stage = stages[0]["name"] if stages else po.stage
-    po.progress = 0
+    for line in target:
+        cursor = datetime.date.today()
+        for i, st in enumerate(stages):
+            days = int(st.get("days") or 0)
+            start = cursor
+            end = start + datetime.timedelta(days=days)
+            session.add(ProductionStage(
+                tenant_id=po.tenant_id, order_id=po.id, line_id=line.id, seq=i + 1,
+                name=st["name"], duration_days=days,
+                status="In Progress" if i == 0 else "Pending",
+                start_on=start, end_on=end,
+            ))
+            cursor = end
+    session.flush()
+    _recompute_order(session, po.id)  # roll stage/progress up across all lines
     session.flush()
     return po
 
@@ -228,7 +289,7 @@ def extend_stage(session: Session, *, public_id: str, days: int) -> ProductionSt
     s.duration_days += days
     if s.end_on:
         s.end_on = s.end_on + datetime.timedelta(days=days)
-    _shift_downstream(session, s.order_id, s.seq, days)
+    _shift(session, s, days)
     session.flush()
     return s
 
@@ -260,7 +321,7 @@ def resolve_stage(session: Session, *, public_id: str) -> ProductionStage | None
     delta = (today - s.start_on).days if s.start_on else 0
     s.start_on = today
     s.end_on = today + datetime.timedelta(days=s.duration_days)
-    _shift_downstream(session, s.order_id, s.seq, delta)
+    _shift(session, s, delta)
     session.flush()
     return s
 

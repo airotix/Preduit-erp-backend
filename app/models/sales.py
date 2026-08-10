@@ -85,6 +85,8 @@ class Invoice(Base):
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     invoice_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    order_no: Mapped[str | None] = mapped_column(String(32), nullable=True)  # source sales order
+    memo: Mapped[str | None] = mapped_column(String(400), nullable=True)  # editable ledger description
     customer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     customer_name: Mapped[str] = mapped_column(String(200))
     issued_date: Mapped[datetime.date] = mapped_column(Date, default=datetime.date.today)
