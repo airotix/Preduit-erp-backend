@@ -38,7 +38,8 @@ def po_detail(public_id: str, db: Session = Depends(tenant_db)):
 def po_status(public_id: str, payload: StatusUpdate,
               principal: Principal = Depends(require_tenant),
               db: Session = Depends(tenant_db)):
-    po = service.set_po_status(db, public_id=public_id, status=payload.status)
+    po = service.set_po_status(db, public_id=public_id, status=payload.status,
+                               tenant_id=principal.tenant_id)
     if po is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "PO not found")
     return {"public_id": str(po.public_id), "status": po.status}
@@ -77,6 +78,12 @@ def create_receipt(payload: GoodsReceiptCreate,
 def suppliers_screen(limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
                      db: Session = Depends(tenant_db)):
     return service.suppliers_screen(db, limit=limit, offset=offset)
+
+
+@router.get("/suppliers/search")
+def suppliers_search(q: str = Query(""), db: Session = Depends(tenant_db)):
+    """Type-ahead over supplier names for the New PO form."""
+    return service.search_suppliers(db, q=q, limit=10)
 
 
 @router.post("/suppliers", status_code=status.HTTP_201_CREATED)

@@ -51,6 +51,19 @@ def set_result(session, *, public_id, status):
     return repo.set_result(session, public_id=public_id, result=status)
 
 
+def pass_and_ship(session, *, tenant_id, public_id, carrier, destination):
+    """Mark an inspection Passed and create its shipment with the given carrier
+    and destination. Idempotent — one shipment per order."""
+    ins = repo.set_result(session, public_id=public_id, result="Pass")
+    if ins is None:
+        return None
+    from app.modules.shipments import repository as ship_repo
+    if not ship_repo.shipment_exists(session, order_ref=ins.order_ref):
+        ship_repo.create_shipment(session, tenant_id=_tid(tenant_id), order_ref=ins.order_ref,
+                                  carrier=carrier or "Pending", destination=destination or "—")
+    return ins
+
+
 def inspection_detail(session: Session, *, public_id: str) -> dict | None:
     ins = repo.get_inspection(session, public_id=public_id)
     if ins is None:

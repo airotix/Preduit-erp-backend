@@ -69,6 +69,19 @@ def ship_order(session, *, tenant_id, public_id, carrier, eta, destination):
     return s
 
 
+def send_for_inspection(session, *, tenant_id, public_id):
+    """When production is complete, open a QC inspection for the order (once).
+    The order then flows to the Quality inspection list."""
+    po = repo.order_by_public(session, public_id)
+    if po is None:
+        return None
+    from app.modules.quality import repository as qc_repo
+    if not qc_repo.inspection_exists(session, order_ref=po.order_no):
+        qc_repo.create_inspection(session, tenant_id=_tid(tenant_id),
+                                  order_ref=po.order_no, stage="Final", aql="2.5")
+    return po
+
+
 def create_porder(session, *, tenant_id, payload: ProductionOrderCreate):
     return repo.create_porder(session, tenant_id=_tid(tenant_id), style=payload.style,
                               factory=payload.factory, qty=payload.qty)
@@ -215,6 +228,12 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
     started, progress = overall["started"], overall["progress"]
     status_label, alert = overall["statusLabel"], overall["alert"]
 
+    # Workflow chain: once every stage is complete, offer "Send for inspection"
+    # (unless an inspection was already opened for this order).
+    from app.modules.quality import repository as qc_repo
+    inspected = qc_repo.inspection_exists(session, order_ref=po.order_no)
+    can_inspect = started and progress == 100 and not inspected
+
     # One timeline per production line (style) → tabs on the detail page.
     lines_out = [
         {"publicId": str(ld["line"].public_id), "name": ld["line"].name,
@@ -244,6 +263,8 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         "orderTotal": order_total,
         "started": started,
         "progress": progress,
+        "canInspect": can_inspect,
+        "inspected": inspected,
         "alert": alert,
         "stageNames": STAGES,
         "stages": overall["stages"],

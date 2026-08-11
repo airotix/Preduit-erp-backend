@@ -19,6 +19,9 @@ class SupplierBill(Base):
     supplier_name: Mapped[str] = mapped_column(String(200))
     supplier_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     po_ref: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    memo: Mapped[str | None] = mapped_column(String(400), nullable=True)  # editable ledger description
+    issued_date: Mapped[datetime.date | None] = mapped_column(
+        Date, default=datetime.date.today, nullable=True)  # ledger date = when added
     amount: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     due_on: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="Open")
@@ -126,6 +129,7 @@ class LedgerEntry(Base):
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     customer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    supplier_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     entry_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     description: Mapped[str | None] = mapped_column(String(400), nullable=True)
     debit: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)

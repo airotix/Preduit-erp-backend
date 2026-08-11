@@ -28,9 +28,17 @@ class GoodsReceiptCreate(BaseModel):
 
 class SupplierCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    region: str = Field(min_length=1, max_length=80)
-    leadTime: str = Field(min_length=1, max_length=40)
-    category: str = Field(min_length=1, max_length=120)
+    # Optional so auto-registered suppliers (created from a PO/receipt with no
+    # profile yet) can be edited without re-entering these.
+    region: str | None = Field(default=None, max_length=80)
+    leadTime: str | None = Field(default=None, max_length=40)
+    category: str | None = Field(default=None, max_length=120)
+    email: str | None = Field(default=None, max_length=256)
+    phone: str | None = Field(default=None, max_length=40)
+    address: str | None = Field(default=None, max_length=300)
+    vatNumber: str | None = Field(default=None, max_length=40)
+    contactPerson: str | None = Field(default=None, max_length=120)
+    bankDetails: str | None = Field(default=None, max_length=400)
 
 
 class SupplierUpdate(SupplierCreate):

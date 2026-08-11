@@ -18,13 +18,24 @@ def find_supplier(session: Session, *, name: str) -> Supplier | None:
     ).scalar_one_or_none()
 
 
+def search_suppliers(session: Session, *, q: str, limit: int = 10) -> list[dict]:
+    """Type-ahead over supplier names."""
+    rows = session.execute(
+        select(Supplier.name, Supplier.region)
+        .where(Supplier.is_deleted == False, Supplier.name.ilike(f"%{q}%"))  # noqa: E712
+        .order_by(Supplier.name).limit(limit)
+    ).all()
+    return [{"name": n, "region": r or ""} for n, r in rows]
+
+
 # ---------- Suppliers / scorecard ----------
 
 def list_suppliers(session: Session, *, limit: int, offset: int) -> tuple[list[dict], int]:
     stmt = (
         select(Supplier.public_id, Supplier.name, Supplier.region, Supplier.category,
                Supplier.lead_time, Supplier.on_time_pct, Supplier.defect_rate,
-               Supplier.price_rating, Supplier.score, Supplier.status)
+               Supplier.price_rating, Supplier.score, Supplier.status,
+               Supplier.vat_number, Supplier.contact_person, Supplier.bank_details)
         .where(Supplier.is_deleted == False)  # noqa: E712
         .order_by(Supplier.name)
         .limit(limit).offset(offset)
@@ -36,18 +47,27 @@ def list_suppliers(session: Session, *, limit: int, offset: int) -> tuple[list[d
     return rows, total
 
 
-def create_supplier(session: Session, *, tenant_id: UUID, name: str, region: str,
-                    lead_time: str, category: str) -> Supplier:
+def create_supplier(session: Session, *, tenant_id: UUID, name: str, region: str | None = None,
+                    lead_time: str | None = None, category: str | None = None,
+                    email: str | None = None, phone: str | None = None, address: str | None = None,
+                    vat_number: str | None = None, contact_person: str | None = None,
+                    bank_details: str | None = None) -> Supplier:
     sup = Supplier(tenant_id=tenant_id, name=name, region=region,
-                   lead_time=lead_time, category=category, status="New")
+                   lead_time=lead_time, category=category, status="New",
+                   email=email, phone=phone, address=address,
+                   vat_number=vat_number, contact_person=contact_person,
+                   bank_details=bank_details)
     session.add(sup)
     session.flush()
     session.refresh(sup)
     return sup
 
 
-def update_supplier(session: Session, *, public_id: str, name: str, region: str,
-                    lead_time: str, category: str) -> Supplier | None:
+def update_supplier(session: Session, *, public_id: str, name: str, region: str | None = None,
+                    lead_time: str | None = None, category: str | None = None,
+                    email: str | None = None, phone: str | None = None, address: str | None = None,
+                    vat_number: str | None = None, contact_person: str | None = None,
+                    bank_details: str | None = None) -> Supplier | None:
     sup = session.execute(
         select(Supplier).where(Supplier.public_id == public_id,
                                Supplier.is_deleted == False)  # noqa: E712
@@ -58,6 +78,12 @@ def update_supplier(session: Session, *, public_id: str, name: str, region: str,
     sup.region = region
     sup.lead_time = lead_time
     sup.category = category
+    sup.email = email
+    sup.phone = phone
+    sup.address = address
+    sup.vat_number = vat_number
+    sup.contact_person = contact_person
+    sup.bank_details = bank_details
     session.flush()
     session.refresh(sup)
     return sup
@@ -178,6 +204,23 @@ def product_images(session: Session) -> dict[str, str]:
         .where(Product.is_deleted == False, Product.image_url.isnot(None))  # noqa: E712
     ).all()
     return {t: u for t, u in rows if u}
+
+
+def count_po_invoices(session: Session) -> int:
+    """Number of PO invoices for this tenant — drives the next sequence number."""
+    return session.execute(
+        select(func.count()).select_from(PoInvoice).where(PoInvoice.is_deleted == False)  # noqa: E712
+    ).scalar_one()
+
+
+def po_invoice_exists(session: Session, *, po_no: str | None) -> bool:
+    """Whether an invoice has already been generated for this PO (idempotency)."""
+    if not po_no:
+        return False
+    return session.execute(
+        select(func.count()).select_from(PoInvoice)
+        .where(PoInvoice.po_no == po_no, PoInvoice.is_deleted == False)  # noqa: E712
+    ).scalar_one() > 0
 
 
 def create_po_invoice(session: Session, *, tenant_id: UUID, invoice_no, po_no, supplier_name,

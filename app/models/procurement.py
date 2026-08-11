@@ -29,6 +29,9 @@ class Supplier(Base):
     address: Mapped[str | None] = mapped_column(String(300), nullable=True)
     code: Mapped[str | None] = mapped_column(String(20), nullable=True)
     terms: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    vat_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    contact_person: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    bank_details: Mapped[str | None] = mapped_column(String(400), nullable=True)
     opening_balance: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -81,7 +84,13 @@ class GoodsReceiptLine(Base):
 class PurchaseOrderLine(Base):
     __tablename__ = "purchase_order_lines"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    # Client-side default so multi-line POs insert cleanly: SQLAlchemy batches
+    # multiple lines into one INSERT…SELECT (VALUES…), and SQL Server's
+    # NEWSEQUENTIALID() default cannot evaluate in that form (→ NULL public_id).
+    # Generating the UUID in Python sidesteps that; server_default stays for
+    # direct SQL inserts.
+    public_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, server_default=text("NEWSEQUENTIALID()"), default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     po_id: Mapped[int] = mapped_column(BigInteger)
     name: Mapped[str] = mapped_column(String(200))

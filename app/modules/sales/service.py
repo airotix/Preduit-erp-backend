@@ -62,8 +62,17 @@ def customers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
 
 
 def _customer_fields(p) -> dict:
-    return {"name": p.name, "email": str(p.email), "kind": p.type,
-            "region": p.region, "phone": p.phone, "address": p.address}
+    return {"name": p.name, "email": p.email or "", "kind": p.type or "Retail",
+            "region": p.region, "phone": p.phone, "address": p.address,
+            "code": p.code, "terms": p.terms, "currency": p.currency,
+            "tax_id": p.taxId, "bank_name": p.bankName, "bank_account": p.bankAccount,
+            "contact_title": p.contactTitle}
+
+
+def search_customers(session: Session, *, q: str, limit: int = 10) -> list[dict]:
+    if not q or not q.strip():
+        return []
+    return repo.search_customers(session, q=q.strip(), limit=limit)
 
 
 def create_customer(session: Session, *, tenant_id: str | UUID, payload: CustomerCreate):
@@ -137,6 +146,13 @@ def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreat
         )
         from app.modules.finance import service as fin_service
         fin_service.post_unposted(session, tenant_id=tid)
+    # Auto-generate the commercial invoice document matching the order channel
+    # (Retail/Online → retail layout, Wholesale → wholesale layout) so it's listed
+    # in the Invoices tab and openable directly.
+    inv_type = order.channel if order.channel in ("Retail", "Online", "Wholesale") else "Retail"
+    inv_draft = build_sales_invoice_draft(session, order_no=order.order_no or "", invoice_type=inv_type)
+    if inv_draft is not None:
+        create_sales_invoice_doc(session, tenant_id=tid, data=inv_draft)
     # Kick off production: one work order for the whole sales order, with one
     # production line per distinct style (each gets its own timeline), linked
     # back so its detail can show the order's line items (Production → Orders).
@@ -375,7 +391,7 @@ def order_detail(session: Session, *, public_id: str) -> dict | None:
             {"k": "Items", "v": str(o.item_count)},
             {"k": "Total", "v": _money(o.total)},
         ],
-        "tabs": ["Summary", "Items", "Fulfillment", "Invoices", "Activity"],
+        "tabs": ["Summary", "Invoices", "Activity"],
         "doc": {
             "lines": _doc_lines(lines),
             "totals": [{"k": "Subtotal", "v": _money(subtotal)}],
@@ -384,6 +400,14 @@ def order_detail(session: Session, *, public_id: str) -> dict | None:
             "partyTitle": "Customer",
             "timeline": timeline,
             "party": _party(cust, o.customer_name),
+            # Commercial invoices generated against this order (openable directly).
+            "orderInvoices": [
+                {"publicId": str(r["public_id"]), "invoiceNo": r["invoice_no"] or "—",
+                 "invoiceType": r["invoice_type"], "currency": r["currency_code"],
+                 "total": _money(r["total"]), "status": r["status"],
+                 "createdAt": r["created_at"].strftime("%d %b %Y") if r["created_at"] else "—"}
+                for r in repo.sales_invoices_for_order(session, order_no=o.order_no or "")
+            ],
         },
     }
 
@@ -465,6 +489,21 @@ def customer_detail(session: Session, *, public_id: str) -> dict | None:
                 for o in orders[:6]
             ],
             "contact": _party(c, c.name),
+            # Redesigned customer card (REACH / ACCOUNT / FINANCE + actions).
+            "customerCard": {
+                "name": c.name, "kind": c.kind, "code": c.code or "",
+                "title": c.contact_title or "", "location": c.region or "",
+                "email": c.email or "", "phone": c.phone or "", "address": c.address or "",
+                "terms": c.terms or "", "currency": c.currency or "",
+                "taxId": c.tax_id or "", "bank": c.bank_name or "", "account": c.bank_account or "",
+            },
+            "customerForm": {
+                "name": c.name, "type": c.kind or "Retail", "region": c.region or "",
+                "email": c.email or "", "phone": c.phone or "", "address": c.address or "",
+                "code": c.code or "", "terms": c.terms or "", "currency": c.currency or "",
+                "taxId": c.tax_id or "", "bankName": c.bank_name or "",
+                "bankAccount": c.bank_account or "", "contactTitle": c.contact_title or "",
+            },
             "timeline": [
                 {"icon": "shopping-bag", "tone": _ORDER_STATUS_TONE.get(o["status"], "neutral"),
                  "title": f"Order {o['order_no']} · {o['status']}", "time": _money(o["total"]), "done": True}
@@ -531,15 +570,27 @@ def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: 
     biz = company.get("legal_name") or company.get("name") or ""
     today = datetime.date.today().isoformat()
     order_date = order.order_date.isoformat() if order.order_date else ""
+    # Auto invoice number: INV-0001, 0002, … (per tenant).
+    invoice_no = f"INV-{repo.count_sales_invoices(session) + 1:04d}"
 
     exporter = _exporter_from_company(company)
     buyer = {
         "name": customer.name if customer else order.customer_name,
         "phone": (customer.phone if customer else "") or "",
         "email": (customer.email if customer else "") or "",
-        "taxId": (customer.code if customer else "") or "",
+        # Prefer the customer's Tax ID/VAT; fall back to their customer code.
+        "taxId": ((customer.tax_id or customer.code) if customer else "") or "",
         "address": (customer.address if customer else "") or "",
         "country": (customer.region if customer else "") or "",
+    }
+    # Payment terms come from the customer profile when set.
+    cust_terms = (customer.terms if customer else "") or "Net 30"
+    # Bank block auto-filled from the customer's details card (same on every
+    # invoice type): title = customer name, bank + account from their profile.
+    remit = {
+        "title": buyer["name"],
+        "bank": (customer.bank_name if customer else "") or "",
+        "account": (customer.bank_account if customer else "") or "",
     }
 
     is_wholesale = invoice_type == "Wholesale"
@@ -591,13 +642,13 @@ def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: 
         grand_amt = round(grand_amt, 2)
         return {
             "layout": "wholesale", "invoiceType": invoice_type,
-            "invoiceNo": "", "invoiceDate": today, "orderNo": order.order_no or "",
+            "invoiceNo": invoice_no, "invoiceDate": today, "orderNo": order.order_no or "",
             "poNo": order.order_no or "", "orderDate": order_date, "deliveryDate": "",
-            "paymentTerms": "Net 30", "salesRep": "", "shipTo": "Same as buyer",
+            "paymentTerms": cust_terms, "salesRep": "", "shipTo": "Same as buyer",
             "currency": currency,
             "exporter": exporter, "buyer": buyer,
             "articles": article_list,
-            "remit": {"title": biz, "bank": "", "account": ""},
+            "remit": remit,
             "terms": "Payment Net 30 from invoice date. Minimum reorder 12 units per style.",
             "totals": {"totalQty": grand_qty, "subtotal": grand_amt, "discount": 0.0,
                        "taxRate": 0.0, "tax": 0.0, "freight": 0.0, "total": grand_amt},
@@ -622,9 +673,9 @@ def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: 
     grand_amt = round(grand_amt, 2)
     return {
         "layout": "retail", "invoiceType": invoice_type,
-        "invoiceNo": "", "invoiceDate": today, "orderRef": order.order_no or "",
+        "invoiceNo": invoice_no, "invoiceDate": today, "orderRef": order.order_no or "",
         "paymentMethod": "Card", "cashier": "", "status": "Paid", "currency": currency,
-        "exporter": exporter, "buyer": buyer,
+        "exporter": exporter, "buyer": buyer, "remit": remit,
         "lines": flat,
         "note": "Thank you for shopping with us. Exchanges within 14 days with this receipt. Sale items final.",
         "totals": {"totalQty": grand_qty, "subtotal": grand_amt, "discount": 0.0,

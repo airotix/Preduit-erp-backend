@@ -20,3 +20,9 @@ class DefectTypeUpdate(DefectTypeCreate):
 
 class StatusUpdate(BaseModel):
     status: str = Field(min_length=1, max_length=24)
+
+
+class PassShipIn(BaseModel):
+    """Mark an inspection Passed and ship it (carrier + destination)."""
+    carrier: str = Field(min_length=1, max_length=120)
+    destination: str = Field(min_length=1, max_length=160)

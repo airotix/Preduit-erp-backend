@@ -56,6 +56,15 @@ def start_production(public_id: str, payload: StartProductionIn,
     return {"public_id": str(po.public_id), "stage": po.stage}
 
 
+@router.post("/porders/{public_id}/inspect")
+def send_for_inspection(public_id: str, principal: Principal = Depends(require_tenant),
+                        db: Session = Depends(tenant_db)):
+    po = service.send_for_inspection(db, tenant_id=principal.tenant_id, public_id=public_id)
+    if po is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Production order not found")
+    return {"public_id": str(po.public_id)}
+
+
 @router.post("/porders/{public_id}/ship")
 def ship_order(public_id: str, payload: ShipOrderIn,
                principal: Principal = Depends(require_tenant),

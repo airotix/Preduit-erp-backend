@@ -2,17 +2,25 @@
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 
 
 class CustomerCreate(BaseModel):
-    """Matches the frontend 'New customer' form."""
+    """Matches the frontend 'New customer' form + the customer detail card editor.
+    email/type are lenient so a customer without an email can still be edited."""
     name: str = Field(min_length=1, max_length=200)
-    email: EmailStr
-    type: str = Field(pattern="^(Wholesale|Retail)$")
+    email: str | None = Field(default=None, max_length=256)
+    type: str | None = Field(default="Retail", max_length=20)
     region: str | None = None
     phone: str | None = None
     address: str | None = None
+    code: str | None = Field(default=None, max_length=20)
+    terms: str | None = Field(default=None, max_length=20)
+    currency: str | None = Field(default=None, max_length=3)
+    taxId: str | None = Field(default=None, max_length=40)
+    bankName: str | None = Field(default=None, max_length=120)
+    bankAccount: str | None = Field(default=None, max_length=60)
+    contactTitle: str | None = Field(default=None, max_length=120)
 
 
 class CustomerUpdate(CustomerCreate):

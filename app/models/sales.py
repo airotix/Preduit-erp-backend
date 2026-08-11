@@ -28,6 +28,11 @@ class Customer(Base):
     status: Mapped[str] = mapped_column(String(20), default="Active")
     code: Mapped[str | None] = mapped_column(String(20), nullable=True)
     terms: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    tax_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    bank_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    bank_account: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    contact_title: Mapped[str | None] = mapped_column(String(120), nullable=True)
     opening_balance: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 

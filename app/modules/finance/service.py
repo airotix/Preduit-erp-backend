@@ -679,9 +679,89 @@ def update_ledger_description(session: Session, *, edit_type: str, public_id: st
                                           public_id=public_id, description=description)
 
 
+def _build_supplier_statement(data: dict) -> dict:
+    """Running-balance supplier statement (payable). Bill rows show the credit we
+    owe; each disbursement is its own debit line (dated when recorded, referencing
+    its bill); manual entries are their own lines. Descriptions inline-editable."""
+    party, opening = data["party"], data["opening"]
+    items = [{**r, "kind": "bill"} for r in data["bills"]]
+    items += [{**e, "kind": "extra"} for e in data["extras"]]
+    items.sort(key=lambda x: x.get("date") or datetime.date.max)
+
+    rows = []
+    running = opening
+    total_debit = total_credit = 0.0
+    for it in items:
+        debit = float(it.get("debit") or 0)
+        credit = float(it.get("credit") or 0)
+        running += debit - credit  # bill = debit (payable), payment = credit
+        total_debit += debit
+        total_credit += credit
+        open_bill = (it["kind"] == "bill" and not it.get("paid")
+                     and float(it.get("remaining") or 0) > 0)
+        rows.append({
+            "date": _fmt_date(it.get("date")), "ref": it["ref"], "desc": it["desc"],
+            "debit": debit or None, "credit": credit or None, "balance": round(running, 2),
+            "editType": it.get("editType"), "editId": it.get("editId"),
+            # Record payment handle (unpaid bills) → disbursement for the remaining.
+            "invoicePublicId": it["public_id"] if open_bill else None,
+            "baseAmount": round(float(it.get("remaining") or 0), 2) if open_bill else None,
+        })
+    closing = round(running, 2)
+    standing_label, standing_tone = (("Payment due", "accent") if closing > 0
+                                     else ("Current", "green"))
+    return {
+        "name": party.name, "code": party.code or "—", "terms": party.terms or "—",
+        "email": getattr(party, "email", "") or "", "initials": initials(party.name),
+        "standingLabel": standing_label, "standingTone": standing_tone,
+        "opening": opening, "totalDebit": total_debit, "totalCredit": total_credit,
+        "closing": closing, "balanceLabel": "Payable", "balanceTone": "accent",
+        "rows": rows,
+    }
+
+
 def supplier_statement(session: Session, *, public_id: str) -> dict | None:
     data = repo.supplier_statement(session, public_id=public_id)
-    return _build_statement(data, kind="supplier") if data else None
+    return _build_supplier_statement(data) if data else None
+
+
+def create_supplier_ledger_entry(session: Session, *, tenant_id, supplier_public_id: str,
+                                 description: str, debit, credit):
+    s = repo.supplier_by_public(session, public_id=supplier_public_id)
+    return repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id), customer_id=None,
+                                    supplier_id=s.id if s else None,
+                                    description=description, debit=debit, credit=credit)
+
+
+def record_bill_payment(session: Session, *, tenant_id, public_id: str, amount_paid, paid: bool):
+    """Settle (all or part of) a payable: record a supplier disbursement so it
+    shows as a Debit on the supplier ledger and reduces the payable. Marks the
+    bill Paid when fully settled. Posts to the GL."""
+    tid = _uuid(tenant_id)
+    bill = repo.bill_by_public(session, public_id=public_id)
+    if bill is None:
+        return None
+    bill_amt = float(bill.amount or 0)
+    already = repo.disbursements_applied_to_bill(
+        session, bill_no=bill.bill_no, supplier_id=bill.supplier_id,
+        supplier_name=bill.supplier_name)
+    remaining = max(bill_amt - already, 0.0)
+    amt = float(amount_paid or 0)
+    if paid and amt <= 0:
+        amt = remaining
+    amt = min(amt, remaining) if remaining > 0 else 0.0
+    if amt > 0:
+        today = datetime.date.today()
+        repo.create_payment(
+            session, tenant_id=tid, party=bill.supplier_name, amount=amt,
+            pay_type="Disbursement", method="Bank", reference=bill.bill_no,
+            allocated_to=bill.bill_no, pay_date=today.isoformat(),
+            status="Cleared", notes=f"Payment for {bill.po_ref or bill.bill_no or 'bill'}")
+        if already + amt >= bill_amt and bill_amt > 0:
+            bill.status = "Paid"
+        session.flush()
+        post_unposted(session, tenant_id=tid)
+    return bill
 
 
 def _tid(t: str | UUID) -> UUID:

@@ -28,13 +28,22 @@ def list_customers(session: Session, *, limit: int, offset: int) -> tuple[list[d
     return rows, total
 
 
-def _apply_customer_fields(c: Customer, *, name, email, kind, region, phone, address) -> None:
+def _apply_customer_fields(c: Customer, *, name, email, kind, region, phone, address,
+                           code=None, terms=None, currency=None, tax_id=None,
+                           bank_name=None, bank_account=None, contact_title=None) -> None:
     c.name = name
     c.email = email
     c.kind = kind
     c.region = region
     c.phone = phone
     c.address = address
+    c.code = code
+    c.terms = terms
+    c.currency = currency
+    c.tax_id = tax_id
+    c.bank_name = bank_name
+    c.bank_account = bank_account
+    c.contact_title = contact_title
 
 
 def create_customer(session: Session, *, tenant_id: UUID, **fields) -> Customer:
@@ -63,6 +72,16 @@ def find_customer_id(session: Session, *, name: str) -> int | None:
     return session.execute(
         select(Customer.id).where(Customer.name == name)
     ).scalar_one_or_none()
+
+
+def search_customers(session: Session, *, q: str, limit: int = 10) -> list[dict]:
+    """Type-ahead over customer names for the New order form."""
+    rows = session.execute(
+        select(Customer.name, Customer.region)
+        .where(Customer.is_deleted == False, Customer.name.ilike(f"%{q}%"))  # noqa: E712
+        .order_by(Customer.name).limit(limit)
+    ).all()
+    return [{"name": n, "region": r or ""} for n, r in rows]
 
 
 def order_stats_by_customer(session: Session) -> dict[str, tuple[int, float]]:
@@ -378,6 +397,27 @@ def list_sales_invoices(session: Session, *, limit: int, offset: int) -> tuple[l
         select(func.count()).select_from(SalesInvoice).where(SalesInvoice.is_deleted == False)  # noqa: E712
     ).scalar_one()
     return rows, total
+
+
+def sales_invoices_for_order(session: Session, *, order_no: str) -> list[dict]:
+    """Commercial invoice documents generated against a given sales order."""
+    if not order_no:
+        return []
+    rows = session.execute(
+        select(SalesInvoice.public_id, SalesInvoice.invoice_no, SalesInvoice.invoice_type,
+               SalesInvoice.currency_code, SalesInvoice.total, SalesInvoice.status,
+               SalesInvoice.created_at)
+        .where(SalesInvoice.is_deleted == False, SalesInvoice.order_no == order_no)  # noqa: E712
+        .order_by(SalesInvoice.id.desc())
+    ).all()
+    return [dict(r._mapping) for r in rows]
+
+
+def count_sales_invoices(session: Session) -> int:
+    """Number of sales invoice documents — drives the INV-0001 sequence."""
+    return session.execute(
+        select(func.count()).select_from(SalesInvoice).where(SalesInvoice.is_deleted == False)  # noqa: E712
+    ).scalar_one()
 
 
 def get_sales_invoice(session: Session, *, public_id: str) -> SalesInvoice | None:

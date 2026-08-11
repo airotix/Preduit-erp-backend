@@ -34,6 +34,16 @@ def create_shipment(session: Session, *, tenant_id: UUID, order_ref, carrier, de
     return s
 
 
+def shipment_exists(session: Session, *, order_ref: str | None) -> bool:
+    """Whether a shipment already exists for this order (idempotency)."""
+    if not order_ref:
+        return False
+    return session.execute(
+        select(func.count()).select_from(Shipment)
+        .where(Shipment.order_ref == order_ref, Shipment.is_deleted == False)  # noqa: E712
+    ).scalar_one() > 0
+
+
 def set_status(session: Session, *, public_id: str, status: str) -> Shipment | None:
     s = session.execute(
         select(Shipment).where(Shipment.public_id == public_id,

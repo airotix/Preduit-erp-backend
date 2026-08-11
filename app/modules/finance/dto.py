@@ -13,9 +13,15 @@ class LedgerEntryIn(BaseModel):
 
 class LedgerDescriptionIn(BaseModel):
     """Inline edit of a ledger row's description."""
-    type: str = Field(pattern="^(invoice|manual|payment|cn)$")
+    type: str = Field(pattern="^(invoice|bill|manual|payment|cn)$")
     publicId: str = Field(min_length=1, max_length=64)
     description: str = Field(default="", max_length=400)
+
+
+class BillSettleIn(BaseModel):
+    """Payment confirmation for a payable (supplier ledger Record payment)."""
+    amountPaid: Decimal = Field(default=0, ge=0)
+    paid: bool = False
 
 
 class AccountCreate(BaseModel):

@@ -21,6 +21,12 @@ def customers_screen(
     return service.customers_screen(db, limit=limit, offset=offset)
 
 
+@router.get("/customers/search")
+def customers_search(q: str = Query(""), db: Session = Depends(tenant_db)):
+    """Type-ahead over customer names for the New order form."""
+    return service.search_customers(db, q=q, limit=10)
+
+
 @router.post("/customers", status_code=status.HTTP_201_CREATED)
 def create_customer(
     payload: CustomerCreate,

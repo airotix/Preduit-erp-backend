@@ -46,6 +46,16 @@ def set_result(session: Session, *, public_id: str, result: str) -> Inspection |
     return ins
 
 
+def inspection_exists(session: Session, *, order_ref: str | None) -> bool:
+    """Whether an inspection already exists for this order (idempotency)."""
+    if not order_ref:
+        return False
+    return session.execute(
+        select(func.count()).select_from(Inspection)
+        .where(Inspection.order_ref == order_ref, Inspection.is_deleted == False)  # noqa: E712
+    ).scalar_one() > 0
+
+
 def get_inspection(session: Session, *, public_id: str) -> Inspection | None:
     return session.execute(
         select(Inspection).where(Inspection.public_id == public_id,

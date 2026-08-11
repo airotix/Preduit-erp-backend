@@ -6,7 +6,7 @@ from app.core.deps import tenant_db
 from app.core.security import Principal, require_tenant
 from app.modules.quality import service
 from app.modules.quality.dto import (
-    DefectTypeCreate, DefectTypeUpdate, InspectionCreate, StatusUpdate,
+    DefectTypeCreate, DefectTypeUpdate, InspectionCreate, PassShipIn, StatusUpdate,
 )
 
 router = APIRouter(prefix="/quality", tags=["quality"])
@@ -29,7 +29,19 @@ def create_inspection(payload: InspectionCreate, principal: Principal = Depends(
 def inspection_result(public_id: str, payload: StatusUpdate,
                       principal: Principal = Depends(require_tenant),
                       db: Session = Depends(tenant_db)):
-    ins = service.set_result(db, public_id=public_id, status=payload.status)
+    ins = service.set_result(db, public_id=public_id, status=payload.status,
+                             tenant_id=principal.tenant_id)
+    if ins is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Inspection not found")
+    return {"public_id": str(ins.public_id), "result": ins.result}
+
+
+@router.post("/inspections/{public_id}/pass")
+def pass_and_ship(public_id: str, payload: PassShipIn,
+                  principal: Principal = Depends(require_tenant),
+                  db: Session = Depends(tenant_db)):
+    ins = service.pass_and_ship(db, tenant_id=principal.tenant_id, public_id=public_id,
+                                carrier=payload.carrier, destination=payload.destination)
     if ins is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Inspection not found")
     return {"public_id": str(ins.public_id), "result": ins.result}

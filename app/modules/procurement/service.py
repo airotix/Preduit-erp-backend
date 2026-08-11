@@ -118,14 +118,31 @@ def pos_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
 
 
 def create_po(session: Session, *, tenant_id: str | UUID, payload: PurchaseOrderCreate):
+    import datetime
     tid = _tid(tenant_id)
     supplier = repo.find_supplier(session, name=payload.supplier)
+    if supplier is None:
+        # Auto-register an unknown supplier so it appears in the Suppliers tab and
+        # on the supplier ledger — mirrors how a new customer is created on order.
+        supplier = repo.create_supplier(session, tenant_id=tid, name=payload.supplier,
+                                        region=None, lead_time=None, category=None)
     lines = [{"name": l.name, "color": l.color, "sku": l.sku, "qty": l.qty, "price": l.price}
              for l in payload.lines]
-    return repo.create_po(
+    po = repo.create_po(
         session, tenant_id=tid, supplier=supplier, supplier_name=payload.supplier,
         expected=payload.expected, lines=lines,
     )
+    # Raise a payable for the PO so it lands on the supplier ledger as a Credit
+    # (posted to the GL). Payment (Debit) is confirmed later via Record payment.
+    total = float(po.total or 0)
+    if total > 0:
+        from app.modules.finance import repository as fin_repo
+        from app.modules.finance import service as fin_service
+        due_on = datetime.date.today() + datetime.timedelta(days=30)
+        fin_repo.create_bill(session, tenant_id=tid, supplier_name=payload.supplier,
+                             po_ref=po.po_no, amount=po.total, due_on=due_on, status="Open")
+        fin_service.post_unposted(session, tenant_id=tid)
+    return po
 
 
 def _po_money(v) -> str:
@@ -236,14 +253,27 @@ def receipts_screen(session: Session, *, limit: int = 50, offset: int = 0) -> di
 def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsReceiptCreate):
     tid = _tid(tenant_id)
     supplier = repo.find_supplier(session, name=payload.supplier)
+    if supplier is None and (payload.supplier or "").strip():
+        # Auto-register an unknown supplier on receipt too, so it always appears
+        # in the Suppliers tab and on the supplier ledger.
+        supplier = repo.create_supplier(session, tenant_id=tid, name=payload.supplier.strip(),
+                                        region=None, lead_time=None, category=None)
     return repo.create_receipt(
         session, tenant_id=tid, po_ref=payload.po, supplier=supplier,
         supplier_name=payload.supplier, lines=payload.lines,
     )
 
 
-def set_po_status(session, *, public_id, status):
-    return repo.set_po_status(session, public_id=public_id, status=status)
+def set_po_status(session, *, public_id, status, tenant_id=None):
+    po = repo.set_po_status(session, public_id=public_id, status=status)
+    # On approval, auto-generate the commercial invoice for the PO (once) so it
+    # shows up in the Invoices list immediately.
+    if po is not None and status == "Approved" and tenant_id is not None:
+        if not repo.po_invoice_exists(session, po_no=po.po_no):
+            draft = build_invoice_draft(session, po_no=po.po_no)
+            if draft is not None:
+                create_invoice(session, tenant_id=tenant_id, data=draft)
+    return po
 
 
 def set_receipt_status(session, *, public_id, status):
@@ -274,15 +304,26 @@ def suppliers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
         records=[{"name": r["name"], "region": r["region"],
-                  "leadTime": r["lead_time"], "category": r["category"]} for r in rows],
+                  "leadTime": r["lead_time"], "category": r["category"],
+                  "vatNumber": r.get("vat_number"), "contactPerson": r.get("contact_person"),
+                  "bankDetails": r.get("bank_details")} for r in rows],
         search="Search suppliers…", action="New supplier", filters=["Region", "Rating"],
     )
+
+
+def search_suppliers(session: Session, *, q: str, limit: int = 10) -> list[dict]:
+    if not q or not q.strip():
+        return []
+    return repo.search_suppliers(session, q=q.strip(), limit=limit)
 
 
 def create_supplier(session: Session, *, tenant_id: str | UUID, payload: SupplierCreate):
     return repo.create_supplier(
         session, tenant_id=_tid(tenant_id), name=payload.name, region=payload.region,
         lead_time=payload.leadTime, category=payload.category,
+        email=payload.email, phone=payload.phone, address=payload.address,
+        vat_number=payload.vatNumber, contact_person=payload.contactPerson,
+        bank_details=payload.bankDetails,
     )
 
 
@@ -290,6 +331,9 @@ def update_supplier(session: Session, *, public_id: str, payload: SupplierUpdate
     return repo.update_supplier(
         session, public_id=public_id, name=payload.name, region=payload.region,
         lead_time=payload.leadTime, category=payload.category,
+        email=payload.email, phone=payload.phone, address=payload.address,
+        vat_number=payload.vatNumber, contact_person=payload.contactPerson,
+        bank_details=payload.bankDetails,
     )
 
 
@@ -356,8 +400,26 @@ def supplier_detail(session: Session, *, public_id: str) -> dict | None:
                  "s": p["status"]}
                 for p in pos[:6]
             ],
+            "contactTitle": "Details",
             "contact": {"name": s.name, "email": s.email or "",
-                        "phone": s.phone or "", "addr": s.address or ""},
+                        "phone": s.phone or "", "addr": s.address or "",
+                        "vat": s.vat_number or "", "contact": s.contact_person or "",
+                        "bank": s.bank_details or ""},
+            # Redesigned supplier details card (CONTACT + FINANCE + actions).
+            "supplierCard": {
+                "name": s.name, "status": s.status, "code": s.code or "",
+                "location": s.region or s.address or "",
+                "email": s.email or "", "phone": s.phone or "",
+                "contactId": s.contact_person or "",
+                "vat": s.vat_number or "", "bank": s.bank_details or "",
+            },
+            # Raw values to prefill the in-place "Edit details" form.
+            "supplierForm": {
+                "name": s.name, "region": s.region or "", "leadTime": s.lead_time or "",
+                "category": s.category or "", "email": s.email or "", "phone": s.phone or "",
+                "address": s.address or "", "contactPerson": s.contact_person or "",
+                "vatNumber": s.vat_number or "", "bankDetails": s.bank_details or "",
+            },
             "timeline": [
                 {"icon": "file-text", "tone": _PO_TONE.get(p["status"], "neutral"),
                  "title": f"{p['po_no']} · {p['status']}", "time": f"€{p['total']:,.0f}", "done": True}
@@ -465,9 +527,14 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
     company = repo.company_info(session)
     biz = company.get("name") or ""
     supplier_name = supplier.name if supplier else po.supplier_name
+    # Auto invoice number: BusinessName-0001, 0002, … (per tenant).
+    slug = "".join(biz.split()) or "INV"
+    seq = repo.count_po_invoices(session) + 1
+    invoice_no = f"{slug}-{seq:04d}"
     return {
-        "invoiceNo": "", "invoiceDate": today, "poNo": po.po_no or "",
-        "orderDate": "", "deliveryDate": po.expected or "", "contact": "",
+        "invoiceNo": invoice_no, "invoiceDate": today, "poNo": po.po_no or "",
+        "orderDate": today, "deliveryDate": po.expected or "",
+        "contact": (supplier.phone if supplier else "") or "",
         "incoterms": "FOB Karachi", "origin": company.get("country") or "Pakistan",
         "currency": currency,
         "terms": "T/T · L/C", "portLoading": company.get("city") or "Karachi", "portDischarge": "",
@@ -476,13 +543,16 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
         # Right counterparty box = the supplier.
         "buyer": {
             "name": supplier_name,
-            "vat": "",
+            "vat": (supplier.vat_number if supplier else "") or "",
+            "contact": (supplier.contact_person if supplier else "") or "",
             "country": (supplier.country_code if supplier else "") or "",
             "tel": (supplier.phone if supplier else "") or "",
             "email": (supplier.email if supplier else "") or "",
         },
-        "bank": {"beneficiary": company.get("legal_name") or biz, "bank": "", "branch": "",
-                 "account": "", "swift": "", "corresp": ""},
+        # Payment goes to the supplier → their bank details (from the supplier profile).
+        "bank": {"beneficiary": supplier_name,
+                 "bank": (supplier.bank_details if supplier else "") or "",
+                 "branch": "", "account": "", "swift": "", "corresp": ""},
         "articles": article_list,
         "totals": {
             "totalQty": grand_qty, "subtotal": grand_amt, "freight": 0.0,

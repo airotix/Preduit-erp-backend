@@ -346,6 +346,18 @@ def list_ap_aging(session: Session) -> list[dict]:
 
 # ---------- Supplier bills (payables) ----------
 
+def find_supplier(session: Session, *, name: str) -> Supplier | None:
+    """Resolve a supplier by name within the tenant (RLS-scoped). Used to link
+    bills/payments to a supplier id. Defined here so finance doesn't depend on
+    the procurement repo (which would risk an import cycle)."""
+    if not name:
+        return None
+    return session.execute(
+        select(Supplier).where(Supplier.name == name, Supplier.is_deleted == False)  # noqa: E712
+        .order_by(Supplier.id)
+    ).scalars().first()
+
+
 def list_bills(session, *, limit, offset):
     return _list(session, [SupplierBill.public_id, SupplierBill.bill_no, SupplierBill.supplier_name,
                            SupplierBill.po_ref, SupplierBill.amount, SupplierBill.due_on,
@@ -470,22 +482,35 @@ def _customer_entries(session: Session, customer_id: int, customer_name: str | N
     return entries
 
 
-def _supplier_entries(session: Session, supplier_id: int) -> list[dict]:
+def _supplier_entries(session: Session, supplier_id: int, supplier_name: str | None = None) -> list[dict]:
+    """Ledger entries for a supplier. Match bills/payments by supplier_id OR name
+    (mirrors the customer side) so the party-list balance matches the statement."""
     entries: list[dict] = []
+    bill_match = [SupplierBill.supplier_id == supplier_id]
+    pay_match = [and_(Payment.party_type == "supplier", Payment.party_id == supplier_id)]
+    if supplier_name:
+        bill_match.append(SupplierBill.supplier_name == supplier_name)
+        pay_match.append(Payment.party == supplier_name)
     for b in session.execute(
-        select(SupplierBill).where(SupplierBill.is_deleted == False,  # noqa: E712
-                                   SupplierBill.supplier_id == supplier_id)
+        select(SupplierBill).where(SupplierBill.is_deleted == False, or_(*bill_match))  # noqa: E712
     ).scalars():
-        entries.append({"date": b.due_on, "ref": b.bill_no or "BILL",
-                        "desc": b.po_ref or "Supplier bill", "debit": 0.0,
-                        "credit": float(b.amount or 0)})
+        entries.append({"date": b.issued_date or b.due_on, "ref": b.bill_no or "BILL",
+                        "desc": b.po_ref or "Supplier bill",
+                        "debit": float(b.amount or 0), "credit": 0.0})
     for p in session.execute(
-        select(Payment).where(Payment.is_deleted == False,  # noqa: E712
-                              Payment.party_type == "supplier", Payment.party_id == supplier_id,
-                              Payment.pay_type.in_(["Disbursement", "Payment"]))
+        select(Payment).where(
+            Payment.is_deleted == False,  # noqa: E712
+            Payment.pay_type.in_(["Disbursement", "Payment"]), or_(*pay_match))
     ).scalars():
         entries.append({"date": _parse_dm(p.pay_date), "ref": p.payment_no or "PAY",
-                        "desc": p.notes or "Payment", "debit": float(p.amount or 0), "credit": 0.0})
+                        "desc": p.notes or "Payment", "debit": 0.0, "credit": float(p.amount or 0)})
+    for le in session.execute(
+        select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
+                                  LedgerEntry.supplier_id == supplier_id)
+    ).scalars():
+        entries.append({"date": le.entry_date, "ref": "ENTRY",
+                        "desc": le.description or "Ledger entry",
+                        "debit": float(le.debit or 0), "credit": float(le.credit or 0)})
     entries.sort(key=lambda e: e["date"] or datetime.date.max)
     return entries
 
@@ -508,10 +533,10 @@ def supplier_parties(session: Session) -> list[dict]:
     for s in session.execute(
         select(Supplier).where(Supplier.is_deleted == False).order_by(Supplier.name)  # noqa: E712
     ).scalars():
-        entries = _supplier_entries(session, s.id)
+        entries = _supplier_entries(session, s.id, s.name)
         debit = sum(e["debit"] for e in entries)
         credit = sum(e["credit"] for e in entries)
-        bal = float(s.opening_balance or 0) + credit - debit
+        bal = float(s.opening_balance or 0) + debit - credit
         out.append({"public_id": str(s.public_id), "name": s.name, "code": s.code, "balance": bal})
     return out
 
@@ -597,8 +622,9 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
 
 
 def create_ledger_entry(session: Session, *, tenant_id: UUID, customer_id: int | None,
-                        description: str, debit, credit) -> LedgerEntry:
-    le = LedgerEntry(tenant_id=tenant_id, customer_id=customer_id,
+                        description: str, debit, credit,
+                        supplier_id: int | None = None) -> LedgerEntry:
+    le = LedgerEntry(tenant_id=tenant_id, customer_id=customer_id, supplier_id=supplier_id,
                      entry_date=datetime.date.today(), description=description,
                      debit=debit or 0, credit=credit or 0)
     session.add(le)
@@ -619,6 +645,7 @@ def update_ledger_description(session: Session, *, edit_type: str, public_id: st
     """Edit the description of any ledger row, routed to its source record."""
     model_field = {
         "invoice": (Invoice, "memo"),
+        "bill": (SupplierBill, "memo"),
         "manual": (LedgerEntry, "description"),
         "payment": (Payment, "notes"),
         "cn": (CreditNote, "reason"),
@@ -661,8 +688,97 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
     ).scalar_one_or_none()
     if s is None:
         return None
+    overdue = session.execute(
+        select(func.count()).select_from(SupplierBill).where(
+            SupplierBill.is_deleted == False, SupplierBill.status != "Paid",  # noqa: E712
+            SupplierBill.supplier_id == s.id, SupplierBill.due_on.isnot(None),
+            SupplierBill.due_on < datetime.date.today(),
+        )
+    ).scalar_one()
+    # Bills for this supplier (by id or name) — payable = credit on the ledger.
+    bill_match = [SupplierBill.supplier_id == s.id, SupplierBill.supplier_name == s.name]
+    bills = session.execute(
+        select(SupplierBill).where(SupplierBill.is_deleted == False, or_(*bill_match))  # noqa: E712
+        .order_by(SupplierBill.due_on, SupplierBill.id)
+    ).scalars().all()
+    bill_nos = {b.bill_no for b in bills if b.bill_no}
+
+    disbursements = session.execute(
+        select(Payment).where(
+            Payment.is_deleted == False,  # noqa: E712
+            Payment.pay_type.in_(["Disbursement", "Payment"]),
+            or_(and_(Payment.party_type == "supplier", Payment.party_id == s.id),
+                Payment.party == s.name),
+        )
+    ).scalars().all()
+    debit_by_bill: dict[str, float] = {}
+    extras: list[dict] = []
+    for p in disbursements:
+        alloc = (p.allocated_to or "").strip()
+        amt = float(p.amount or 0)
+        allocated = bool(alloc and alloc in bill_nos)
+        if allocated:  # tracked to compute the bill's paid/remaining status
+            debit_by_bill[alloc] = debit_by_bill.get(alloc, 0.0) + amt
+        # Each payment is its own credit line, dated when recorded, referencing its bill.
+        extras.append({"date": _parse_dm(p.pay_date),
+                       "ref": alloc if allocated else (p.payment_no or "PAY"),
+                       "desc": p.notes or "Payment", "debit": 0.0, "credit": amt,
+                       "editType": "payment", "editId": str(p.public_id)})
+    for le in session.execute(
+        select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
+                                  LedgerEntry.supplier_id == s.id)
+    ).scalars():
+        extras.append({"date": le.entry_date, "ref": "ENTRY",
+                       "desc": le.description or "Ledger entry",
+                       "debit": float(le.debit or 0), "credit": float(le.credit or 0),
+                       "editType": "manual", "editId": str(le.public_id)})
+
+    bill_rows = []
+    for b in bills:
+        amt = float(b.amount or 0)
+        applied = round(debit_by_bill.get(b.bill_no or "", 0.0), 2)
+        bill_rows.append({
+            "date": b.issued_date or b.due_on, "ref": b.bill_no or "BILL",
+            "desc": b.memo or b.po_ref or "Supplier bill",
+            "debit": amt, "credit": 0.0, "remaining": round(amt - applied, 2),
+            "public_id": str(b.public_id), "editType": "bill", "editId": str(b.public_id),
+            "paid": (b.status == "Paid") or (amt > 0 and applied >= amt),
+        })
+    extras.sort(key=lambda e: e["date"] or datetime.date.max)
     return {"party": s, "opening": float(s.opening_balance or 0),
-            "entries": _supplier_entries(session, s.id)}
+            "bills": bill_rows, "extras": extras, "overdue": overdue}
+
+
+def supplier_by_public(session: Session, *, public_id: str) -> Supplier | None:
+    return session.execute(
+        select(Supplier).where(Supplier.public_id == public_id,
+                               Supplier.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
+
+
+def bill_by_public(session: Session, *, public_id: str) -> SupplierBill | None:
+    return session.execute(
+        select(SupplierBill).where(SupplierBill.public_id == public_id,
+                                   SupplierBill.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
+
+
+def disbursements_applied_to_bill(session: Session, *, bill_no: str | None,
+                                  supplier_id: int | None, supplier_name: str | None) -> float:
+    """Total disbursements already allocated to a specific bill for a supplier."""
+    if not bill_no:
+        return 0.0
+    party = [and_(Payment.party_type == "supplier", Payment.party_id == supplier_id)]
+    if supplier_name:
+        party.append(Payment.party == supplier_name)
+    total = session.execute(
+        select(func.coalesce(func.sum(Payment.amount), 0)).where(
+            Payment.is_deleted == False,  # noqa: E712
+            Payment.pay_type.in_(["Disbursement", "Payment"]),
+            Payment.allocated_to == bill_no, or_(*party),
+        )
+    ).scalar_one()
+    return float(total or 0)
 
 
 # ---------- Profitability ----------

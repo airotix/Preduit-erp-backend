@@ -8,7 +8,7 @@ from app.modules.finance import service
 from app.modules.finance import fx as fx_service
 from app.modules.finance.dto import (
     AccountCreate, AccountUpdate, BankAccountCreate, BankTxnCreate, BillCreate,
-    BillUpdate, BudgetLineCreate, FixedAssetCreate, JournalEntryCreate,
+    BillSettleIn, BillUpdate, BudgetLineCreate, FixedAssetCreate, JournalEntryCreate,
     JournalEntryUpdate, JournalFull, LedgerDescriptionIn, LedgerEntryIn,
     PaymentCreate, PaymentUpdate, PeriodCreate,
 )
@@ -246,6 +246,28 @@ def supplier_ledger_statement(public_id: str, currency: str = Query("PKR"),
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Supplier not found")
     return service.convert(db, d, currency=currency)
+
+
+@router.post("/supplier-ledger/{public_id}/entries", status_code=status.HTTP_201_CREATED)
+def create_supplier_ledger_entry(public_id: str, payload: LedgerEntryIn,
+                                 principal: Principal = Depends(require_tenant),
+                                 db: Session = Depends(tenant_db)):
+    le = service.create_supplier_ledger_entry(
+        db, tenant_id=principal.tenant_id, supplier_public_id=public_id,
+        description=payload.description, debit=payload.debit, credit=payload.credit)
+    return {"public_id": str(le.public_id)}
+
+
+@router.post("/bills/{public_id}/settle")
+def settle_bill(public_id: str, payload: BillSettleIn,
+                principal: Principal = Depends(require_tenant),
+                db: Session = Depends(tenant_db)):
+    bill = service.record_bill_payment(
+        db, tenant_id=principal.tenant_id, public_id=public_id,
+        amount_paid=payload.amountPaid, paid=payload.paid)
+    if bill is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bill not found")
+    return {"public_id": str(bill.public_id), "status": bill.status}
 
 
 @router.get("/coa/screen")
