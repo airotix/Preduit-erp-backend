@@ -632,7 +632,7 @@ def _build_customer_statement(data: dict) -> dict:
     for it in items:
         debit = float(it.get("debit") or 0)
         credit = float(it.get("credit") or 0)
-        running += debit - credit
+        running += credit - debit
         total_debit += debit
         total_credit += credit
         open_inv = (it["kind"] == "invoice" and not it.get("paid")
@@ -641,6 +641,7 @@ def _build_customer_statement(data: dict) -> dict:
             "date": _fmt_date(it.get("date")), "ref": it["ref"], "desc": it["desc"],
             "debit": debit or None, "credit": credit or None, "balance": round(running, 2),
             "editType": it.get("editType"), "editId": it.get("editId"),
+            "paymentType": it.get("paymentType"),
             # Record-payment handle (unpaid invoices) targets the remaining balance.
             "invoicePublicId": it["public_id"] if open_inv else None,
             "baseAmount": round(float(it.get("remaining") or 0), 2) if open_inv else None,
@@ -666,17 +667,67 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
 
 
 def create_ledger_entry(session: Session, *, tenant_id, customer_public_id: str,
-                        description: str, debit, credit):
+                        description: str, debit, credit, payment_type: str | None = None):
     c = repo.customer_by_public(session, public_id=customer_public_id)
     return repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id),
                                     customer_id=c.id if c else None,
-                                    description=description, debit=debit, credit=credit)
+                                    description=description, debit=debit, credit=credit,
+                                    payment_type=payment_type)
+
+
+def create_cash_bank_entry(session: Session, *, tenant_id, kind: str,
+                           description: str, debit, credit):
+    """A manual line straight onto the Cash or Bank ledger — no customer/supplier
+    party — tagged with the ledger's payment type so it shows in that ledger."""
+    return repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id),
+                                    customer_id=None, supplier_id=None,
+                                    description=description, debit=debit, credit=credit,
+                                    payment_type=kind)
 
 
 def update_ledger_description(session: Session, *, edit_type: str, public_id: str,
                               description: str) -> bool:
     return repo.update_ledger_description(session, edit_type=edit_type,
                                           public_id=public_id, description=description)
+
+
+def update_ledger_payment_type(session: Session, *, edit_type: str, public_id: str,
+                               payment_type: str | None) -> bool:
+    return repo.update_ledger_payment_type(session, edit_type=edit_type,
+                                           public_id=public_id, payment_type=payment_type)
+
+
+def _build_cash_bank_ledger(rows: list[dict], *, kind: str) -> dict:
+    """Running-balance ledger consolidated across every customer and supplier —
+    same shape/behaviour as the customer/supplier ledger tables (inline-editable
+    description and payment type), just filtered to one payment type."""
+    out_rows = []
+    running = 0.0
+    total_debit = total_credit = 0.0
+    for r in rows:
+        debit = float(r.get("debit") or 0)
+        credit = float(r.get("credit") or 0)
+        running += credit - debit
+        total_debit += debit
+        total_credit += credit
+        out_rows.append({
+            "date": _fmt_date(r.get("date")), "ref": r["ref"],
+            "party": r.get("party") or "—", "partyType": r.get("partyType"),
+            "source": r.get("source"), "desc": r["desc"],
+            "debit": debit or None, "credit": credit or None, "balance": round(running, 2),
+            "editType": r.get("editType"), "editId": r.get("editId"),
+            "paymentType": kind,
+        })
+    return {
+        "kind": kind, "label": "Cash ledger" if kind == "cash" else "Bank ledger",
+        "opening": 0.0, "totalDebit": total_debit, "totalCredit": total_credit,
+        "closing": round(running, 2), "rows": out_rows,
+    }
+
+
+def cash_bank_ledger(session: Session, *, kind: str) -> dict:
+    rows = repo.cash_bank_ledger(session, payment_type=kind)
+    return _build_cash_bank_ledger(rows, kind=kind)
 
 
 def _build_supplier_statement(data: dict) -> dict:
@@ -703,6 +754,7 @@ def _build_supplier_statement(data: dict) -> dict:
             "date": _fmt_date(it.get("date")), "ref": it["ref"], "desc": it["desc"],
             "debit": debit or None, "credit": credit or None, "balance": round(running, 2),
             "editType": it.get("editType"), "editId": it.get("editId"),
+            "paymentType": it.get("paymentType"),
             # Record payment handle (unpaid bills) → disbursement for the remaining.
             "invoicePublicId": it["public_id"] if open_bill else None,
             "baseAmount": round(float(it.get("remaining") or 0), 2) if open_bill else None,
@@ -726,11 +778,12 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
 
 
 def create_supplier_ledger_entry(session: Session, *, tenant_id, supplier_public_id: str,
-                                 description: str, debit, credit):
+                                 description: str, debit, credit, payment_type: str | None = None):
     s = repo.supplier_by_public(session, public_id=supplier_public_id)
     return repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id), customer_id=None,
                                     supplier_id=s.id if s else None,
-                                    description=description, debit=debit, credit=credit)
+                                    description=description, debit=debit, credit=credit,
+                                    payment_type=payment_type)
 
 
 def record_bill_payment(session: Session, *, tenant_id, public_id: str, amount_paid, paid: bool):
@@ -973,6 +1026,9 @@ def _aging_screen(rows: list[dict], entity_label: str, name_key: str, action: st
                  {"label": "31–60", "align": "right"}, {"label": "61–90", "align": "right"},
                  {"label": "90+", "align": "right"}, {"label": "Total", "align": "right"}],
         rows=grid, total=len(rows),
+        # "Region" is only shown as the entity cell's sub-text — surfaced here
+        # so the Region filter has real data to filter on.
+        records=[{"region": r["region"]} for r in rows],
         search=f"Search {entity_label.lower()}s…", action=action, filters=["Region"],
     )
 

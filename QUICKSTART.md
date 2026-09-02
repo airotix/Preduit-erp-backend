@@ -20,9 +20,9 @@ Goal: run the API on your machine and see real catalog data from your
 Open **PowerShell**, then:
 
 ```powershell
-cd "C:\Users\GamaZone\OneDrive\Desktop\Preduit\preduit-erp\backend"
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+cd backend
+py -3.13 -m venv venv312
+.\venv312\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 

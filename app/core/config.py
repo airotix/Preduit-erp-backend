@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     jwt_access_minutes: int = 30
     jwt_refresh_days: int = 14
 
+    # Refresh token delivery. The refresh token is sent as an HttpOnly cookie
+    # (JS can't read it → not exfiltratable via XSS) rather than in the JSON
+    # body. The browser reaches the API same-origin through the Next.js proxy,
+    # so a first-party SameSite=Lax cookie works in dev (http) and prod (https).
+    refresh_cookie_name: str = "erp_refresh"
+    refresh_cookie_path: str = "/api/v1/auth"     # only sent to refresh/logout/me
+    refresh_cookie_samesite: str = "lax"
+
+    @property
+    def refresh_cookie_secure(self) -> bool:
+        # Secure (HTTPS-only) everywhere except local dev over http.
+        return self.env != "dev"
+
     # Auth hardening (AUTH-E).
     auth_max_failed_attempts: int = 5      # failed logins before a temporary lock
     auth_lockout_minutes: int = 15         # how long the account stays locked
@@ -49,6 +62,32 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    # File uploads (documents module). Reject anything larger than the cap or
+    # whose extension/MIME isn't on the allowlist.
+    upload_max_bytes: int = 15 * 1024 * 1024   # 15 MB
+    upload_allowed_exts: str = (
+        "png,jpg,jpeg,gif,webp,svg,pdf,csv,txt,doc,docx,xls,xlsx,ppt,pptx"
+    )
+    upload_allowed_mimes: str = (
+        "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,"
+        "application/pdf,text/csv,text/plain,"
+        "application/msword,"
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document,"
+        "application/vnd.ms-excel,"
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+        "application/vnd.ms-powerpoint,"
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation,"
+        "application/octet-stream"   # some browsers send this for known-good files
+    )
+
+    @property
+    def upload_ext_set(self) -> set[str]:
+        return {e.strip().lower().lstrip(".") for e in self.upload_allowed_exts.split(",") if e.strip()}
+
+    @property
+    def upload_mime_set(self) -> set[str]:
+        return {m.strip().lower() for m in self.upload_allowed_mimes.split(",") if m.strip()}
 
     @property
     def jwt_secret_is_default(self) -> bool:

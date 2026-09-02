@@ -258,10 +258,17 @@ def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsRec
         # in the Suppliers tab and on the supplier ledger.
         supplier = repo.create_supplier(session, tenant_id=tid, name=payload.supplier.strip(),
                                         region=None, lead_time=None, category=None)
-    return repo.create_receipt(
+    grn = repo.create_receipt(
         session, tenant_id=tid, po_ref=payload.po, supplier=supplier,
         supplier_name=payload.supplier, lines=payload.lines,
     )
+    # Receiving goods against a PO increments inventory for that PO's line items.
+    po = repo.po_by_no(session, po_no=payload.po) if payload.po else None
+    if po is not None:
+        from app.modules.inventory import service as inv_service
+        inv_service.receive_stock_lines(session, tenant_id=tid,
+                                        lines=repo.po_lines(session, po_id=po.id))
+    return grn
 
 
 def set_po_status(session, *, public_id, status, tenant_id=None):
@@ -306,7 +313,11 @@ def suppliers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
         records=[{"name": r["name"], "region": r["region"],
                   "leadTime": r["lead_time"], "category": r["category"],
                   "vatNumber": r.get("vat_number"), "contactPerson": r.get("contact_person"),
-                  "bankDetails": r.get("bank_details")} for r in rows],
+                  "bankDetails": r.get("bank_details"),
+                  # "Rating" is the same underlying tier as the Status column
+                  # (Preferred/On watch/New/Suspended) — duplicated under this
+                  # key purely so the Rating filter has a matching data source.
+                  "rating": r["status"]} for r in rows],
         search="Search suppliers…", action="New supplier", filters=["Region", "Rating"],
     )
 
@@ -323,7 +334,9 @@ def create_supplier(session: Session, *, tenant_id: str | UUID, payload: Supplie
         lead_time=payload.leadTime, category=payload.category,
         email=payload.email, phone=payload.phone, address=payload.address,
         vat_number=payload.vatNumber, contact_person=payload.contactPerson,
-        bank_details=payload.bankDetails,
+        bank_details=payload.bankDetails, bank_name=payload.bankName,
+        bank_account_title=payload.bankAccountTitle, bank_account_number=payload.bankAccountNumber,
+        bank_swift=payload.bankSwift, bank_iban=payload.bankIban,
     )
 
 
@@ -333,7 +346,9 @@ def update_supplier(session: Session, *, public_id: str, payload: SupplierUpdate
         lead_time=payload.leadTime, category=payload.category,
         email=payload.email, phone=payload.phone, address=payload.address,
         vat_number=payload.vatNumber, contact_person=payload.contactPerson,
-        bank_details=payload.bankDetails,
+        bank_details=payload.bankDetails, bank_name=payload.bankName,
+        bank_account_title=payload.bankAccountTitle, bank_account_number=payload.bankAccountNumber,
+        bank_swift=payload.bankSwift, bank_iban=payload.bankIban,
     )
 
 
@@ -360,6 +375,7 @@ def scorecard_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
         ],
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
+        records=[{"region": r["region"]} for r in rows],
         search="Search suppliers…", action="Export", filters=["Region"],
     )
 
@@ -411,14 +427,20 @@ def supplier_detail(session: Session, *, public_id: str) -> dict | None:
                 "location": s.region or s.address or "",
                 "email": s.email or "", "phone": s.phone or "",
                 "contactId": s.contact_person or "",
-                "vat": s.vat_number or "", "bank": s.bank_details or "",
+                "vat": s.vat_number or "",
+                "bankName": s.bank_name or "", "bankAccountTitle": s.bank_account_title or "",
+                "bankAccountNumber": s.bank_account_number or "", "bankSwift": s.bank_swift or "",
+                "bankIban": s.bank_iban or "",
             },
             # Raw values to prefill the in-place "Edit details" form.
             "supplierForm": {
                 "name": s.name, "region": s.region or "", "leadTime": s.lead_time or "",
                 "category": s.category or "", "email": s.email or "", "phone": s.phone or "",
                 "address": s.address or "", "contactPerson": s.contact_person or "",
-                "vatNumber": s.vat_number or "", "bankDetails": s.bank_details or "",
+                "vatNumber": s.vat_number or "",
+                "bankName": s.bank_name or "", "bankAccountTitle": s.bank_account_title or "",
+                "bankAccountNumber": s.bank_account_number or "", "bankSwift": s.bank_swift or "",
+                "bankIban": s.bank_iban or "",
             },
             "timeline": [
                 {"icon": "file-text", "tone": _PO_TONE.get(p["status"], "neutral"),
@@ -482,6 +504,7 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
     supplier = session.get(Supplier, po.supplier_id) if po.supplier_id else None
     currency = po.currency_code or "USD"
     images = repo.product_images(session)   # article (product title) → image URL
+    specs = repo.product_specs(session)     # article (product title) → fabric/HS/…
 
     # group: article -> { colors: {color: {qty:{size:q}, price}}, sizes:set }
     articles: dict[str, dict] = {}
@@ -514,8 +537,10 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
         sub_amt = round(sum(r["amount"] for r in rows), 2)
         grand_qty += sub_qty
         grand_amt += sub_amt
+        sp = specs.get(art) or {}
         article_list.append({
-            "articleNo": "", "style": art, "description": art, "fabric": "", "hsCode": "",
+            "articleNo": "", "style": art, "description": art,
+            "fabric": sp.get("fabric") or "", "hsCode": sp.get("hsCode") or "",
             "image": images.get(art) or None, "sizes": sizes, "rows": rows,
             "subtotalQty": sub_qty, "subtotalAmount": sub_amt,
         })
@@ -549,10 +574,17 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
             "tel": (supplier.phone if supplier else "") or "",
             "email": (supplier.email if supplier else "") or "",
         },
-        # Payment goes to the supplier → their bank details (from the supplier profile).
-        "bank": {"beneficiary": supplier_name,
-                 "bank": (supplier.bank_details if supplier else "") or "",
-                 "branch": "", "account": "", "swift": "", "corresp": ""},
+        # Payment goes to the supplier → their structured bank details (from the
+        # supplier profile). Beneficiary = the account title, falling back to the
+        # supplier name; the free-text bank_details is a last-resort fallback.
+        "bank": {
+            "beneficiary": (supplier.bank_account_title if supplier else "") or supplier_name,
+            "bank": (supplier.bank_name if supplier else "") or (supplier.bank_details if supplier else "") or "",
+            "account": (supplier.bank_account_number if supplier else "") or "",
+            "iban": (supplier.bank_iban if supplier else "") or "",
+            "swift": (supplier.bank_swift if supplier else "") or "",
+            "branch": "",
+        },
         "articles": article_list,
         "totals": {
             "totalQty": grand_qty, "subtotal": grand_amt, "freight": 0.0,

@@ -182,33 +182,39 @@ def update_product(session: Session, *, public_id: str, title: str, category_id:
         product.image_url = image_url or None
     if specs is not None:
         product.composition = (specs.get("composition") or "").strip() or None
+        product.fabric = (specs.get("fabric") or "").strip() or None
         product.gauge = (specs.get("gauge") or "").strip() or None
         product.care = (specs.get("care") or "").strip() or None
         product.origin = (specs.get("origin") or "").strip() or None
         product.hs_code = (specs.get("hsCode") or "").strip() or None
         product.weight = (specs.get("weight") or "").strip() or None
     session.flush()
-    # If any price was supplied, apply it to the first variant (create one with an
-    # auto SKU if none exists). Only the prices provided are changed.
+    # If any price was supplied, apply it to every variant of this product
+    # (create one with an auto SKU if none exists yet). The detail/list screens
+    # show MIN(price) across variants, so a partial update — e.g. only the
+    # first variant — would leave the displayed price unchanged whenever a
+    # cheaper untouched variant still "won" the MIN. Only the prices actually
+    # provided are changed; other fields on each variant are left alone.
     if any(p is not None for p in (retail, wholesale, online, supplier)):
-        variant = session.execute(
+        variants = session.execute(
             select(ProductVariant).where(ProductVariant.product_id == product.id)
             .order_by(ProductVariant.id)
-        ).scalars().first()
-        if variant is None:
+        ).scalars().all()
+        if not variants:
             create_variant(session, tenant_id=product.tenant_id, product_id=product.id,
                            retail=retail, wholesale=wholesale, online=online,
                            supplier=supplier, currency_code=currency_code)
         else:
-            if retail is not None:
-                variant.retail_price = retail
-                variant.price = retail
-            if wholesale is not None:
-                variant.wholesale_price = wholesale
-            if online is not None:
-                variant.online_price = online
-            if supplier is not None:
-                variant.supplier_price = supplier
+            for variant in variants:
+                if retail is not None:
+                    variant.retail_price = retail
+                    variant.price = retail
+                if wholesale is not None:
+                    variant.wholesale_price = wholesale
+                if online is not None:
+                    variant.online_price = online
+                if supplier is not None:
+                    variant.supplier_price = supplier
         session.flush()
     session.refresh(product)
     return product
@@ -269,6 +275,10 @@ def create_variant(session: Session, *, tenant_id: UUID, product_id: int, sku: s
     )
     session.add(variant)
     session.flush()
+    # A new catalog variant should immediately appear in Inventory — seed a
+    # zero-quantity stock level at the default location. (local import: cycle)
+    from app.modules.inventory import repository as inv_repo
+    inv_repo.ensure_stock_row(session, tenant_id=tenant_id, variant_id=variant.id)
     return variant
 
 
@@ -293,6 +303,15 @@ def list_categories(session: Session, *, limit: int, offset: int) -> tuple[list[
     rows = [dict(r._mapping) for r in session.execute(stmt)]
     total = session.execute(select(func.count()).select_from(Category)).scalar_one()
     return rows, total
+
+
+def list_category_names(session: Session) -> list[str]:
+    """Every category name for the tenant (active or not) — used to populate
+    the product form's Category picker so a category is selectable the
+    instant it's created, without waiting on pagination or an active flag."""
+    return [r[0] for r in session.execute(
+        select(Category.name).order_by(Category.name)
+    )]
 
 
 def update_category(session: Session, *, public_id: str, name: str,

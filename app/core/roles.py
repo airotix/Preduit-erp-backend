@@ -18,7 +18,8 @@ ROLES = [SUPER_ADMIN, ADMIN, MANAGER, MERCHANDISER, ACCOUNTANT, USER_OVERVIEW, L
 
 # Module read/write permission helpers.
 _MODULES = ["dashboard", "catalog", "inventory", "sales", "procurement",
-            "finance", "production", "quality", "shipments", "ai"]
+            "finance", "production", "quality", "shipments", "ai",
+            "orderhistory", "commerce"]
 
 
 def _rw(*modules: str) -> set[str]:
@@ -36,8 +37,12 @@ def _ro(*modules: str) -> set[str]:
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     SUPER_ADMIN: {"*"},
     ADMIN: {"*"},  # full access within the company (incl. admin.users / admin.settings)
+    # Order History has no write actions of its own (read-only cross-module
+    # drill-down); Order History + Channels are Admin/Manager-only per the
+    # Roles matrix, so only Manager needs an explicit grant here.
     MANAGER: _rw("dashboard", "catalog", "inventory", "sales", "procurement",
-                 "production", "quality", "shipments") | _ro("finance", "ai"),
+                 "production", "quality", "shipments")
+             | _ro("finance", "ai", "orderhistory", "commerce"),
     MERCHANDISER: _rw("catalog", "inventory", "sales", "ai") | _ro("dashboard", "production"),
     ACCOUNTANT: _rw("finance") | _ro("dashboard", "sales", "procurement"),
     USER_OVERVIEW: _ro(*_MODULES),  # read-only visibility across every module

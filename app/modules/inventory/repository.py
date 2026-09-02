@@ -6,7 +6,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, aliased
 
 from app.models.catalog import AttributeValue, Category, Product, ProductVariant
-from app.models.inventory import Location, ReorderAlert, StockLevel, StockTransfer
+from app.models.inventory import (
+    Location, ReorderAlert, StockLevel, StockTransfer, StockTransferLine,
+)
 
 
 # ---------- lookups ----------
@@ -21,6 +23,85 @@ def find_location_id_by_name(session: Session, *, name: str) -> int | None:
     return session.execute(
         select(Location.id).where(Location.name == name)
     ).scalar_one_or_none()
+
+
+# ---------- stock movement (reserve / relieve / transfer) ----------
+
+def first_location_id(session: Session) -> int | None:
+    """Any active location — the fallback holding location for movements."""
+    return session.execute(
+        select(Location.id).where(Location.is_deleted == False)  # noqa: E712
+        .order_by(Location.id).limit(1)
+    ).scalar_one_or_none()
+
+
+def variant_stock_location_id(session: Session, *, variant_id: int) -> int | None:
+    """Location holding the most on-hand for this variant, else the first location."""
+    top = session.execute(
+        select(StockLevel.location_id).where(StockLevel.variant_id == variant_id)
+        .order_by(StockLevel.on_hand.desc()).limit(1)
+    ).scalar_one_or_none()
+    return top if top is not None else first_location_id(session)
+
+
+def resolve_variant_id(session: Session, *, sku: str | None = None, name: str | None = None,
+                       color: str | None = None, size: str | None = None) -> int | None:
+    """Find a product variant for an order/transfer line: by SKU first, else by
+    product title + colour + size."""
+    if sku:
+        vid = find_variant_id_by_sku(session, sku=sku)
+        if vid is not None:
+            return vid
+    if not name:
+        return None
+    color_av = aliased(AttributeValue)
+    size_av = aliased(AttributeValue)
+    stmt = (
+        select(ProductVariant.id)
+        .join(Product, Product.id == ProductVariant.product_id)
+        .outerjoin(color_av, color_av.id == ProductVariant.color_id)
+        .outerjoin(size_av, size_av.id == ProductVariant.size_id)
+        .where(Product.title == name, Product.is_deleted == False)  # noqa: E712
+    )
+    if color:
+        stmt = stmt.where(color_av.value == color)
+    if size:
+        stmt = stmt.where(size_av.value == size)
+    return session.execute(stmt.limit(1)).scalar_one_or_none()
+
+
+def adjust_stock(session: Session, *, tenant_id: UUID, variant_id: int, location_id: int,
+                 on_hand_delta: int = 0, reserved_delta: int = 0) -> None:
+    """Apply signed deltas to a stock level (upsert), never letting a count go
+    below zero. This is the single primitive for reserve/relieve/transfer."""
+    row = session.execute(
+        select(StockLevel).where(StockLevel.variant_id == variant_id,
+                                 StockLevel.location_id == location_id)
+    ).scalar_one_or_none()
+    if row is None:
+        row = StockLevel(tenant_id=tenant_id, variant_id=variant_id,
+                         location_id=location_id, on_hand=0, reserved=0)
+        session.add(row)
+    row.on_hand = max(0, (row.on_hand or 0) + on_hand_delta)
+    row.reserved = max(0, (row.reserved or 0) + reserved_delta)
+    session.flush()
+
+
+def ensure_stock_row(session: Session, *, tenant_id: UUID, variant_id: int,
+                     location_id: int | None = None) -> None:
+    """Guarantee a stock level exists for a variant (on_hand 0) so newly created
+    catalog items immediately appear in Inventory."""
+    loc = location_id if location_id is not None else first_location_id(session)
+    if loc is None:
+        return   # tenant has no locations yet — nothing to attach stock to
+    exists = session.execute(
+        select(StockLevel.id).where(StockLevel.variant_id == variant_id,
+                                    StockLevel.location_id == loc)
+    ).scalar_one_or_none()
+    if exists is None:
+        session.add(StockLevel(tenant_id=tenant_id, variant_id=variant_id,
+                               location_id=loc, on_hand=0, reserved=0))
+        session.flush()
 
 
 # ---------- Stock levels (aggregated per article/product) ----------
@@ -113,6 +194,60 @@ def get_article_stock(session: Session, *, public_id: str) -> dict | None:
     return {"product": product, "grid": [dict(r) for r in grid],
             "all_sizes": [dict(r) for r in all_sizes],
             "locations": [dict(r) for r in locations]}
+
+
+def search_stock_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
+    """Type-ahead over products that appear in stock levels (mirrors catalog
+    search but restricted to items actually stocked)."""
+    prods = [dict(r._mapping) for r in session.execute(
+        select(Product.id, Product.title,
+               func.min(ProductVariant.price).label("price"),
+               func.min(ProductVariant.currency_code).label("currency_code"))
+        .select_from(StockLevel)
+        .join(ProductVariant, ProductVariant.id == StockLevel.variant_id)
+        .join(Product, Product.id == ProductVariant.product_id)
+        .where(Product.is_deleted == False, Product.title.ilike(f"%{q}%"))  # noqa: E712
+        .group_by(Product.id, Product.title)
+        .order_by(Product.title).limit(limit)
+    )]
+    ids = [p["id"] for p in prods]
+    colors_by: dict[int, list[dict]] = {}
+    if ids:
+        for pid, val, hexv in session.execute(
+            select(ProductVariant.product_id, AttributeValue.value, AttributeValue.hex)
+            .join(AttributeValue, AttributeValue.id == ProductVariant.color_id)
+            .where(ProductVariant.product_id.in_(ids), AttributeValue.attr_type == "Color")
+            .distinct().order_by(AttributeValue.value)
+        ):
+            colors_by.setdefault(pid, []).append({"name": val, "hex": hexv or "#CBD1DC"})
+    return [{"name": p["title"], "price": float(p["price"] or 0),
+             "currency": p["currency_code"] or "EUR", "colors": colors_by.get(p["id"], [])}
+            for p in prods]
+
+
+def find_product_by_title(session: Session, *, title: str) -> Product | None:
+    return session.execute(
+        select(Product).where(Product.title == title, Product.is_deleted == False)  # noqa: E712
+    ).scalars().first()
+
+
+def add_stock(session: Session, *, tenant_id: UUID, variant_id: int, location_id: int,
+              qty: int) -> StockLevel:
+    """Receive stock: add qty to the on-hand at a location (create the row if new)."""
+    existing = session.execute(
+        select(StockLevel).where(StockLevel.variant_id == variant_id,
+                                 StockLevel.location_id == location_id)
+    ).scalar_one_or_none()
+    if existing:
+        existing.on_hand = (existing.on_hand or 0) + qty
+        session.flush()
+        return existing
+    level = StockLevel(tenant_id=tenant_id, variant_id=variant_id,
+                       location_id=location_id, on_hand=qty, reserved=0)
+    session.add(level)
+    session.flush()
+    session.refresh(level)
+    return level
 
 
 def get_product_by_public_id(session: Session, *, public_id: str) -> Product | None:
@@ -351,7 +486,9 @@ def set_transfer_status(session: Session, *, public_id: str, status: str) -> Sto
 
 
 def create_transfer(session: Session, *, tenant_id: UUID, from_id: int | None,
-                    to_id: int | None, units: int) -> StockTransfer:
+                    to_id: int | None, lines: list[dict] | None = None) -> StockTransfer:
+    lines = lines or []
+    units = sum(int(l.get("qty") or 0) for l in lines)
     trf = StockTransfer(
         tenant_id=tenant_id, from_location_id=from_id, to_location_id=to_id,
         units=units, status="Draft",
@@ -359,9 +496,25 @@ def create_transfer(session: Session, *, tenant_id: UUID, from_id: int | None,
     session.add(trf)
     session.flush()
     trf.transfer_no = f"TRF-{2000 + trf.id}"
+    for l in lines:
+        session.add(StockTransferLine(
+            tenant_id=tenant_id, transfer_id=trf.id, name=l["name"],
+            color=l.get("color"), size=l.get("size"), sku=l.get("sku"),
+            qty=int(l.get("qty") or 0),
+        ))
     session.flush()
     session.refresh(trf)
     return trf
+
+
+def location_options(session: Session) -> list[dict]:
+    """Location names for the transfer From/To selects."""
+    rows = session.execute(
+        select(Location.name, Location.kind)
+        .where(Location.is_deleted == False)  # noqa: E712
+        .order_by(Location.name)
+    ).all()
+    return [{"name": n, "kind": k or ""} for n, k in rows]
 
 
 # ---------- Reorder alerts ----------
@@ -374,6 +527,7 @@ def list_alerts(session: Session, *, limit: int, offset: int) -> tuple[list[dict
             ReorderAlert.sku, ReorderAlert.available, ReorderAlert.reorder_point,
             ReorderAlert.suggested, ReorderAlert.severity,
             Product.title, Color.value.label("color"), Size.value.label("size"),
+            Category.name.label("category"),
             ProductVariant.retail_price.label("retail"),
             ProductVariant.online_price.label("online"),
             ProductVariant.wholesale_price.label("wholesale"),
@@ -381,6 +535,7 @@ def list_alerts(session: Session, *, limit: int, offset: int) -> tuple[list[dict
         .select_from(ReorderAlert)
         .outerjoin(ProductVariant, ProductVariant.sku == ReorderAlert.sku)
         .outerjoin(Product, Product.id == ProductVariant.product_id)
+        .outerjoin(Category, Category.id == Product.category_id)
         .outerjoin(Color, Color.id == ProductVariant.color_id)
         .outerjoin(Size, Size.id == ProductVariant.size_id)
         .where(ReorderAlert.is_deleted == False)  # noqa: E712

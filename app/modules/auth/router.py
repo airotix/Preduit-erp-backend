@@ -1,5 +1,5 @@
 """Authentication routes (public login/register/refresh + authenticated /me)."""
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from app.core.config import get_settings
 from app.core.ratelimit import rate_limit
@@ -11,7 +11,7 @@ from app.modules.auth.dto import (AcceptInvitationRequest, CompanySetupRequest,
                                   CreateInvitationRequest, EmailOnlyRequest,
                                   ForgotPasswordRequest, LoginRequest, LogoutRequest,
                                   RefreshRequest, RegisterCompanyRequest, ResetPasswordRequest,
-                                  UpdateUserRequest, VerifyEmailRequest)
+                                  SwitchBusinessRequest, UpdateUserRequest, VerifyEmailRequest)
 
 settings = get_settings()
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -19,19 +19,54 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # Company owners/admins manage their team; "*" holders (Admin/Super Admin) qualify.
 require_admin = require_permission("admin.users")
 
+_REFRESH_MAX_AGE = settings.jwt_refresh_days * 24 * 60 * 60
+
+
+def _issue_with_cookie(response: Response, result: dict, *, persist: bool = True) -> dict:
+    """Move the refresh token out of the JSON body and into an HttpOnly cookie
+    (unreadable by JS → safe from XSS exfiltration). Returns the body without it."""
+    token = result.pop("refreshToken", None)
+    if token:
+        response.set_cookie(
+            key=settings.refresh_cookie_name, value=token, httponly=True,
+            secure=settings.refresh_cookie_secure, samesite=settings.refresh_cookie_samesite,
+            path=settings.refresh_cookie_path,
+            max_age=_REFRESH_MAX_AGE if persist else None,   # None → session cookie
+        )
+    return result
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(key=settings.refresh_cookie_name, path=settings.refresh_cookie_path)
+
 
 @router.post("/login")
-def login(payload: LoginRequest, _rl: None = rate_limit("login")):
-    return service.login(payload.email, payload.password)
+def login(payload: LoginRequest, response: Response, _rl: None = rate_limit("login")):
+    result = service.login(payload.email, payload.password, business_name=payload.businessName)
+    return _issue_with_cookie(response, result, persist=payload.remember)
+
+
+@router.get("/businesses")
+def my_businesses(principal: Principal = Depends(get_principal)):
+    """Every business the signed-in email owns (for the in-app switcher)."""
+    return {"businesses": service.list_businesses_for(principal.email)}
+
+
+@router.post("/switch-business")
+def switch_business(payload: SwitchBusinessRequest, response: Response,
+                    principal: Principal = Depends(get_principal)):
+    result = service.switch_business(email=principal.email, business_id=payload.businessId)
+    return _issue_with_cookie(response, result)
 
 
 @router.post("/register-company", status_code=status.HTTP_201_CREATED)
-def register_company(payload: RegisterCompanyRequest):
+def register_company(payload: RegisterCompanyRequest, response: Response):
     try:
-        return service.register_company(
+        result = service.register_company(
             company_name=payload.companyName, owner_name=payload.ownerName,
             email=payload.email, password=payload.password, currency=payload.currency,
         )
+        return _issue_with_cookie(response, result)
     except HTTPException:
         raise
     except Exception as exc:  # surface the real cause (keeps CORS headers on errors)
@@ -42,8 +77,13 @@ def register_company(payload: RegisterCompanyRequest):
 
 
 @router.post("/refresh")
-def refresh(payload: RefreshRequest):
-    return service.refresh(payload.refreshToken)
+def refresh(request: Request, response: Response, payload: RefreshRequest | None = None):
+    # Prefer the HttpOnly cookie; fall back to a body token (older clients).
+    token = request.cookies.get(settings.refresh_cookie_name) or (payload.refreshToken if payload else None)
+    if not token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "No refresh token")
+    result = service.refresh(token)
+    return _issue_with_cookie(response, result)
 
 
 # --- Email verification (sign-up OTP) ------------------------------------- #
@@ -53,8 +93,10 @@ def resend_verification(payload: EmailOnlyRequest, _rl: None = rate_limit("verif
 
 
 @router.post("/verify-email")
-def verify_email(payload: VerifyEmailRequest, _rl: None = rate_limit("verify")):
-    return service.verify_email(payload.email, payload.code)
+def verify_email(payload: VerifyEmailRequest, response: Response, _rl: None = rate_limit("verify")):
+    result = service.verify_email(payload.email, payload.code)
+    # Only carries tokens when the OTP was correct (verified → signed in).
+    return _issue_with_cookie(response, result) if isinstance(result, dict) and "accessToken" in result else result
 
 
 # --- Password reset -------------------------------------------------------- #
@@ -75,14 +117,20 @@ def peek_invitation(token: str = Query(min_length=8)):
 
 
 @router.post("/invitations/accept", status_code=status.HTTP_201_CREATED)
-def accept_invitation(payload: AcceptInvitationRequest, _rl: None = rate_limit("accept")):
-    return service.accept_invitation(payload.token, payload.name, payload.password)
+def accept_invitation(payload: AcceptInvitationRequest, response: Response,
+                      _rl: None = rate_limit("accept")):
+    result = service.accept_invitation(payload.token, payload.name, payload.password)
+    return _issue_with_cookie(response, result)
 
 
 @router.post("/logout")
-def logout(payload: LogoutRequest | None = None):
-    # Access token is stateless; revoke the refresh token so it can't be rotated.
-    return service.logout(payload.refreshToken if payload else None)
+def logout(request: Request, response: Response, payload: LogoutRequest | None = None):
+    # Access token is stateless; revoke the refresh token so it can't be rotated,
+    # and clear the cookie so the browser drops it.
+    token = request.cookies.get(settings.refresh_cookie_name) or (payload.refreshToken if payload else None)
+    result = service.logout(token)
+    _clear_refresh_cookie(response)
+    return result
 
 
 @router.get("/me")

@@ -43,6 +43,10 @@ class Tenant(Base):
     legal_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     legal_same_as_company: Mapped[bool] = mapped_column(Boolean, default=False)
     registration_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    bank_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    bank_account: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    bank_iban: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    bank_swift: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
 
 class Subscription(Base):

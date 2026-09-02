@@ -2,11 +2,18 @@
 from pydantic import BaseModel, Field
 
 
+class StockReceiptLineIn(BaseModel):
+    """One article line on the New stock (receipt) form."""
+    name: str = Field(min_length=1, max_length=200)
+    color: str | None = Field(default=None, max_length=60)
+    size: str | None = Field(default=None, max_length=60)
+    sku: str | None = Field(default=None, max_length=64)
+    qty: int = Field(gt=0)
+
+
 class StockReceiptCreate(BaseModel):
-    sku: str = Field(min_length=1, max_length=64)
     location: str = Field(min_length=1, max_length=120)
-    onHand: int
-    reserved: int = 0
+    lines: list[StockReceiptLineIn] = Field(min_length=1)
 
 
 class LocationCreate(BaseModel):
@@ -21,10 +28,19 @@ class LocationUpdate(LocationCreate):
     """Same editable field set as create."""
 
 
+class TransferLineIn(BaseModel):
+    """One article line on the New transfer form (item + colour + size + qty)."""
+    name: str = Field(min_length=1, max_length=200)
+    color: str | None = Field(default=None, max_length=60)
+    size: str | None = Field(default=None, max_length=60)
+    sku: str | None = Field(default=None, max_length=64)
+    qty: int = Field(gt=0)
+
+
 class TransferCreate(BaseModel):
     from_: str = Field(min_length=1, alias="from")
     to: str = Field(min_length=1)
-    units: int = Field(gt=0)
+    lines: list[TransferLineIn] = Field(min_length=1)
 
 
 class ReorderAlertCreate(BaseModel):

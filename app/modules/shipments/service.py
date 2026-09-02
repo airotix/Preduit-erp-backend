@@ -2,8 +2,11 @@
 import uuid
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.production import ProductionOrder
+from app.models.sales import SalesOrder
 from app.modules.shipments import repository as repo
 from app.modules.shipments.dto import CarrierCreate, CarrierUpdate, ShipmentCreate
 from app.presenters.screen import list_config, text_cell
@@ -54,8 +57,56 @@ def create_shipment(session, *, tenant_id, payload: ShipmentCreate):
                                 carrier=payload.carrier, destination=payload.destination)
 
 
+def _mark_sales_order_shipped(session: Session, order_ref: str | None) -> None:
+    """When a shipment is Delivered, flip its sales order to 'Shipped'. The
+    shipment's order_ref may be the sales order number directly, or a production
+    order number that links back to a sales order."""
+    if not order_ref:
+        return
+    so = session.execute(
+        select(SalesOrder).where(SalesOrder.order_no == order_ref,
+                                 SalesOrder.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
+    if so is None:
+        # Resolve via the production order (order_ref → production → sales order).
+        po = session.execute(
+            select(ProductionOrder).where(ProductionOrder.order_no == order_ref,
+                                          ProductionOrder.is_deleted == False)  # noqa: E712
+        ).scalar_one_or_none()
+        if po is not None and po.sales_order_id:
+            so = session.get(SalesOrder, po.sales_order_id)
+    if so is not None and so.status != "Shipped":
+        so.status = "Shipped"
+        session.flush()
+        # Relieve inventory: reduce on-hand and release the reservation for each
+        # order line now that the goods have shipped.
+        from app.models.sales import SalesOrderLine
+        from app.modules.inventory import service as inv_service
+        line_rows = session.execute(
+            select(SalesOrderLine).where(SalesOrderLine.order_id == so.id)
+        ).scalars().all()
+        lines = [{"sku": ln.sku, "name": ln.name, "color": ln.color,
+                  "size": ln.size, "qty": ln.qty} for ln in line_rows]
+        inv_service.relieve_order_stock(session, tenant_id=so.tenant_id, lines=lines)
+
+
+def search_carriers(session, *, q, limit: int = 50):
+    return repo.search_carriers(session, q=q or "", limit=limit)
+
+
 def set_status(session, *, public_id, status):
-    return repo.set_status(session, public_id=public_id, status=status)
+    s = repo.set_status(session, public_id=public_id, status=status)
+    if s is not None and status == "Delivered":
+        _mark_sales_order_shipped(session, s.order_ref)
+    return s
+
+
+def update_shipment(session, *, public_id, payload):
+    s = repo.update_shipment(session, public_id=public_id, carrier=payload.carrier,
+                             destination=payload.destination, eta=payload.eta, status=payload.status)
+    if s is not None and payload.status == "Delivered":
+        _mark_sales_order_shipped(session, s.order_ref)
+    return s
 
 
 def shipment_detail(session: Session, *, public_id: str) -> dict | None:
@@ -98,6 +149,11 @@ def shipment_detail(session: Session, *, public_id: str) -> dict | None:
                 {"name": ln["description"], "sku": ln["sku"] or "—", "qty": ln["qty"]}
                 for ln in lines
             ],
+            "form": {
+                "carrier": s.carrier or "", "destination": s.destination or "",
+                "eta": s.eta or "", "status": s.status,
+            },
+            "statusOptions": [name for name, _ in _TRACK],
         },
     }
 

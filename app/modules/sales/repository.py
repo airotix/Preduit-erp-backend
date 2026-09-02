@@ -102,7 +102,7 @@ def list_orders(session: Session, *, limit: int, offset: int) -> tuple[list[dict
         select(
             SalesOrder.public_id, SalesOrder.order_no, SalesOrder.customer_name,
             SalesOrder.channel, SalesOrder.item_count, SalesOrder.total,
-            SalesOrder.currency_code, SalesOrder.status,
+            SalesOrder.currency_code, SalesOrder.status, SalesOrder.order_date,
         )
         .where(SalesOrder.is_deleted == False)  # noqa: E712
         .order_by(SalesOrder.id.desc())
@@ -328,7 +328,9 @@ def variants_by_sku(session: Session, *, skus: list[str]) -> dict[str, dict]:
         select(
             ProductVariant.sku, ProductVariant.retail_price, ProductVariant.online_price,
             ProductVariant.wholesale_price, ProductVariant.price,
-            Product.title, Product.composition, Product.hs_code, Product.image_url,
+            Product.title, Product.composition, Product.fabric, Product.hs_code,
+            Product.gauge, Product.care, Product.origin, Product.weight,
+            Product.image_url,
             color.value.label("color"), size.value.label("size"),
             size.sort_order.label("size_sort"),
         )
@@ -342,7 +344,12 @@ def variants_by_sku(session: Session, *, skus: list[str]) -> dict[str, dict]:
         m = r._mapping
         out[m["sku"]] = {
             "color": m["color"], "size": m["size"], "size_sort": m["size_sort"],
-            "title": m["title"], "fabric": m["composition"], "hs_code": m["hs_code"],
+            "title": m["title"],
+            # "Matière / fabric" on the invoice = the product's Fabric spec,
+            # falling back to Composition so existing catalog data still fills.
+            "fabric": m["fabric"] or m["composition"],
+            "composition": m["composition"], "hs_code": m["hs_code"],
+            "gauge": m["gauge"], "care": m["care"], "origin": m["origin"], "weight": m["weight"],
             "image": m["image_url"],
             "retail_price": m["retail_price"], "online_price": m["online_price"],
             "wholesale_price": m["wholesale_price"], "base_price": m["price"],
@@ -360,7 +367,8 @@ def company_info(session: Session) -> dict:
     """Our own company's profile fields — for the invoice letterhead block."""
     row = session.execute(text(
         "SELECT name, legal_name, tax_registration, registration_number, base_currency_code, "
-        "country, city, [state], postal, street, business_email, phone, support_line, website, logo_doc_id "
+        "country, city, [state], postal, street, business_email, phone, support_line, website, logo_doc_id, "
+        "bank_name, bank_account, bank_iban, bank_swift "
         "FROM dbo.tenants WHERE id = CAST(SESSION_CONTEXT(N'tenant_id') AS UNIQUEIDENTIFIER)"
     )).mappings().first()
     return dict(row) if row else {}

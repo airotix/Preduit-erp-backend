@@ -22,10 +22,9 @@ def _tid(tenant_id: str | UUID) -> UUID:
 
 
 def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
-    """Type-ahead suggestions for order/line item entry."""
-    if not q or not q.strip():
-        return []
-    rows = repo.search_products(session, q=q.strip(), limit=limit)
+    """Type-ahead suggestions for order/line item entry. An empty query lists
+    the full catalogue (so clicking the field shows everything); typing filters."""
+    rows = repo.search_products(session, q=(q or "").strip(), limit=limit)
     fallback_price, fallback_ccy = None, None
     if any(r["price"] is None for r in rows):
         fallback_price, fallback_ccy = repo.default_price(session)
@@ -61,6 +60,11 @@ def list_colors(session: Session) -> list[dict]:
 def list_sizes(session: Session) -> list[str]:
     """Ordered size scale for PO size breakdowns."""
     return repo.list_sizes(session)
+
+
+def list_category_names(session: Session) -> list[str]:
+    """All category names, for the product form's Category picker."""
+    return repo.list_category_names(session)
 
 
 def products_screen(session: Session, *, limit: int = 25, offset: int = 0) -> dict:
@@ -185,6 +189,7 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
 
     specs = [
         {"k": "Composition", "v": prod.composition or "—"},
+        {"k": "Fabric", "v": prod.fabric or "—"},
         {"k": "Gauge", "v": prod.gauge or "—"},
         {"k": "Care", "v": prod.care or "—"},
         {"k": "Origin", "v": prod.origin or "—"},
@@ -223,6 +228,7 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
                 "supplierPrice": _minraw("supplier_price"),
                 "imageUrl": prod.image_url or "",
                 "composition": prod.composition or "",
+                "fabric": prod.fabric or "",
                 "gauge": prod.gauge or "",
                 "care": prod.care or "",
                 "origin": prod.origin or "",
@@ -268,7 +274,8 @@ def update_product(session: Session, *, tenant_id: str | UUID, public_id: str, p
         currency_code=payload.currency_code,
         # Pass the raw value ("" clears the image; None means "no change").
         image_url=payload.imageUrl,
-        specs={"composition": payload.composition, "gauge": payload.gauge,
+        specs={"composition": payload.composition, "fabric": payload.fabric,
+               "gauge": payload.gauge,
                "care": payload.care, "origin": payload.origin,
                "hsCode": payload.hsCode, "weight": payload.weight},
     )

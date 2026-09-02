@@ -14,6 +14,7 @@ class BomCreate(BaseModel):
     component: str = Field(min_length=1, max_length=200)
     style: str = Field(min_length=1, max_length=200)
     material: str = Field(min_length=1, max_length=80)
+    qtyPerUnit: str = Field(min_length=1, max_length=40)
     cost: Decimal = Field(gt=0)
 
 

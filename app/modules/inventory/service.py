@@ -70,6 +70,10 @@ def stock_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
         ],
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
+        # "Category" isn't its own visible column (it only appears as the
+        # Article cell's sub-text) — surfaced here so the Category filter has
+        # real data to filter on.
+        records=[{"category": r["category"]} for r in rows],
         search="Search articles…", action="Stock receipt",
         filters=["Category", "Status"],
     )
@@ -175,18 +179,35 @@ def save_article_matrix(session: Session, *, tenant_id: str | UUID, public_id: s
     return stock_article_detail(session, public_id=public_id)
 
 
+def search_stock_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
+    # Empty query lists all in-stock items (click-to-browse); typing filters.
+    return repo.search_stock_products(session, q=(q or "").strip(), limit=limit)
+
+
 def create_stock_receipt(session: Session, *, tenant_id: str | UUID, payload: StockReceiptCreate):
+    """Receive stock: for each article/colour/size line, add qty to on-hand at
+    the location (creating the variant + stock row if needed)."""
     tid = _tid(tenant_id)
-    variant_id = repo.find_variant_id_by_sku(session, sku=payload.sku)
-    if variant_id is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No variant with SKU {payload.sku}")
     location_id = repo.find_location_id_by_name(session, name=payload.location)
     if location_id is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"No location named {payload.location}")
-    return repo.upsert_stock(
-        session, tenant_id=tid, variant_id=variant_id, location_id=location_id,
-        on_hand=payload.onHand, reserved=payload.reserved,
-    )
+    received = 0
+    for l in payload.lines:
+        product = repo.find_product_by_title(session, title=l.name)
+        if product is None or not (l.color or "").strip() or not (l.size or "").strip():
+            continue
+        price, currency = repo.variant_defaults(session, product_id=product.id)
+        color = (repo.find_attr_value(session, attr_type="Color", value=l.color)
+                 or repo.create_color(session, tenant_id=tid, value=l.color, hex=None))
+        size = (repo.find_attr_value(session, attr_type="Size", value=l.size)
+                or repo.create_size(session, tenant_id=tid, value=l.size))
+        variant = repo.find_or_create_variant(
+            session, tenant_id=tid, product_id=product.id, color_id=color.id,
+            size_id=size.id, price=price, currency=currency)
+        repo.add_stock(session, tenant_id=tid, variant_id=variant.id,
+                       location_id=location_id, qty=int(l.qty or 0))
+        received += int(l.qty or 0)
+    return received
 
 
 # ---------- Locations ----------
@@ -255,7 +276,9 @@ def transfers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
         ],
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
-        records=[{"status": r["status"]} for r in rows],
+        # "Location" covers both ends of the transfer — a row matches the
+        # filter if either its From or its To location is picked.
+        records=[{"status": r["status"], "location": [r["from_name"], r["to_name"]]} for r in rows],
         search="Search transfers…", action="New transfer",
         filters=["Status", "Location"],
     )
@@ -265,11 +288,81 @@ def create_transfer(session: Session, *, tenant_id: str | UUID, payload: Transfe
     tid = _tid(tenant_id)
     from_id = repo.find_location_id_by_name(session, name=payload.from_)
     to_id = repo.find_location_id_by_name(session, name=payload.to)
-    return repo.create_transfer(session, tenant_id=tid, from_id=from_id, to_id=to_id, units=payload.units)
+    lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku, "qty": l.qty}
+             for l in payload.lines]
+    trf = repo.create_transfer(session, tenant_id=tid, from_id=from_id, to_id=to_id, lines=lines)
+    # Actually move the stock: out of the source location, into the destination.
+    for ln in lines:
+        vid = repo.resolve_variant_id(session, sku=ln.get("sku"), name=ln.get("name"),
+                                      color=ln.get("color"), size=ln.get("size"))
+        qty = int(ln.get("qty") or 0)
+        if vid is None or qty <= 0:
+            continue
+        if from_id is not None:
+            repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=from_id,
+                              on_hand_delta=-qty)
+        if to_id is not None:
+            repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=to_id,
+                              on_hand_delta=qty)
+    return trf
+
+
+def location_options(session: Session) -> list[dict]:
+    return repo.location_options(session)
 
 
 def set_transfer_status(session, *, public_id, status):
     return repo.set_transfer_status(session, public_id=public_id, status=status)
+
+
+# ---------- Stock movement (called from sales / shipments / procurement) ----------
+
+def reserve_order_stock(session, *, tenant_id, lines) -> None:
+    """Reserve stock for a new sales order — best-effort per line (a line whose
+    variant can't be resolved is simply skipped, never blocking the order)."""
+    tid = _tid(tenant_id)
+    for ln in lines:
+        vid = repo.resolve_variant_id(session, sku=ln.get("sku"), name=ln.get("name"),
+                                      color=ln.get("color"), size=ln.get("size"))
+        qty = int(ln.get("qty") or 0)
+        if vid is None or qty <= 0:
+            continue
+        loc = repo.variant_stock_location_id(session, variant_id=vid)
+        if loc is not None:
+            repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=loc,
+                              reserved_delta=qty)
+
+
+def relieve_order_stock(session, *, tenant_id, lines) -> None:
+    """Relieve stock when an order ships: reduce on-hand and release the
+    reservation for each line."""
+    tid = _tid(tenant_id)
+    for ln in lines:
+        vid = repo.resolve_variant_id(session, sku=ln.get("sku"), name=ln.get("name"),
+                                      color=ln.get("color"), size=ln.get("size"))
+        qty = int(ln.get("qty") or 0)
+        if vid is None or qty <= 0:
+            continue
+        loc = repo.variant_stock_location_id(session, variant_id=vid)
+        if loc is not None:
+            repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=loc,
+                              on_hand_delta=-qty, reserved_delta=-qty)
+
+
+def receive_stock_lines(session, *, tenant_id, lines) -> None:
+    """Increment stock when goods are received against a PO (per line)."""
+    tid = _tid(tenant_id)
+    loc = repo.first_location_id(session)
+    for ln in lines:
+        vid = repo.resolve_variant_id(session, sku=ln.get("sku"), name=ln.get("name"),
+                                      color=ln.get("color"), size=ln.get("size"))
+        qty = int(ln.get("qty") or 0)
+        if vid is None or qty <= 0:
+            continue
+        dest = repo.variant_stock_location_id(session, variant_id=vid) or loc
+        if dest is not None:
+            repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=dest,
+                              on_hand_delta=qty)
 
 
 # ---------- Reorder alerts ----------
@@ -308,6 +401,7 @@ def alerts_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict
             {"label": "Wholesale Price", "align": "right"}, {"label": "Severity"},
         ],
         rows=grid, total=total,
+        records=[{"category": r["category"]} for r in rows],
         search="Search alerts…", action="Create PO", filters=["Severity", "Category"],
     )
 

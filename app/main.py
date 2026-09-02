@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
+from app.core.security_headers import SecurityHeadersMiddleware
 from app.modules.admin.router import router as admin_router
 from app.modules.ai.router import router as ai_router
 from app.modules.auth.router import router as auth_router
@@ -15,6 +16,7 @@ from app.modules.finance.router import router as finance_router
 from app.modules.inventory.router import router as inventory_router
 from app.modules.meta.router import router as meta_router
 from app.modules.onboarding.router import router as onboarding_router
+from app.modules.order_history.router import router as order_history_router
 from app.modules.procurement.router import router as procurement_router
 from app.modules.production.router import router as production_router
 from app.modules.quality.router import router as quality_router
@@ -47,7 +49,12 @@ if settings.jwt_secret_is_default:
         "Using the default dev JWT secret — override JWT_SECRET before deploying."
     )
 
+# Security headers on every response (HSTS only outside dev — see module docs).
+app.add_middleware(SecurityHeadersMiddleware, hsts=settings.env != "dev")
+
 # Allow the configured browser origins to call the API (credentialed CORS).
+# NOTE: CORS is added last so it runs first (Starlette applies middleware in
+# reverse), ensuring preflight/OPTIONS short-circuits still carry CORS headers.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -73,6 +80,7 @@ app.include_router(quality_router, prefix=API_V1)
 app.include_router(shipments_router, prefix=API_V1)
 app.include_router(admin_router, prefix=API_V1)
 app.include_router(ai_router, prefix=API_V1)
+app.include_router(order_history_router, prefix=API_V1)
 
 
 @app.get("/health", tags=["meta"])

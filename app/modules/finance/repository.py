@@ -523,7 +523,7 @@ def customer_parties(session: Session) -> list[dict]:
         entries = _customer_entries(session, c.id, c.name)
         debit = sum(e["debit"] for e in entries)
         credit = sum(e["credit"] for e in entries)
-        bal = float(c.opening_balance or 0) + debit - credit
+        bal = float(c.opening_balance or 0) + credit - debit
         out.append({"public_id": str(c.public_id), "name": c.name, "code": c.code, "balance": bal})
     return out
 
@@ -584,7 +584,8 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
         extras.append({"date": _parse_dm(p.pay_date),
                        "ref": alloc if allocated else (p.payment_no or "RCPT"),
                        "desc": p.notes or "Payment received", "debit": 0.0,
-                       "credit": amt, "editType": "payment", "editId": str(p.public_id)})
+                       "credit": amt, "editType": "payment", "editId": str(p.public_id),
+                       "paymentType": p.payment_type})
     for cn in session.execute(
         select(CreditNote).where(CreditNote.is_deleted == False,  # noqa: E712
                                  CreditNote.customer_id == c.id)
@@ -592,7 +593,7 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
         extras.append({"date": cn.cn_date, "ref": cn.cn_no or "CN",
                        "desc": cn.reason or "Credit note", "debit": 0.0,
                        "credit": float(cn.amount or 0), "editType": "cn",
-                       "editId": str(cn.public_id)})
+                       "editId": str(cn.public_id), "paymentType": cn.payment_type})
     # Manual ledger entries (New entry): free-form debit/credit + description.
     for le in session.execute(
         select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
@@ -601,7 +602,8 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
         extras.append({"date": le.entry_date, "ref": "ENTRY",
                        "desc": le.description or "Ledger entry",
                        "debit": float(le.debit or 0), "credit": float(le.credit or 0),
-                       "editType": "manual", "editId": str(le.public_id)})
+                       "editType": "manual", "editId": str(le.public_id),
+                       "paymentType": le.payment_type})
 
     inv_rows = []
     for inv in invoices:
@@ -615,6 +617,7 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
             "debit": amt, "credit": 0.0, "remaining": round(amt - applied, 2),
             "public_id": str(inv.public_id), "editType": "invoice", "editId": str(inv.public_id),
             "paid": (inv.status == "Paid") or (amt > 0 and applied >= amt),
+            "paymentType": inv.payment_type,
         })
     extras.sort(key=lambda e: e["date"] or datetime.date.max)
     return {"party": c, "opening": float(c.opening_balance or 0),
@@ -623,10 +626,11 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
 
 def create_ledger_entry(session: Session, *, tenant_id: UUID, customer_id: int | None,
                         description: str, debit, credit,
-                        supplier_id: int | None = None) -> LedgerEntry:
+                        supplier_id: int | None = None,
+                        payment_type: str | None = None) -> LedgerEntry:
     le = LedgerEntry(tenant_id=tenant_id, customer_id=customer_id, supplier_id=supplier_id,
                      entry_date=datetime.date.today(), description=description,
-                     debit=debit or 0, credit=credit or 0)
+                     debit=debit or 0, credit=credit or 0, payment_type=payment_type)
     session.add(le)
     session.flush()
     session.refresh(le)
@@ -662,6 +666,114 @@ def update_ledger_description(session: Session, *, edit_type: str, public_id: st
     setattr(obj, field, description)
     session.flush()
     return True
+
+
+def update_ledger_payment_type(session: Session, *, edit_type: str, public_id: str,
+                               payment_type: str | None) -> bool:
+    """Edit the Cash/Bank payment type of any ledger row, routed to its source record."""
+    model = {
+        "invoice": Invoice, "bill": SupplierBill, "manual": LedgerEntry,
+        "payment": Payment, "cn": CreditNote,
+    }.get(edit_type)
+    if model is None:
+        return False
+    obj = session.execute(
+        select(model).where(model.public_id == public_id,
+                            model.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
+    if obj is None:
+        return False
+    obj.payment_type = payment_type
+    session.flush()
+    return True
+
+
+def cash_bank_ledger(session: Session, *, payment_type: str) -> list[dict]:
+    """All lines tagged Cash or Bank, across both customer and supplier ledgers —
+    invoices, bills, receipts/disbursements, credit notes, manual entries — using
+    the same debit/credit convention as customer_statement/supplier_statement so
+    it reads exactly like those ledgers, just consolidated across every party."""
+    rows: list[dict] = []
+
+    for inv in session.execute(
+        select(Invoice).where(Invoice.is_deleted == False,  # noqa: E712
+                              Invoice.payment_type == payment_type)
+    ).scalars():
+        rows.append({"date": inv.issued_date, "ref": inv.invoice_no or "INV",
+                     "party": inv.customer_name, "partyType": "customer", "source": "Invoice",
+                     "desc": inv.memo or "Sales invoice",
+                     "debit": float(inv.amount or 0), "credit": 0.0,
+                     "editType": "invoice", "editId": str(inv.public_id)})
+
+    for b in session.execute(
+        select(SupplierBill).where(SupplierBill.is_deleted == False,  # noqa: E712
+                                   SupplierBill.payment_type == payment_type)
+    ).scalars():
+        rows.append({"date": b.issued_date or b.due_on, "ref": b.bill_no or "BILL",
+                     "party": b.supplier_name, "partyType": "supplier", "source": "Bill",
+                     "desc": b.memo or b.po_ref or "Supplier bill",
+                     "debit": float(b.amount or 0), "credit": 0.0,
+                     "editType": "bill", "editId": str(b.public_id)})
+
+    for p in session.execute(
+        select(Payment).where(Payment.is_deleted == False,  # noqa: E712
+                              Payment.payment_type == payment_type)
+    ).scalars():
+        is_receipt = p.pay_type == "Receipt"
+        rows.append({"date": _parse_dm(p.pay_date),
+                     "ref": p.payment_no or ("RCPT" if is_receipt else "PAY"),
+                     "party": p.party, "partyType": p.party_type or ("customer" if is_receipt else "supplier"),
+                     "source": "Receipt" if is_receipt else "Disbursement",
+                     "desc": p.notes or ("Payment received" if is_receipt else "Payment"),
+                     "debit": 0.0, "credit": float(p.amount or 0),
+                     "editType": "payment", "editId": str(p.public_id)})
+
+    for cn in session.execute(
+        select(CreditNote).where(CreditNote.is_deleted == False,  # noqa: E712
+                                 CreditNote.payment_type == payment_type)
+    ).scalars():
+        rows.append({"date": cn.cn_date, "ref": cn.cn_no or "CN",
+                     "party": cn.customer_name, "partyType": "customer", "source": "Credit note",
+                     "desc": cn.reason or "Credit note",
+                     "debit": 0.0, "credit": float(cn.amount or 0),
+                     "editType": "cn", "editId": str(cn.public_id)})
+
+    entries = session.execute(
+        select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
+                                  LedgerEntry.payment_type == payment_type)
+    ).scalars().all()
+    cust_ids = {le.customer_id for le in entries if le.customer_id}
+    sup_ids = {le.supplier_id for le in entries if le.supplier_id}
+    # NOTE: .all() first — dict(Result) would treat the Result as a mapping
+    # (it exposes .keys()) and try to subscript it, raising TypeError.
+    cust_names = dict(session.execute(
+        select(Customer.id, Customer.name).where(Customer.id.in_(cust_ids))
+    ).all()) if cust_ids else {}
+    sup_names = dict(session.execute(
+        select(Supplier.id, Supplier.name).where(Supplier.id.in_(sup_ids))
+    ).all()) if sup_ids else {}
+    for le in entries:
+        if le.customer_id:
+            party, party_type = cust_names.get(le.customer_id, "—"), "customer"
+        elif le.supplier_id:
+            party, party_type = sup_names.get(le.supplier_id, "—"), "supplier"
+        else:
+            party, party_type = "—", None
+        rows.append({"date": le.entry_date, "ref": "ENTRY",
+                     "party": party, "partyType": party_type, "source": "Manual",
+                     "desc": le.description or "Ledger entry",
+                     "debit": float(le.debit or 0), "credit": float(le.credit or 0),
+                     "editType": "manual", "editId": str(le.public_id)})
+
+    def _sort_key(r):
+        d = r.get("date")
+        # Coerce datetime → date so a mix of DATE and DATETIME values can't raise
+        # "can't compare datetime.datetime to datetime.date" and 500 the endpoint.
+        if isinstance(d, datetime.datetime):
+            d = d.date()
+        return d if isinstance(d, datetime.date) else datetime.date.max
+    rows.sort(key=_sort_key)
+    return rows
 
 
 def receipts_applied_to_invoice(session: Session, *, invoice_no: str | None,
@@ -723,7 +835,8 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
         extras.append({"date": _parse_dm(p.pay_date),
                        "ref": alloc if allocated else (p.payment_no or "PAY"),
                        "desc": p.notes or "Payment", "debit": 0.0, "credit": amt,
-                       "editType": "payment", "editId": str(p.public_id)})
+                       "editType": "payment", "editId": str(p.public_id),
+                       "paymentType": p.payment_type})
     for le in session.execute(
         select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
                                   LedgerEntry.supplier_id == s.id)
@@ -731,7 +844,8 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
         extras.append({"date": le.entry_date, "ref": "ENTRY",
                        "desc": le.description or "Ledger entry",
                        "debit": float(le.debit or 0), "credit": float(le.credit or 0),
-                       "editType": "manual", "editId": str(le.public_id)})
+                       "editType": "manual", "editId": str(le.public_id),
+                       "paymentType": le.payment_type})
 
     bill_rows = []
     for b in bills:
@@ -743,6 +857,7 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
             "debit": amt, "credit": 0.0, "remaining": round(amt - applied, 2),
             "public_id": str(b.public_id), "editType": "bill", "editId": str(b.public_id),
             "paid": (b.status == "Paid") or (amt > 0 and applied >= amt),
+            "paymentType": b.payment_type,
         })
     extras.sort(key=lambda e: e["date"] or datetime.date.max)
     return {"party": s, "opening": float(s.opening_balance or 0),

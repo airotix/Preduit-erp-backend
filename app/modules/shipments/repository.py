@@ -44,6 +44,17 @@ def shipment_exists(session: Session, *, order_ref: str | None) -> bool:
     ).scalar_one() > 0
 
 
+def shipment_for_order(session: Session, *, order_ref: str | None) -> Shipment | None:
+    """The existing shipment for an order, if any (to link/display on re-pass)."""
+    if not order_ref:
+        return None
+    return session.execute(
+        select(Shipment).where(Shipment.order_ref == order_ref,
+                               Shipment.is_deleted == False)  # noqa: E712
+        .order_by(Shipment.id.desc())
+    ).scalars().first()
+
+
 def set_status(session: Session, *, public_id: str, status: str) -> Shipment | None:
     s = session.execute(
         select(Shipment).where(Shipment.public_id == public_id,
@@ -51,6 +62,21 @@ def set_status(session: Session, *, public_id: str, status: str) -> Shipment | N
     ).scalar_one_or_none()
     if s is None:
         return None
+    s.status = status
+    session.flush()
+    return s
+
+
+def update_shipment(session: Session, *, public_id: str, carrier, destination, eta, status) -> Shipment | None:
+    s = session.execute(
+        select(Shipment).where(Shipment.public_id == public_id,
+                               Shipment.is_deleted == False)  # noqa: E712
+    ).scalar_one_or_none()
+    if s is None:
+        return None
+    s.carrier = carrier
+    s.destination = destination
+    s.eta = eta
     s.status = status
     session.flush()
     return s
@@ -84,6 +110,17 @@ def list_carriers(session, *, limit, offset):
         select(func.count()).select_from(Carrier).where(Carrier.is_deleted == False)  # noqa: E712
     ).scalar_one()
     return rows, total
+
+
+def search_carriers(session: Session, *, q: str, limit: int = 50) -> list[dict]:
+    """Active carrier names for the type-ahead (empty q → all)."""
+    rows = session.execute(
+        select(Carrier.name, Carrier.service, Carrier.avg_transit)
+        .where(Carrier.is_deleted == False,  # noqa: E712
+               Carrier.name.ilike(f"%{(q or '').strip()}%"))
+        .order_by(Carrier.name).limit(limit)
+    ).all()
+    return [{"name": n, "service": s or "", "avgTransit": t or ""} for n, s, t in rows]
 
 
 def _apply_carrier(c: Carrier, *, name, service, avg_transit) -> None:

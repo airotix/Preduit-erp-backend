@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.modules.production import repository as repo
+from app.models.production import ProductionOrder, ProductionOrderLine
 from app.modules.production.dto import BomCreate, BomUpdate, ProductionOrderCreate
 from app.presenters.screen import board_config, initials, list_config, text_cell
 
@@ -69,16 +70,45 @@ def ship_order(session, *, tenant_id, public_id, carrier, eta, destination):
     return s
 
 
+def _line_is_complete(session, line_id: int) -> bool:
+    stages = repo.list_line_stages(session, line_id)
+    return bool(stages) and all(s.status == "Completed" for s in stages)
+
+
+def _open_line_inspection(session, *, tenant_id, order_ref, line: ProductionOrderLine) -> None:
+    """Create a Final inspection for one production item (line name), idempotent
+    per order + item — so each item is inspected independently of the others.
+    Quantity = the sum across all lines sharing that item name."""
+    from app.modules.quality import repository as qc_repo
+    item = line.name
+    if qc_repo.inspection_exists_for_item(session, order_ref=order_ref, item=item):
+        return
+    qty = sum(int(l.qty or 0) for l in repo.list_lines(session, line.order_id) if l.name == item)
+    qc_repo.create_inspection(session, tenant_id=_tid(tenant_id),
+                              order_ref=order_ref, item=item, stage="Final", aql="2.5",
+                              product=line.name, prod_qty=qty or line.qty, sku=line.sku)
+
+
 def send_for_inspection(session, *, tenant_id, public_id):
-    """When production is complete, open a QC inspection for the order (once).
-    The order then flows to the Quality inspection list."""
+    """Open a QC inspection for every production line (item) that has finished
+    production. Each completed item gets its own inspection — the order does NOT
+    have to wait for all items to finish."""
     po = repo.order_by_public(session, public_id)
     if po is None:
         return None
-    from app.modules.quality import repository as qc_repo
-    if not qc_repo.inspection_exists(session, order_ref=po.order_no):
-        qc_repo.create_inspection(session, tenant_id=_tid(tenant_id),
-                                  order_ref=po.order_no, stage="Final", aql="2.5")
+    lines = repo.list_lines(session, po.id)
+    made_any = False
+    for ln in lines:
+        if _line_is_complete(session, ln.id):
+            _open_line_inspection(session, tenant_id=tenant_id, order_ref=po.order_no, line=ln)
+            made_any = True
+    # Legacy fallback: an order with no per-line stages → one order-level inspection.
+    if not lines:
+        from app.modules.quality import repository as qc_repo
+        if not qc_repo.inspection_exists(session, order_ref=po.order_no):
+            qc_repo.create_inspection(session, tenant_id=_tid(tenant_id),
+                                      order_ref=po.order_no, stage="Final", aql="2.5",
+                                      product=po.style, prod_qty=po.qty)
     return po
 
 
@@ -130,14 +160,16 @@ def bom_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
         records=[{"component": r["component"], "style": r["style"],
-                  "material": r["material"], "cost": float(r["cost"]) if r["cost"] is not None else None}
+                  "material": r["material"], "qtyPerUnit": r["qty_per_unit"],
+                  "cost": float(r["cost"]) if r["cost"] is not None else None}
                  for r in rows],
         search="Search BOMs…", action="New BOM", filters=["Style"],
     )
 
 
 def _bom_fields(p) -> dict:
-    return {"component": p.component, "style": p.style, "material": p.material, "cost": p.cost}
+    return {"component": p.component, "style": p.style, "material": p.material,
+            "qty_per_unit": p.qtyPerUnit, "cost": p.cost}
 
 
 def create_bom(session, *, tenant_id, payload: BomCreate):
@@ -286,7 +318,24 @@ def stage_action(session, *, action, public_id, days=None, worker=None, notes=No
     if action == "start":
         return repo.start_stage(session, public_id=public_id)
     if action == "complete":
-        return repo.complete_stage(session, public_id=public_id)
+        stage = repo.complete_stage(session, public_id=public_id)
+        # When this completes a whole production LINE (item), open that item's
+        # inspection right away — independently of the other items on the order.
+        if stage is not None:
+            po = session.get(ProductionOrder, stage.order_id) if stage.order_id else None
+            if po is not None and stage.line_id and _line_is_complete(session, stage.line_id):
+                line = session.get(ProductionOrderLine, stage.line_id)
+                if line is not None:
+                    _open_line_inspection(session, tenant_id=stage.tenant_id,
+                                          order_ref=po.order_no, line=line)
+            elif po is not None and not stage.line_id and (po.progress or 0) >= 100:
+                # Legacy order-level stages → one order-level inspection.
+                from app.modules.quality import repository as qc_repo
+                if not qc_repo.inspection_exists(session, order_ref=po.order_no):
+                    qc_repo.create_inspection(session, tenant_id=stage.tenant_id,
+                                              order_ref=po.order_no, stage="Final", aql="2.5",
+                                              product=po.style, prod_qty=po.qty)
+        return stage
     if action == "extend":
         return repo.extend_stage(session, public_id=public_id, days=days or 0)
     if action == "assign":

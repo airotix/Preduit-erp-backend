@@ -2,7 +2,9 @@
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.core.validation import clean_email, clean_phone
 
 
 class CustomerCreate(BaseModel):
@@ -13,6 +15,16 @@ class CustomerCreate(BaseModel):
     type: str | None = Field(default="Retail", max_length=20)
     region: str | None = None
     phone: str | None = None
+
+    @field_validator("email")
+    @classmethod
+    def _v_email(cls, v):
+        return clean_email(v)
+
+    @field_validator("phone")
+    @classmethod
+    def _v_phone(cls, v):
+        return clean_phone(v)
     address: str | None = None
     code: str | None = Field(default=None, max_length=20)
     terms: str | None = Field(default=None, max_length=20)
@@ -50,10 +62,14 @@ class OrderLineIn(BaseModel):
 
 
 class OrderCreate(BaseModel):
-    """Matches the frontend 'New order' form (customer + channel + line items)."""
+    """Matches the frontend 'New order' form (customer + channel + line items).
+    `newCustomer` carries the full Reach/Account/Finance details from the New
+    Order form's inline sub-form, present only when the typed customer didn't
+    match an existing one."""
     customer: str = Field(min_length=1, max_length=200)
     channel: str = Field(pattern="^(Wholesale|Online|Marketplace|Retail)$")
     lines: list[OrderLineIn] = Field(min_length=1)
+    newCustomer: CustomerCreate | None = None
 
 
 class InvoiceCreate(BaseModel):

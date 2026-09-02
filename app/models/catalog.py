@@ -49,6 +49,7 @@ class Product(Base):
     status: Mapped[str] = mapped_column(String(20), default="Draft")
     # Spec fields shown on the product detail page.
     composition: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    fabric: Mapped[str | None] = mapped_column(String(120), nullable=True)
     gauge: Mapped[str | None] = mapped_column(String(40), nullable=True)
     care: Mapped[str | None] = mapped_column(String(120), nullable=True)
     origin: Mapped[str | None] = mapped_column(String(80), nullable=True)

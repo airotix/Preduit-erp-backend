@@ -5,6 +5,15 @@ from pydantic import BaseModel, Field
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=256)
     password: str = Field(min_length=1)
+    # When an email owns several businesses, the business name on the login form
+    # selects which ERP to sign in to.
+    businessName: str | None = Field(default=None, max_length=200)
+    # "Keep me signed in" → a persistent refresh cookie; false → session cookie.
+    remember: bool = True
+
+
+class SwitchBusinessRequest(BaseModel):
+    businessId: str = Field(min_length=1, max_length=64)
 
 
 class RegisterCompanyRequest(BaseModel):
@@ -16,7 +25,8 @@ class RegisterCompanyRequest(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refreshToken: str
+    # Optional now — the refresh token normally arrives as an HttpOnly cookie.
+    refreshToken: str | None = None
 
 
 class LogoutRequest(BaseModel):

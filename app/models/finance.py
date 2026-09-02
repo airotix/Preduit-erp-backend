@@ -20,6 +20,7 @@ class SupplierBill(Base):
     supplier_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     po_ref: Mapped[str | None] = mapped_column(String(32), nullable=True)
     memo: Mapped[str | None] = mapped_column(String(400), nullable=True)  # editable ledger description
+    payment_type: Mapped[str | None] = mapped_column(String(10), nullable=True)  # cash|bank
     issued_date: Mapped[datetime.date | None] = mapped_column(
         Date, default=datetime.date.today, nullable=True)  # ledger date = when added
     amount: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
@@ -96,6 +97,7 @@ class Payment(Base):
     pay_type: Mapped[str] = mapped_column(String(20), default="Receipt")
     status: Mapped[str] = mapped_column(String(20), default="Pending")
     method: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    payment_type: Mapped[str | None] = mapped_column(String(10), nullable=True)  # cash|bank
     reference: Mapped[str | None] = mapped_column(String(60), nullable=True)
     notes: Mapped[str | None] = mapped_column(String(300), nullable=True)
     gl_journal_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -115,6 +117,7 @@ class CreditNote(Base):
     cn_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    payment_type: Mapped[str | None] = mapped_column(String(10), nullable=True)  # cash|bank
     gl_journal_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     posted: Mapped[bool] = mapped_column(Boolean, default=False)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -132,6 +135,7 @@ class LedgerEntry(Base):
     supplier_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     entry_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     description: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    payment_type: Mapped[str | None] = mapped_column(String(10), nullable=True)  # cash|bank
     debit: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     credit: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.deps import tenant_db
-from app.core.security import Principal, require_tenant
+from app.core.security import Principal, require_module
 from app.modules.sales import service
 from app.modules.sales.dto import (
     CustomerCreate, CustomerUpdate, InvoiceCreate, InvoiceSettleIn, OrderCreate,
@@ -12,17 +12,20 @@ from app.modules.sales.dto import (
 
 router = APIRouter(prefix="/sales", tags=["sales"])
 
+read = require_module("sales", "read")
+write = require_module("sales", "write")
+
 
 @router.get("/customers/screen")
 def customers_screen(
     limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     return service.customers_screen(db, limit=limit, offset=offset)
 
 
 @router.get("/customers/search")
-def customers_search(q: str = Query(""), db: Session = Depends(tenant_db)):
+def customers_search(q: str = Query(""), _: Principal = Depends(read), db: Session = Depends(tenant_db)):
     """Type-ahead over customer names for the New order form."""
     return service.search_customers(db, q=q, limit=10)
 
@@ -30,7 +33,7 @@ def customers_search(q: str = Query(""), db: Session = Depends(tenant_db)):
 @router.post("/customers", status_code=status.HTTP_201_CREATED)
 def create_customer(
     payload: CustomerCreate,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     c = service.create_customer(db, tenant_id=principal.tenant_id, payload=payload)
@@ -39,7 +42,7 @@ def create_customer(
 
 @router.put("/customers/{public_id}")
 def update_customer(public_id: str, payload: CustomerUpdate,
-                    principal: Principal = Depends(require_tenant),
+                    principal: Principal = Depends(write),
                     db: Session = Depends(tenant_db)):
     c = service.update_customer(db, public_id=public_id, payload=payload)
     if c is None:
@@ -50,7 +53,7 @@ def update_customer(public_id: str, payload: CustomerUpdate,
 @router.get("/orders/screen")
 def orders_screen(
     limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     return service.orders_screen(db, limit=limit, offset=offset)
 
@@ -58,7 +61,7 @@ def orders_screen(
 @router.post("/orders", status_code=status.HTTP_201_CREATED)
 def create_order(
     payload: OrderCreate,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     res = service.create_order(db, tenant_id=principal.tenant_id, payload=payload)
@@ -72,7 +75,7 @@ def create_order(
 
 @router.post("/invoices/{public_id}/settle")
 def settle_invoice(public_id: str, payload: InvoiceSettleIn,
-                   principal: Principal = Depends(require_tenant),
+                   principal: Principal = Depends(write),
                    db: Session = Depends(tenant_db)):
     inv = service.record_invoice_payment(
         db, tenant_id=principal.tenant_id, public_id=public_id,
@@ -83,7 +86,7 @@ def settle_invoice(public_id: str, payload: InvoiceSettleIn,
 
 
 @router.get("/customers/{public_id}/detail")
-def customer_detail(public_id: str, db: Session = Depends(tenant_db)):
+def customer_detail(public_id: str, _: Principal = Depends(read), db: Session = Depends(tenant_db)):
     d = service.customer_detail(db, public_id=public_id)
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Customer not found")
@@ -91,7 +94,7 @@ def customer_detail(public_id: str, db: Session = Depends(tenant_db)):
 
 
 @router.get("/orders/{public_id}/detail")
-def order_detail(public_id: str, db: Session = Depends(tenant_db)):
+def order_detail(public_id: str, _: Principal = Depends(read), db: Session = Depends(tenant_db)):
     d = service.order_detail(db, public_id=public_id)
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
@@ -99,7 +102,7 @@ def order_detail(public_id: str, db: Session = Depends(tenant_db)):
 
 
 @router.get("/invoices/{public_id}/detail")
-def invoice_detail(public_id: str, db: Session = Depends(tenant_db)):
+def invoice_detail(public_id: str, _: Principal = Depends(read), db: Session = Depends(tenant_db)):
     d = service.invoice_detail(db, public_id=public_id)
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
@@ -108,7 +111,7 @@ def invoice_detail(public_id: str, db: Session = Depends(tenant_db)):
 
 @router.post("/orders/{public_id}/status")
 def order_status(public_id: str, payload: StatusUpdate,
-                 principal: Principal = Depends(require_tenant),
+                 principal: Principal = Depends(write),
                  db: Session = Depends(tenant_db)):
     o = service.set_order_status(db, public_id=public_id, status=payload.status)
     if o is None:
@@ -118,7 +121,7 @@ def order_status(public_id: str, payload: StatusUpdate,
 
 @router.post("/invoices/{public_id}/status")
 def invoice_status(public_id: str, payload: StatusUpdate,
-                   principal: Principal = Depends(require_tenant),
+                   principal: Principal = Depends(write),
                    db: Session = Depends(tenant_db)):
     inv = service.set_invoice_status(db, public_id=public_id, status=payload.status)
     if inv is None:
@@ -128,7 +131,7 @@ def invoice_status(public_id: str, payload: StatusUpdate,
 
 @router.post("/returns/{public_id}/status")
 def return_status(public_id: str, payload: StatusUpdate,
-                  principal: Principal = Depends(require_tenant),
+                  principal: Principal = Depends(write),
                   db: Session = Depends(tenant_db)):
     r = service.set_return_status(db, public_id=public_id, status=payload.status)
     if r is None:
@@ -137,14 +140,14 @@ def return_status(public_id: str, payload: StatusUpdate,
 
 
 @router.get("/board/screen")
-def board_screen(db: Session = Depends(tenant_db)):
+def board_screen(_: Principal = Depends(read), db: Session = Depends(tenant_db)):
     return service.board_screen(db)
 
 
 @router.get("/invoices/screen")
 def invoices_screen(
     limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     return service.invoices_screen(db, limit=limit, offset=offset)
 
@@ -152,7 +155,7 @@ def invoices_screen(
 @router.post("/invoices", status_code=status.HTTP_201_CREATED)
 def create_invoice(
     payload: InvoiceCreate,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     inv = service.create_invoice(db, tenant_id=principal.tenant_id, payload=payload)
@@ -162,7 +165,7 @@ def create_invoice(
 @router.get("/returns/screen")
 def returns_screen(
     limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     return service.returns_screen(db, limit=limit, offset=offset)
 
@@ -170,7 +173,7 @@ def returns_screen(
 @router.post("/returns", status_code=status.HTTP_201_CREATED)
 def create_return(
     payload: ReturnCreate,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     ret = service.create_return(db, tenant_id=principal.tenant_id, payload=payload)
@@ -183,7 +186,7 @@ def create_return(
 def sales_invoice_draft(
     order: str = Query(...),
     type: str = Query("Retail"),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     d = service.build_sales_invoice_draft(db, order_no=order, invoice_type=type)
     if d is None:
@@ -194,7 +197,7 @@ def sales_invoice_draft(
 @router.get("/invoice-docs")
 def sales_invoices_list(
     limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     return service.list_sales_invoice_docs(db, limit=limit, offset=offset)
 
@@ -202,14 +205,14 @@ def sales_invoices_list(
 @router.post("/invoice-docs", status_code=status.HTTP_201_CREATED)
 def sales_invoice_create(
     payload: dict,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     return service.create_sales_invoice_doc(db, tenant_id=principal.tenant_id, data=payload)
 
 
 @router.get("/invoice-docs/{public_id}")
-def sales_invoice_get(public_id: str, db: Session = Depends(tenant_db)):
+def sales_invoice_get(public_id: str, _: Principal = Depends(read), db: Session = Depends(tenant_db)):
     d = service.get_sales_invoice_doc(db, public_id=public_id)
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
@@ -219,7 +222,7 @@ def sales_invoice_get(public_id: str, db: Session = Depends(tenant_db)):
 @router.put("/invoice-docs/{public_id}")
 def sales_invoice_update(
     public_id: str, payload: dict,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     d = service.update_sales_invoice_doc(db, public_id=public_id, data=payload)

@@ -125,7 +125,10 @@ def rules_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
         ids=[str(r["public_id"]) for r in rows],
         records=[{"name": r["name"], "condition": r["condition"], "approver": r["approver"]}
                  for r in rows],
-        search="Search rules…", action="New rule", filters=["Module"],
+        # No "module" field exists on ApprovalRule today (would need a schema
+        # migration to add real per-rule module tagging) — omitted rather
+        # than shipping a filter chip with no underlying data.
+        search="Search rules…", action="New rule", filters=[],
     )
 
 
@@ -194,5 +197,9 @@ def audit_screen(session: Session, *, limit: int = 100) -> dict:
         columns=[{"label": "Time"}, {"label": "User"}, {"label": "Action"},
                  {"label": "Entity"}, {"label": "IP"}],
         rows=grid, total=len(grid),
+        # "Date" isn't its own column (the "Time" column carries the full
+        # date+time) — surfaced day-granularity here for the Date filter.
+        records=[{"date": r["occurred_at"].strftime("%d %b %Y") if r["occurred_at"] else None}
+                 for r in rows],
         search="Search audit log…", action=None, filters=["User", "Entity", "Date"],
     )

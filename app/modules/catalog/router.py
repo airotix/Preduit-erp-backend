@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.deps import tenant_db
-from app.core.security import Principal, require_tenant
+from app.core.security import Principal, require_module
 from app.modules.catalog import service
 from app.modules.catalog.dto import (
     AttributeCreate, AttributeUpdate, CategoryCreate, CategoryUpdate,
@@ -14,11 +14,14 @@ from app.modules.inventory.dto import MatrixUpdate
 
 router = APIRouter(prefix="/catalog", tags=["catalog"])
 
+read = require_module("catalog", "read")
+write = require_module("catalog", "write")
+
 
 @router.get("/products/screen")
 def products_screen(
     limit: int = Query(25, le=200), offset: int = Query(0, ge=0),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     """ScreenConfig for /catalog/products (frontend BFF endpoint)."""
     return service.products_screen(db, limit=limit, offset=offset)
@@ -26,20 +29,22 @@ def products_screen(
 
 @router.get("/products/search")
 def products_search(q: str = Query("", max_length=100),
-                    limit: int = Query(10, le=25),
-                    db: Session = Depends(tenant_db)):
-    """Type-ahead product suggestions (name + suggested price)."""
+                    limit: int = Query(1000, le=2000),
+                    _: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    """Type-ahead product suggestions (name + suggested price) — also used by
+    Sales/Procurement line editors, which is why every role able to write
+    orders or POs already carries at least catalog.read."""
     return service.search_products(db, q=q, limit=limit)
 
 
 @router.get("/colors")
-def colors(db: Session = Depends(tenant_db)):
+def colors(_: Principal = Depends(read), db: Session = Depends(tenant_db)):
     """Color options for order/PO line editors."""
     return service.list_colors(db)
 
 
 @router.get("/sizes")
-def sizes(db: Session = Depends(tenant_db)):
+def sizes(_: Principal = Depends(read), db: Session = Depends(tenant_db)):
     """Ordered size scale for PO size breakdowns."""
     return service.list_sizes(db)
 
@@ -47,7 +52,7 @@ def sizes(db: Session = Depends(tenant_db)):
 @router.post("/products", status_code=status.HTTP_201_CREATED)
 def create_product(
     payload: ProductCreate,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     product = service.create_product(db, tenant_id=principal.tenant_id, payload=payload)
@@ -56,7 +61,7 @@ def create_product(
 
 @router.put("/products/{public_id}")
 def update_product(public_id: str, payload: ProductUpdate,
-                   principal: Principal = Depends(require_tenant),
+                   principal: Principal = Depends(write),
                    db: Session = Depends(tenant_db)):
     product = service.update_product(db, tenant_id=principal.tenant_id,
                                      public_id=public_id, payload=payload)
@@ -67,7 +72,7 @@ def update_product(public_id: str, payload: ProductUpdate,
 
 @router.put("/products/{public_id}/image")
 def set_product_image(public_id: str, payload: dict,
-                      principal: Principal = Depends(require_tenant),
+                      principal: Principal = Depends(write),
                       db: Session = Depends(tenant_db)):
     p = service.set_product_image(db, public_id=public_id, image_url=payload.get("imageUrl"))
     if p is None:
@@ -76,7 +81,7 @@ def set_product_image(public_id: str, payload: dict,
 
 
 @router.get("/products/{public_id}/detail")
-def product_detail(public_id: str, db: Session = Depends(tenant_db)):
+def product_detail(public_id: str, _: Principal = Depends(read), db: Session = Depends(tenant_db)):
     detail = service.product_detail(db, public_id=public_id)
     if detail is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
@@ -85,7 +90,7 @@ def product_detail(public_id: str, db: Session = Depends(tenant_db)):
 
 @router.put("/products/{public_id}/matrix")
 def save_product_matrix(public_id: str, payload: MatrixUpdate,
-                        principal: Principal = Depends(require_tenant),
+                        principal: Principal = Depends(write),
                         db: Session = Depends(tenant_db)):
     p = service.save_product_matrix(db, tenant_id=principal.tenant_id,
                                     public_id=public_id, payload=payload)
@@ -94,10 +99,17 @@ def save_product_matrix(public_id: str, payload: MatrixUpdate,
     return {"public_id": str(p.public_id)}
 
 
+@router.get("/categories")
+def category_names(_: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    """Flat list of category names for the product form's Category picker —
+    kept in sync automatically, unlike a hardcoded option list."""
+    return service.list_category_names(db)
+
+
 @router.get("/categories/screen")
 def categories_screen(
     limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     return service.categories_screen(db, limit=limit, offset=offset)
 
@@ -105,7 +117,7 @@ def categories_screen(
 @router.post("/categories", status_code=status.HTTP_201_CREATED)
 def create_category(
     payload: CategoryCreate,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     category = service.create_category(db, tenant_id=principal.tenant_id, payload=payload)
@@ -114,7 +126,7 @@ def create_category(
 
 @router.put("/categories/{public_id}")
 def update_category(public_id: str, payload: CategoryUpdate,
-                    principal: Principal = Depends(require_tenant),
+                    principal: Principal = Depends(write),
                     db: Session = Depends(tenant_db)):
     c = service.update_category(db, public_id=public_id, payload=payload)
     if c is None:
@@ -125,7 +137,7 @@ def update_category(public_id: str, payload: CategoryUpdate,
 @router.get("/attributes/screen")
 def attributes_screen(
     limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
-    db: Session = Depends(tenant_db),
+    _: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
     return service.attributes_screen(db, limit=limit, offset=offset)
 
@@ -133,7 +145,7 @@ def attributes_screen(
 @router.post("/attributes", status_code=status.HTTP_201_CREATED)
 def create_attribute(
     payload: AttributeCreate,
-    principal: Principal = Depends(require_tenant),
+    principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
     attr = service.create_attribute(db, tenant_id=principal.tenant_id, payload=payload)

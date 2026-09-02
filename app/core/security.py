@@ -79,3 +79,12 @@ def require_permission(permission: str):
             raise HTTPException(status.HTTP_403_FORBIDDEN, f"Missing permission: {permission}")
         return principal
     return _guard
+
+
+def require_module(module: str, level: str = "read"):
+    """Dependency factory: allow only principals whose role grants `<module>.<level>`
+    (or `*`) — the per-module read/write gate backing the Admin > Roles matrix
+    (core/roles.py). `level` is "read" or "write"; write implies nothing about
+    read, so screens needing both should depend on "read" for GETs and "write"
+    for mutating routes."""
+    return require_permission(f"{module}.{level}")

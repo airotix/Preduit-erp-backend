@@ -342,10 +342,11 @@ def get_bom_detail(session: Session, *, public_id: str) -> dict | None:
     return {"bom": b, "orders": orders}
 
 
-def _apply_bom(b: BomLine, *, component, style, material, cost) -> None:
+def _apply_bom(b: BomLine, *, component, style, material, qty_per_unit, cost) -> None:
     b.component = component
     b.style = style
     b.material = material
+    b.qty_per_unit = qty_per_unit
     b.cost = cost
 
 

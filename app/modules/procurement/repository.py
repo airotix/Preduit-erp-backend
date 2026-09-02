@@ -51,12 +51,16 @@ def create_supplier(session: Session, *, tenant_id: UUID, name: str, region: str
                     lead_time: str | None = None, category: str | None = None,
                     email: str | None = None, phone: str | None = None, address: str | None = None,
                     vat_number: str | None = None, contact_person: str | None = None,
-                    bank_details: str | None = None) -> Supplier:
+                    bank_details: str | None = None, bank_name: str | None = None,
+                    bank_account_title: str | None = None, bank_account_number: str | None = None,
+                    bank_swift: str | None = None, bank_iban: str | None = None) -> Supplier:
     sup = Supplier(tenant_id=tenant_id, name=name, region=region,
                    lead_time=lead_time, category=category, status="New",
                    email=email, phone=phone, address=address,
                    vat_number=vat_number, contact_person=contact_person,
-                   bank_details=bank_details)
+                   bank_details=bank_details, bank_name=bank_name,
+                   bank_account_title=bank_account_title, bank_account_number=bank_account_number,
+                   bank_swift=bank_swift, bank_iban=bank_iban)
     session.add(sup)
     session.flush()
     session.refresh(sup)
@@ -67,7 +71,9 @@ def update_supplier(session: Session, *, public_id: str, name: str, region: str 
                     lead_time: str | None = None, category: str | None = None,
                     email: str | None = None, phone: str | None = None, address: str | None = None,
                     vat_number: str | None = None, contact_person: str | None = None,
-                    bank_details: str | None = None) -> Supplier | None:
+                    bank_details: str | None = None, bank_name: str | None = None,
+                    bank_account_title: str | None = None, bank_account_number: str | None = None,
+                    bank_swift: str | None = None, bank_iban: str | None = None) -> Supplier | None:
     sup = session.execute(
         select(Supplier).where(Supplier.public_id == public_id,
                                Supplier.is_deleted == False)  # noqa: E712
@@ -84,6 +90,11 @@ def update_supplier(session: Session, *, public_id: str, name: str, region: str 
     sup.vat_number = vat_number
     sup.contact_person = contact_person
     sup.bank_details = bank_details
+    sup.bank_name = bank_name
+    sup.bank_account_title = bank_account_title
+    sup.bank_account_number = bank_account_number
+    sup.bank_swift = bank_swift
+    sup.bank_iban = bank_iban
     session.flush()
     session.refresh(sup)
     return sup
@@ -204,6 +215,28 @@ def product_images(session: Session) -> dict[str, str]:
         .where(Product.is_deleted == False, Product.image_url.isnot(None))  # noqa: E712
     ).all()
     return {t: u for t, u in rows if u}
+
+
+def product_specs(session: Session) -> dict[str, dict]:
+    """Map product title → specification fields, so PO invoices can auto-fill the
+    article's fabric / HS code straight from the catalog. Fabric falls back to
+    Composition when the dedicated Fabric spec is empty."""
+    rows = session.execute(
+        select(Product.title, Product.fabric, Product.composition, Product.hs_code,
+               Product.gauge, Product.care, Product.origin, Product.weight)
+        .where(Product.is_deleted == False)  # noqa: E712
+    ).all()
+    out: dict[str, dict] = {}
+    for r in rows:
+        m = r._mapping
+        out[m["title"]] = {
+            "fabric": m["fabric"] or m["composition"] or "",
+            "hsCode": m["hs_code"] or "",
+            "composition": m["composition"] or "",
+            "gauge": m["gauge"] or "", "care": m["care"] or "",
+            "origin": m["origin"] or "", "weight": m["weight"] or "",
+        }
+    return out
 
 
 def count_po_invoices(session: Session) -> int:

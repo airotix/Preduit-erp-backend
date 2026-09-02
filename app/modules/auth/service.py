@@ -94,7 +94,8 @@ def _profile(db, user: User) -> dict:
         "company": {"id": str(user.tenant_id) if user.tenant_id else None,
                     "name": tenant.name if tenant else None,
                     "currency": tenant.base_currency_code if tenant else None,
-                    "setupComplete": bool(tenant.setup_complete) if tenant else True},
+                    "setupComplete": bool(tenant.setup_complete) if tenant else True,
+                    "enabledModules": _get_enabled_modules(db, user.tenant_id) if user.tenant_id else None},
     }
 
 
@@ -155,6 +156,26 @@ def _find_by_email(db, email: str):
     ).scalars().first()
 
 
+def _users_by_email(db, email: str) -> list:
+    """Every user row for an email across all tenants (one person can own many
+    businesses). In prod the system principal is RLS-exempt so one scan sees all;
+    in local dev we walk each tenant."""
+    _clear_tenant(db)
+    rows = db.execute(
+        select(User).where(func.lower(User.email) == email.strip().lower())
+    ).scalars().all()
+    if rows:
+        return list(rows)
+    found = []
+    for tid in db.execute(select(Tenant.id)).scalars().all():
+        _set_tenant(db, tid)
+        u = _find_by_email(db, email)
+        if u is not None:
+            found.append(u)
+    _clear_tenant(db)
+    return found
+
+
 def _find_user_global(db, email: str):
     """Locate a user by email without knowing their tenant.
 
@@ -176,19 +197,71 @@ def _find_user_global(db, email: str):
     return None
 
 
-def login(email: str, password: str) -> dict:
+def _business_list(db, users: list) -> list[dict]:
+    out = []
+    for u in users:
+        t = db.get(Tenant, u.tenant_id)
+        out.append({"businessId": str(u.tenant_id), "name": (t.name if t else "—"),
+                    "role": u.role})
+    # Stable, name-sorted.
+    return sorted(out, key=lambda b: (b["name"] or "").lower())
+
+
+def login(email: str, password: str, business_name: str | None = None) -> dict:
     with system_session() as db:
-        user = _find_user_global(db, email)   # finds the user in whatever tenant
-        if user is not None:
-            _set_tenant(db, user.tenant_id)   # scope reads/writes for this user's tenant
-            if user.locked_until and user.locked_until > _now():
-                _raise_locked(user.locked_until)   # 423 with unlock time
-        if user is None or not user.is_active or not verify_password(password, user.password_hash):
-            if user is not None and user.is_active:
-                _register_failed_login(db, user)   # count toward lockout (commits)
+        users = _users_by_email(db, email)   # all businesses this email belongs to
+        # Verify the password against the account (all a person's rows share it).
+        verified = [u for u in users if u.is_active and verify_password(password, u.password_hash)]
+        if not verified:
+            locked = next((u for u in users if u.locked_until and u.locked_until > _now()), None)
+            if locked is not None:
+                _set_tenant(db, locked.tenant_id)
+                _raise_locked(locked.locked_until)
+            for u in users:
+                if u.is_active:
+                    _set_tenant(db, u.tenant_id)
+                    _register_failed_login(db, u)
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
-        user.failed_logins = 0                # success clears the counter and any lock
+
+        # Single business → sign straight in. Several → the business name on the
+        # login form selects which one.
+        if len(verified) == 1:
+            user = verified[0]
+        else:
+            wanted = (business_name or "").strip().lower()
+            if not wanted:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "This email has multiple businesses — enter your business name to sign in.")
+            matches = [u for u in verified
+                       if (db.get(Tenant, u.tenant_id).name or "").strip().lower() == wanted]
+            if not matches:
+                raise HTTPException(status.HTTP_404_NOT_FOUND,
+                                    f"No business named “{business_name.strip()}” for this account.")
+            user = matches[0]
+
+        _set_tenant(db, user.tenant_id)
+        user.failed_logins = 0
         user.locked_until = None
+        user.last_login = _now()
+        return _issue(db, user)
+
+
+def list_businesses_for(email: str) -> list[dict]:
+    """Every business owned by the signed-in user's email (for the switcher)."""
+    with system_session() as db:
+        return _business_list(db, _users_by_email(db, email))
+
+
+def switch_business(*, email: str, business_id: str) -> dict:
+    """Issue fresh tokens for another business owned by the same email."""
+    with system_session() as db:
+        users = _users_by_email(db, email)
+        user = next((u for u in users
+                     if str(u.tenant_id) == business_id and u.is_active), None)
+        if user is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Business not found for this account")
+        _set_tenant(db, user.tenant_id)
         user.last_login = _now()
         return _issue(db, user)
 
@@ -279,14 +352,33 @@ def _slugify(name: str, db) -> str:
 
 def register_company(*, company_name: str, owner_name: str, email: str,
                      password: str, currency: str = "EUR") -> dict:
+    """Register a new business (ERP/tenant). One person (email) may own several
+    businesses — but not two with the same name. To add a business under an
+    existing email, the existing account's password must be supplied."""
     with system_session() as db:
+        existing = _users_by_email(db, email)
         _clear_tenant(db)
-        if _find_by_email(db, email):
-            raise HTTPException(status.HTTP_409_CONFLICT, "That email is already registered")
+        name = company_name.strip()
+
+        additional = bool(existing)
+        if additional:
+            # Adding another business to an existing account: authenticate as the
+            # existing owner and block a duplicate business name.
+            owner_row = next((u for u in existing if u.is_active), existing[0])
+            if not verify_password(password, owner_row.password_hash):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "This email already has an account — use your existing password to add another business.")
+            for u in existing:
+                t = db.get(Tenant, u.tenant_id)
+                if t is not None and (t.name or "").strip().lower() == name.lower():
+                    raise HTTPException(status.HTTP_409_CONFLICT,
+                                        f"You already have a business named “{name}”.")
+
         slug = _slugify(company_name, db)
         tid = uuid.uuid4()
         _set_tenant(db, tid)   # so tenant/subscription/user inserts pass the block predicate
-        db.add(Tenant(id=tid, name=company_name.strip(), slug=slug,
+        db.add(Tenant(id=tid, name=name, slug=slug,
                       base_currency_code=(currency or "EUR").upper()[:3],
                       region="primary", status="Active"))
         db.flush()
@@ -296,15 +388,44 @@ def register_company(*, company_name: str, owner_name: str, email: str,
             email=email.strip(), display_name=owner_name.strip() or email,
             is_owner=True, status="Active", role=ADMIN, is_active=True,
             password_hash=hash_password(password),
+            # A returning owner is already verified; only first-time emails verify.
+            email_verified=True if additional and existing[0].email_verified else False,
         )
         db.add(owner)
         db.flush()
+        if additional and owner.email_verified:
+            return _issue(db, owner)   # existing verified account → straight in
         code = _create_email_code(db, owner)   # seed the sign-up verification OTP
         mailer.send_verification_code(email.strip(), code)
         issued = _issue(db, owner)
         if _dev_reveal():
             issued["devVerifyCode"] = code
         return issued
+
+
+def _get_enabled_modules(db, tenant_id) -> list[str] | None:
+    """The company's chosen module set from the setup wizard, or None if it
+    was never set (pre-existing tenants) — callers treat None as "show every
+    module" so this stays backwards compatible."""
+    row = db.execute(
+        text("SELECT value FROM dbo.system_settings WHERE tenant_id=:t AND [key]='enabled_modules'"),
+        {"t": str(tenant_id)},
+    ).first()
+    if row is None or not row[0]:
+        return None
+    try:
+        val = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return val if isinstance(val, list) else None
+
+
+def _set_enabled_modules(db, tenant_id, modules: list[str]) -> None:
+    """Idempotent upsert of the enabled-modules list into system_settings."""
+    db.execute(text("DELETE FROM dbo.system_settings WHERE tenant_id=:t AND [key]='enabled_modules'"),
+               {"t": str(tenant_id)})
+    db.execute(text("INSERT INTO dbo.system_settings (tenant_id,[key],value) VALUES (:t,'enabled_modules',:v)"),
+               {"t": str(tenant_id), "v": json.dumps(modules or [])})
 
 
 def complete_company_setup(*, tenant_id: str, actor_public_id: str | None,
@@ -326,17 +447,14 @@ def complete_company_setup(*, tenant_id: str, actor_public_id: str | None,
         tenant.city = (city or "").strip() or None
         tenant.tax_registration = (tax_registration or "").strip() or None
         tenant.setup_complete = True
-        # Persist enabled modules as a JSON list in system_settings (idempotent).
-        db.execute(text("DELETE FROM dbo.system_settings WHERE tenant_id=:t AND [key]='enabled_modules'"),
-                   {"t": str(tenant_id)})
-        db.execute(text("INSERT INTO dbo.system_settings (tenant_id,[key],value) VALUES (:t,'enabled_modules',:v)"),
-                   {"t": str(tenant_id), "v": json.dumps(modules or [])})
+        _set_enabled_modules(db, tenant_id, modules)
         user = None
         if actor_public_id:
             user = db.execute(select(User).where(User.public_id == actor_public_id)).scalars().first()
         return _profile(db, user) if user else {"company": {"id": str(tenant_id), "name": tenant.name,
                                                             "currency": tenant.base_currency_code,
-                                                            "setupComplete": True}}
+                                                            "setupComplete": True,
+                                                            "enabledModules": _get_enabled_modules(db, tenant_id)}}
 
 
 def _profile_from_tenant(t: Tenant) -> dict:
@@ -368,6 +486,10 @@ def _profile_from_tenant(t: Tenant) -> dict:
         "sameAsCompany": bool(t.legal_same_as_company),
         "registrationNumber": t.registration_number or "",
         "taxNumber": t.tax_registration or "",
+        "bankName": t.bank_name or "",
+        "bankAccount": t.bank_account or "",
+        "bankIban": t.bank_iban or "",
+        "bankSwift": t.bank_swift or "",
     }
 
 
@@ -383,10 +505,21 @@ def get_company_profile(tenant_id: str) -> dict:
         tenant = db.get(Tenant, _tid(tenant_id))
         if tenant is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found.")
-        return _profile_from_tenant(tenant)
+        prof = _profile_from_tenant(tenant)
+        prof["enabledModules"] = _get_enabled_modules(db, tenant_id)
+        return prof
 
 
 def save_company_profile(tenant_id: str, p: dict) -> dict:
+    # Validate contact/web formats server-side (mirrors the frontend checks).
+    from app.core.validation import clean_email, clean_phone, clean_url
+    try:
+        clean_email(p.get("businessEmail"))
+        clean_phone(p.get("phone"))
+        clean_phone(p.get("supportLine"))
+        clean_url(p.get("website"))
+    except ValueError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))
     with system_session() as db:
         _set_tenant(db, tenant_id)
         t = db.get(Tenant, _tid(tenant_id))
@@ -419,8 +552,16 @@ def save_company_profile(tenant_id: str, p: dict) -> dict:
         t.legal_same_as_company = bool(p.get("sameAsCompany"))
         t.registration_number = _clean(p.get("registrationNumber"))
         t.tax_registration = _clean(p.get("taxNumber"))
+        t.bank_name = _clean(p.get("bankName"))
+        t.bank_account = _clean(p.get("bankAccount"))
+        t.bank_iban = _clean(p.get("bankIban"))
+        t.bank_swift = _clean(p.get("bankSwift"))
         db.flush()
-        return _profile_from_tenant(t)
+        if isinstance(p.get("enabledModules"), list):
+            _set_enabled_modules(db, tenant_id, p["enabledModules"])
+        prof = _profile_from_tenant(t)
+        prof["enabledModules"] = _get_enabled_modules(db, tenant_id)
+        return prof
 
 
 def dev_bootstrap() -> dict:

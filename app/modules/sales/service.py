@@ -14,14 +14,13 @@ from app.presenters.screen import board_config, initials, list_config, text_cell
 
 _TYPE_TONE = {"Wholesale": "navy", "Retail": "neutral"}
 _CHANNEL_TONE = {"Wholesale": "navy", "Online": "green", "Marketplace": "amber", "Retail": "neutral"}
-_ORDER_STATUS_TONE = {"New": "gray", "Picking": "amber", "Shipped": "green", "Cancelled": "red"}
+_ORDER_STATUS_TONE = {"New": "gray", "Packed": "navy", "Shipped": "green", "Cancelled": "red"}
 _INV_STATUS_TONE = {"Open": "amber", "Paid": "green", "Overdue": "red"}
 _RET_STATUS_TONE = {"Inspecting": "amber", "Refunded": "green", "Rejected": "red"}
 
 # Fulfillment board columns: (status, title, accent, tone, metaIcon)
 _BOARD_COLUMNS = [
     ("New", "New", "#9499A6", "neutral", "package"),
-    ("Picking", "Picking", "#D29A22", "amber", "package"),
     ("Packed", "Packed", "#3A4256", "navy", "package"),
     ("Shipped", "Shipped", "#2E9E6B", "green", "truck"),
 ]
@@ -106,7 +105,9 @@ def orders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict
         ],
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
-        records=[{"status": r["status"]} for r in rows],
+        records=[{"status": r["status"],
+                  "date": r["order_date"].strftime("%d %b %Y") if r["order_date"] else None}
+                 for r in rows],
         search="Search orders, customer…", action="New order",
         filters=["Channel", "Status", "Date"],
     )
@@ -117,13 +118,21 @@ def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreat
     name = payload.customer.strip()
     customer_id = repo.find_customer_id(session, name=name)
     if customer_id is None:
-        # Auto-register a customer we haven't seen before, so they show up in
-        # the Customers tab and can be reused on future orders.
-        kind = "Wholesale" if payload.channel == "Wholesale" else "Retail"
-        cust = repo.create_customer(
-            session, tenant_id=tid, name=name, email="", kind=kind,
-            region=None, phone=None, address=None,
-        )
+        if payload.newCustomer is not None:
+            # Full Reach/Account/Finance details from the New Order form's
+            # inline "new customer" sub-form — persist them in full rather
+            # than the bare-bones auto-registration below.
+            fields = _customer_fields(payload.newCustomer)
+            fields["name"] = name  # keep in sync with the order's customer field
+            cust = repo.create_customer(session, tenant_id=tid, **fields)
+        else:
+            # Auto-register a customer we haven't seen before, so they show up in
+            # the Customers tab and can be reused on future orders.
+            kind = "Wholesale" if payload.channel == "Wholesale" else "Retail"
+            cust = repo.create_customer(
+                session, tenant_id=tid, name=name, email="", kind=kind,
+                region=None, phone=None, address=None,
+            )
         customer_id = cust.id
     lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku,
               "qty": l.qty, "price": l.price}
@@ -132,6 +141,10 @@ def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreat
         session, tenant_id=tid, customer_id=customer_id, customer_name=payload.customer,
         channel=payload.channel, lines=lines,
     )
+    # Reserve stock for the order's lines (best-effort; released + relieved when
+    # the order ships).
+    from app.modules.inventory import service as inv_service
+    inv_service.reserve_order_stock(session, tenant_id=tid, lines=lines)
     # Raise a receivable for the order so it lands on the customer ledger as a
     # Debit (posted to the GL). Payment (Credit) is confirmed separately via the
     # settle endpoint from the New Order payment modal.
@@ -365,7 +378,7 @@ def _doc_lines(lines: list[dict]) -> list[dict]:
     ]
 
 
-_ORDER_STAGES = ["New", "Picking", "Packed", "Shipped"]
+_ORDER_STAGES = ["New", "Packed", "Shipped"]
 
 
 def order_detail(session: Session, *, public_id: str) -> dict | None:
@@ -375,7 +388,7 @@ def order_detail(session: Session, *, public_id: str) -> dict | None:
     o, lines, cust = data["order"], data["lines"], data["customer"]
     subtotal = sum((l["line_total"] or 0) for l in lines)
     idx = _ORDER_STAGES.index(o.status) if o.status in _ORDER_STAGES else 0
-    stages = [("shopping-bag", "accent", "Order placed"), ("box", "amber", "Picking"),
+    stages = [("shopping-bag", "accent", "Order placed"),
               ("package", "navy", "Packed"), ("truck", "green", "Shipped")]
     timeline = [{"icon": ic, "tone": tn, "title": ti, "time": "", "done": i <= idx}
                 for i, (ic, tn, ti) in enumerate(stages)]
@@ -585,12 +598,15 @@ def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: 
     }
     # Payment terms come from the customer profile when set.
     cust_terms = (customer.terms if customer else "") or "Net 30"
-    # Bank block auto-filled from the customer's details card (same on every
-    # invoice type): title = customer name, bank + account from their profile.
+    # "Remit to" block = OUR OWN business, pulled straight from the Company
+    # Profile → Banking details (same on every invoice type). Title falls back
+    # legal name → trading name; bank/account/IBAN/SWIFT from the profile.
     remit = {
-        "title": buyer["name"],
-        "bank": (customer.bank_name if customer else "") or "",
-        "account": (customer.bank_account if customer else "") or "",
+        "title": biz or company.get("name") or "",
+        "bank": company.get("bank_name") or "",
+        "account": company.get("bank_account") or "",
+        "iban": company.get("bank_iban") or "",
+        "swift": company.get("bank_swift") or "",
     }
 
     is_wholesale = invoice_type == "Wholesale"

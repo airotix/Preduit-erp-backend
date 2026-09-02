@@ -45,6 +45,24 @@ class StockTransfer(Base):
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class StockTransferLine(Base):
+    """One article (colour × size) moving on a stock transfer."""
+    __tablename__ = "stock_transfer_lines"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # Client-side default so multi-line inserts don't rely on the server
+    # NEWSEQUENTIALID() default (which fails under SQLAlchemy's batch INSERT).
+    public_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, server_default=text("NEWSEQUENTIALID()"), default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    transfer_id: Mapped[int] = mapped_column(BigInteger)
+    name: Mapped[str] = mapped_column(String(200))
+    color: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    size: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    sku: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    qty: Mapped[int] = mapped_column(Integer, default=0)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class ReorderAlert(Base):
     __tablename__ = "reorder_alerts"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

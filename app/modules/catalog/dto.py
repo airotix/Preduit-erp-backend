@@ -20,6 +20,7 @@ class ProductCreate(BaseModel):
     imageUrl: str | None = None
     # Specifications
     composition: str | None = Field(default=None, max_length=120)
+    fabric: str | None = Field(default=None, max_length=120)
     gauge: str | None = Field(default=None, max_length=40)
     care: str | None = Field(default=None, max_length=120)
     origin: str | None = Field(default=None, max_length=80)

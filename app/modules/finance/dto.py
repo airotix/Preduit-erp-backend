@@ -9,6 +9,7 @@ class LedgerEntryIn(BaseModel):
     description: str = Field(min_length=1, max_length=400)
     debit: Decimal = Field(default=0, ge=0)
     credit: Decimal = Field(default=0, ge=0)
+    paymentType: str | None = Field(default=None, pattern="^(cash|bank)$")
 
 
 class LedgerDescriptionIn(BaseModel):
@@ -16,6 +17,13 @@ class LedgerDescriptionIn(BaseModel):
     type: str = Field(pattern="^(invoice|bill|manual|payment|cn)$")
     publicId: str = Field(min_length=1, max_length=64)
     description: str = Field(default="", max_length=400)
+
+
+class LedgerPaymentTypeIn(BaseModel):
+    """Inline edit of a ledger row's payment type (Cash / Bank)."""
+    type: str = Field(pattern="^(invoice|bill|manual|payment|cn)$")
+    publicId: str = Field(min_length=1, max_length=64)
+    paymentType: str | None = Field(default=None, pattern="^(cash|bank)$")
 
 
 class BillSettleIn(BaseModel):

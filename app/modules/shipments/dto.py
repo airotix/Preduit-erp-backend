@@ -8,6 +8,13 @@ class ShipmentCreate(BaseModel):
     destination: str = Field(min_length=1, max_length=160)
 
 
+class ShipmentUpdate(BaseModel):
+    carrier: str = Field(min_length=1, max_length=120)
+    destination: str = Field(min_length=1, max_length=160)
+    eta: str | None = Field(default=None, max_length=40)
+    status: str = Field(min_length=1, max_length=24)
+
+
 class CarrierCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     service: str = Field(min_length=1, max_length=80)

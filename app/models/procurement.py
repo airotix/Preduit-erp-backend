@@ -32,6 +32,11 @@ class Supplier(Base):
     vat_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
     contact_person: Mapped[str | None] = mapped_column(String(120), nullable=True)
     bank_details: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    bank_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    bank_account_title: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    bank_account_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    bank_swift: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    bank_iban: Mapped[str | None] = mapped_column(String(60), nullable=True)
     opening_balance: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
