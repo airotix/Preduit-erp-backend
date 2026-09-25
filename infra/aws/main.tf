@@ -194,7 +194,7 @@ resource "aws_db_subnet_group" "main" {
 resource "aws_db_instance" "main" {
   identifier              = local.name
   engine                  = "postgres"
-  engine_version          = "16.3"
+  engine_version          = "16"
   instance_class          = var.db_instance_class
   allocated_storage       = 20
   max_allocated_storage   = 100
@@ -309,6 +309,19 @@ resource "aws_iam_role" "ecs_execution" {
 resource "aws_iam_role_policy_attachment" "ecs_execution" {
   role       = aws_iam_role.ecs_execution.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role_policy" "ecs_exec_secrets" {
+  name = "read-rds-secret"
+  role = aws_iam_role.ecs_execution.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = aws_db_instance.main.master_user_secret[0].secret_arn
+    }]
+  })
 }
 
 resource "aws_iam_role" "backend_task" {
@@ -472,10 +485,17 @@ resource "aws_ecs_task_definition" "backend" {
       { name = "DB_HOST",   value = aws_db_instance.main.address },
       { name = "DB_PORT",   value = "5432" },
       { name = "DB_NAME",   value = var.db_name },
+      { name = "DB_USER",   value = var.db_master_username },
       { name = "DB_SSLMODE", value = "require" },
       { name = "S3_BUCKET", value = aws_s3_bucket.docs.id },
       { name = "S3_REGION", value = var.aws_region },
       { name = "REDIS_URL", value = "rediss://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0" },
+    ]
+    secrets = [
+      {
+        name      = "DB_PASS"
+        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:password::"
+      },
     ]
     logConfiguration = {
       logDriver = "awslogs"
