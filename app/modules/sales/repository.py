@@ -359,7 +359,7 @@ def variants_by_sku(session: Session, *, skus: list[str]) -> dict[str, dict]:
 
 def tenant_name(session: Session) -> str | None:
     return session.execute(text(
-        "SELECT name FROM dbo.tenants WHERE id = CAST(SESSION_CONTEXT(N'tenant_id') AS UNIQUEIDENTIFIER)"
+        "SELECT name FROM tenants WHERE id = current_setting('app.tenant_id')::uuid"
     )).scalar()
 
 
@@ -367,9 +367,9 @@ def company_info(session: Session) -> dict:
     """Our own company's profile fields — for the invoice letterhead block."""
     row = session.execute(text(
         "SELECT name, legal_name, tax_registration, registration_number, base_currency_code, "
-        "country, city, [state], postal, street, business_email, phone, support_line, website, logo_doc_id, "
+        "country, city, state, postal, street, business_email, phone, support_line, website, logo_doc_id, "
         "bank_name, bank_account, bank_iban, bank_swift "
-        "FROM dbo.tenants WHERE id = CAST(SESSION_CONTEXT(N'tenant_id') AS UNIQUEIDENTIFIER)"
+        "FROM tenants WHERE id = current_setting('app.tenant_id')::uuid"
     )).mappings().first()
     return dict(row) if row else {}
 

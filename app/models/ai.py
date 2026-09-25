@@ -11,7 +11,7 @@ from app.models.base import Base
 class AiSnapshot(Base):
     __tablename__ = "ai_snapshot"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     kind: Mapped[str] = mapped_column(String(40))
     scope: Mapped[str] = mapped_column(String(200), default="")
@@ -22,7 +22,7 @@ class AiSnapshot(Base):
 class AiSyncState(Base):
     __tablename__ = "ai_sync_state"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     last_synced_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="idle")

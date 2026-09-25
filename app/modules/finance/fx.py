@@ -1,6 +1,6 @@
 """Exchange-rate sync for the ERP.
 
-Populates the dated dbo.exchange_rates table from the free, key-less
+Populates the dated exchange_rates table from the free, key-less
 Frankfurter/ECB API so the currency conversion stays current. (The transactional
 FX gain/loss module was removed per client request; only rate management remains.)
 """
@@ -69,7 +69,7 @@ def sync_rates(session, tenant_id) -> dict:
     ts = data.get("time_last_update_unix")
     valid_from = datetime.datetime.utcfromtimestamp(ts).date() if ts else datetime.date.today()
 
-    # Only store rates for currencies that exist in dbo.currencies — from_ccy/to_ccy
+    # Only store rates for currencies that exist in currencies — from_ccy/to_ccy
     # are FKs to it, so unknown codes would fail the insert.
     known = repo.currency_codes(session)
     symbols = [c for c in known if c != base] or [c for c in _DEFAULT_SYMBOLS if c != base]

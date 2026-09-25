@@ -12,7 +12,7 @@ from app.models.base import Base
 class Supplier(Base):
     __tablename__ = "suppliers"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(200))
     region: Mapped[str | None] = mapped_column(String(80), nullable=True)
@@ -44,7 +44,7 @@ class Supplier(Base):
 class PurchaseOrder(Base):
     __tablename__ = "purchase_orders"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     po_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     supplier_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -61,7 +61,7 @@ class PurchaseOrder(Base):
 class GoodsReceipt(Base):
     __tablename__ = "goods_receipts"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     grn_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     po_ref: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -90,12 +90,12 @@ class PurchaseOrderLine(Base):
     __tablename__ = "purchase_order_lines"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     # Client-side default so multi-line POs insert cleanly: SQLAlchemy batches
-    # multiple lines into one INSERT…SELECT (VALUES…), and SQL Server's
-    # NEWSEQUENTIALID() default cannot evaluate in that form (→ NULL public_id).
+    # multiple lines into one INSERT…SELECT (VALUES…), and the DB's
+    # gen_random_uuid() default cannot evaluate in that form (→ NULL public_id).
     # Generating the UUID in Python sidesteps that; server_default stays for
     # direct SQL inserts.
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()"), default=uuid.uuid4)
+        Uuid, server_default=text("gen_random_uuid()"), default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     po_id: Mapped[int] = mapped_column(BigInteger)
     name: Mapped[str] = mapped_column(String(200))
@@ -111,7 +111,7 @@ class PoInvoice(Base):
     """Commercial invoice generated against a PO — full editable doc in `data`."""
     __tablename__ = "po_invoices"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     invoice_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
     po_no: Mapped[str | None] = mapped_column(String(40), nullable=True)

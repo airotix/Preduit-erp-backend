@@ -10,7 +10,7 @@ from app.models.base import Base
 class Shipment(Base):
     __tablename__ = "shipments"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     shipment_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     order_ref: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -24,7 +24,7 @@ class Shipment(Base):
 class Carrier(Base):
     __tablename__ = "carriers"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(120))
     service: Mapped[str | None] = mapped_column(String(80), nullable=True)

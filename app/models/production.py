@@ -12,7 +12,7 @@ from app.models.base import Base
 class ProductionOrder(Base):
     __tablename__ = "production_orders"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     order_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Summary style label for the order (e.g. "Merino Crew Knit +1 more"); the
@@ -35,7 +35,7 @@ class ProductionOrderLine(Base):
     """One style/item within a production order — each gets its own stage timeline."""
     __tablename__ = "production_order_lines"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("production_orders.id"))
     sales_order_line_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -45,10 +45,8 @@ class ProductionOrderLine(Base):
     size: Mapped[str | None] = mapped_column(String(60), nullable=True)
     qty: Mapped[int] = mapped_column(Integer, default=0)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
-    # NOTE: the table has a ROWVERSION column, but it is intentionally NOT mapped.
-    # ROWVERSION is server-generated and cannot appear in an INSERT/UPDATE column
-    # list — mapping it makes SQLAlchemy emit an explicit NULL and SQL Server
-    # rejects it ("Cannot insert an explicit value into a timestamp column").
+    # NOTE: the table has a version column that is intentionally NOT mapped.
+    # It is server-generated and cannot appear in an INSERT/UPDATE column list.
 
     order: Mapped["ProductionOrder"] = relationship(back_populates="lines")
     stages: Mapped[list["ProductionStage"]] = relationship(
@@ -59,7 +57,7 @@ class ProductionOrderLine(Base):
 class ProductionStage(Base):
     __tablename__ = "production_stages"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("production_orders.id"), nullable=True)
     line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("production_order_lines.id"), nullable=True)
@@ -80,7 +78,7 @@ class ProductionStage(Base):
 class BomLine(Base):
     __tablename__ = "bill_of_materials"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     component: Mapped[str] = mapped_column(String(200))
     style: Mapped[str | None] = mapped_column(String(200), nullable=True)

@@ -11,7 +11,7 @@ from app.models.base import Base
 class Document(Base):
     __tablename__ = "documents"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     doc_id: Mapped[str] = mapped_column(String(40))
     module: Mapped[str] = mapped_column(String(40))

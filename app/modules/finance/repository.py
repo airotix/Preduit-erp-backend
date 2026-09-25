@@ -979,20 +979,20 @@ def create_full_journal(session: Session, *, tenant_id: UUID, reference: str | N
 
 def base_currency(session: Session) -> str | None:
     return session.execute(text(
-        "SELECT base_currency_code FROM dbo.tenants "
-        "WHERE id = CAST(SESSION_CONTEXT(N'tenant_id') AS UNIQUEIDENTIFIER)"
+        "SELECT base_currency_code FROM tenants "
+        "WHERE id = current_setting('app.tenant_id')::uuid"
     )).scalar()
 
 
 def currency_codes(session: Session) -> set[str]:
     """Currency codes known to the ERP (exchange_rates.from/to are FKs to this)."""
-    rows = session.execute(text("SELECT code FROM dbo.currencies")).scalars().all()
+    rows = session.execute(text("SELECT code FROM currencies")).scalars().all()
     return {str(c).strip() for c in rows}
 
 
 def list_rates(session: Session) -> list[dict]:
     rows = session.execute(text(
-        "SELECT from_ccy, to_ccy, rate, valid_from, source FROM dbo.exchange_rates "
+        "SELECT from_ccy, to_ccy, rate, valid_from, source FROM exchange_rates "
         "ORDER BY valid_from DESC, from_ccy, to_ccy"
     )).mappings().all()
     return [dict(r) for r in rows]
@@ -1000,18 +1000,16 @@ def list_rates(session: Session) -> list[dict]:
 
 def upsert_rate(session: Session, *, tenant_id, from_ccy: str, to_ccy: str,
                 rate: float, valid_from, source: str) -> None:
-    """Update the dated rate if present, else insert. Avoids MERGE (fewer edge
-    cases under RLS). UPDATE is auto-scoped to the tenant by the filter predicate;
-    INSERT sets tenant_id explicitly to satisfy the block predicate."""
+    """Update the dated rate if present, else insert."""
     params = {"tid": str(tenant_id), "f": from_ccy, "t": to_ccy, "r": rate,
               "vf": valid_from, "s": source}
     res = session.execute(text(
-        "UPDATE dbo.exchange_rates SET rate = :r, source = :s "
+        "UPDATE exchange_rates SET rate = :r, source = :s "
         "WHERE from_ccy = :f AND to_ccy = :t AND valid_from = :vf"), params)
     if (res.rowcount or 0) == 0:
         session.execute(text(
-            "INSERT INTO dbo.exchange_rates (tenant_id, from_ccy, to_ccy, rate, valid_from, source) "
-            "VALUES (CAST(:tid AS UNIQUEIDENTIFIER), :f, :t, :r, :vf, :s)"), params)
+            "INSERT INTO exchange_rates (tenant_id, from_ccy, to_ccy, rate, valid_from, source) "
+            "VALUES (:tid::uuid, :f, :t, :r, :vf, :s)"), params)
 
 
 def reverse_journal(session: Session, *, public_id: str) -> JournalEntry | None:
@@ -1290,14 +1288,14 @@ def fx_factor(session: Session, *, target: str) -> float:
     """Conversion factor from the tenant's base currency to `target` (1.0 if same
     or no rate on file). Uses the latest exchange_rates row for this tenant."""
     base = session.execute(text(
-        "SELECT base_currency_code FROM dbo.tenants "
-        "WHERE id = CAST(SESSION_CONTEXT(N'tenant_id') AS UNIQUEIDENTIFIER)"
+        "SELECT base_currency_code FROM tenants "
+        "WHERE id = current_setting('app.tenant_id')::uuid"
     )).scalar()
     if not base or not target or base == target:
         return 1.0
     rate = session.execute(
-        text("SELECT TOP 1 rate FROM dbo.exchange_rates "
-             "WHERE from_ccy = :b AND to_ccy = :t ORDER BY valid_from DESC"),
+        text("SELECT rate FROM exchange_rates "
+             "WHERE from_ccy = :b AND to_ccy = :t ORDER BY valid_from DESC LIMIT 1"),
         {"b": base, "t": target},
     ).scalar()
     return float(rate) if rate else 1.0

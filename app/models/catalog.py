@@ -12,7 +12,7 @@ class Category(Base):
     __tablename__ = "categories"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()")
+        Uuid, server_default=text("gen_random_uuid()")
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(120))
@@ -26,7 +26,7 @@ class AttributeValue(Base):
     __tablename__ = "attribute_values"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()")
+        Uuid, server_default=text("gen_random_uuid()")
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     attr_type: Mapped[str] = mapped_column(String(20))  # 'Color' | 'Size'
@@ -40,7 +40,7 @@ class Product(Base):
     __tablename__ = "products"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()")
+        Uuid, server_default=text("gen_random_uuid()")
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     title: Mapped[str] = mapped_column(String(200))
@@ -63,7 +63,7 @@ class ProductVariant(Base):
     __tablename__ = "product_variants"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()")
+        Uuid, server_default=text("gen_random_uuid()")
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("products.id"))

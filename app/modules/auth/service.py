@@ -69,12 +69,12 @@ def verify_password(pw: str, hashed: str | None) -> bool:
 # erp_system principal (prod). Under local trusted-connection dev it isn't, so we
 # set/clear the tenant context on the connection to satisfy the policy predicate.
 def _set_tenant(db, tenant_id) -> None:
-    db.execute(text("EXEC sp_set_session_context @key=N'tenant_id', @value=:tid"),
+    db.execute(text("SET app.tenant_id = :tid"),
                {"tid": str(tenant_id)})
 
 
 def _clear_tenant(db) -> None:
-    db.execute(text("EXEC sp_set_session_context @key=N'tenant_id', @value=NULL"))
+    db.execute(text("RESET app.tenant_id"))
 
 
 # --------------------------------------------------------------------------- #
@@ -408,7 +408,7 @@ def _get_enabled_modules(db, tenant_id) -> list[str] | None:
     was never set (pre-existing tenants) — callers treat None as "show every
     module" so this stays backwards compatible."""
     row = db.execute(
-        text("SELECT value FROM dbo.system_settings WHERE tenant_id=:t AND [key]='enabled_modules'"),
+        text("SELECT value FROM system_settings WHERE tenant_id=:t AND key='enabled_modules'"),
         {"t": str(tenant_id)},
     ).first()
     if row is None or not row[0]:
@@ -422,9 +422,9 @@ def _get_enabled_modules(db, tenant_id) -> list[str] | None:
 
 def _set_enabled_modules(db, tenant_id, modules: list[str]) -> None:
     """Idempotent upsert of the enabled-modules list into system_settings."""
-    db.execute(text("DELETE FROM dbo.system_settings WHERE tenant_id=:t AND [key]='enabled_modules'"),
+    db.execute(text("DELETE FROM system_settings WHERE tenant_id=:t AND key='enabled_modules'"),
                {"t": str(tenant_id)})
-    db.execute(text("INSERT INTO dbo.system_settings (tenant_id,[key],value) VALUES (:t,'enabled_modules',:v)"),
+    db.execute(text("INSERT INTO system_settings (tenant_id, key, value) VALUES (:t, 'enabled_modules', :v)"),
                {"t": str(tenant_id), "v": json.dumps(modules or [])})
 
 
