@@ -312,14 +312,17 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
 }
 
 resource "aws_iam_role_policy" "ecs_exec_secrets" {
-  name = "read-rds-secret"
+  name = "read-secrets"
   role = aws_iam_role.ecs_execution.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
       Action   = ["secretsmanager:GetSecretValue"]
-      Resource = aws_db_instance.main.master_user_secret[0].secret_arn
+      Resource = [
+        aws_db_instance.main.master_user_secret[0].secret_arn,
+        aws_secretsmanager_secret.app.arn,
+      ]
     }]
   })
 }
@@ -401,7 +404,7 @@ resource "aws_lb_target_group" "backend" {
   target_type = "ip"
 
   health_check {
-    path                = "/api/v1/health"
+    path                = "/health"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     interval            = 30
@@ -455,7 +458,7 @@ resource "aws_lb_listener_rule" "api" {
   priority     = 100
 
   condition {
-    path_pattern { values = ["/api/*"] }
+    path_pattern { values = ["/api/*", "/health", "/docs", "/openapi.json"] }
   }
 
   action {
@@ -481,20 +484,35 @@ resource "aws_ecs_task_definition" "backend" {
     image = "${aws_ecr_repository.backend.repository_url}:${var.backend_image_tag}"
     portMappings = [{ containerPort = 8000 }]
     environment = [
-      { name = "ENV",       value = var.env },
-      { name = "DB_HOST",   value = aws_db_instance.main.address },
-      { name = "DB_PORT",   value = "5432" },
-      { name = "DB_NAME",   value = var.db_name },
-      { name = "DB_USER",   value = var.db_master_username },
-      { name = "DB_SSLMODE", value = "require" },
-      { name = "S3_BUCKET", value = aws_s3_bucket.docs.id },
-      { name = "S3_REGION", value = var.aws_region },
-      { name = "REDIS_URL", value = "rediss://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0" },
+      { name = "ENV",              value = var.env },
+      { name = "DB_HOST",          value = aws_db_instance.main.address },
+      { name = "DB_PORT",          value = "5432" },
+      { name = "DB_NAME",          value = var.db_name },
+      { name = "DB_USER",          value = var.db_master_username },
+      { name = "DB_APP_USER",      value = var.db_master_username },
+      { name = "DB_SYSTEM_USER",   value = var.db_master_username },
+      { name = "DB_SSLMODE",       value = "require" },
+      { name = "S3_BUCKET",        value = aws_s3_bucket.docs.id },
+      { name = "S3_REGION",        value = var.aws_region },
+      { name = "REDIS_URL",        value = "rediss://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0" },
+      { name = "CORS_ORIGINS",     value = "https://${aws_lb.main.dns_name},http://${aws_lb.main.dns_name}" },
     ]
     secrets = [
       {
         name      = "DB_PASS"
         valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:password::"
+      },
+      {
+        name      = "DB_APP_PASSWORD"
+        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:password::"
+      },
+      {
+        name      = "DB_SYSTEM_PASSWORD"
+        valueFrom = "${aws_db_instance.main.master_user_secret[0].secret_arn}:password::"
+      },
+      {
+        name      = "JWT_SECRET"
+        valueFrom = "${aws_secretsmanager_secret.app.arn}:JWT_SECRET::"
       },
     ]
     logConfiguration = {
