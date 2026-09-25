@@ -458,7 +458,7 @@ resource "aws_lb_listener_rule" "api" {
   priority     = 100
 
   condition {
-    path_pattern { values = ["/api/*"] }
+    path_pattern { values = ["/api/*", "/health", "/docs", "/openapi.json"] }
   }
 
   action {
