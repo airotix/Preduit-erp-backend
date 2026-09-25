@@ -338,7 +338,7 @@ resource "aws_iam_role" "frontend_task" {
 # Secrets Manager (DB password is auto-managed by RDS; app secrets here)
 # ==============================================================================
 resource "aws_secretsmanager_secret" "app" {
-  name = "${local.name}/app-secrets"
+  name = "${local.name}/app-config"
 }
 
 # ==============================================================================
