@@ -498,10 +498,11 @@ resource "aws_ecs_task_definition" "backend" {
       { name = "CORS_ORIGINS",     value = "https://${aws_lb.main.dns_name},http://${aws_lb.main.dns_name}" },
       { name = "SMTP_HOST",        value = "email-smtp.${var.aws_region}.amazonaws.com" },
       { name = "SMTP_PORT",        value = "587" },
-      { name = "SMTP_USER",        value = "ingressendpoint-20260925-164442" },
+      { name = "SMTP_USER",        value = "AKIA52KEJ4FNGUZCCY3H" },
       { name = "SMTP_USE_TLS",     value = "true" },
       { name = "MAIL_FROM",        value = "airotixpersonal@gmail.com" },
       { name = "MAIL_FROM_NAME",   value = "Preduit ERP" },
+      { name = "APP_BASE_URL",     value = "http://${aws_lb.main.dns_name}" },
     ]
     secrets = [
       {
