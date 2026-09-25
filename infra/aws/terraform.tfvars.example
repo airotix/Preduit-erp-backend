@@ -4,7 +4,7 @@ env        = "prod"
 aws_region = "eu-west-1"
 
 # Database
-db_instance_class  = "db.t4g.medium"
+db_instance_class  = "db.t3.micro"
 db_master_username = "erp_admin"
 
 # ECS sizing

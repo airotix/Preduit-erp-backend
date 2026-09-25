@@ -22,7 +22,7 @@ variable "az_count" {
 
 # --- Database ---
 variable "db_instance_class" {
-  default = "db.t4g.medium"
+  default = "db.t3.micro"
 }
 
 variable "db_name" {

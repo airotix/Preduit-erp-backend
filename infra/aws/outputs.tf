@@ -4,11 +4,7 @@ output "alb_dns" {
 }
 
 output "rds_endpoint" {
-  value = aws_rds_cluster.main.endpoint
-}
-
-output "rds_reader_endpoint" {
-  value = aws_rds_cluster.main.reader_endpoint
+  value = aws_db_instance.main.address
 }
 
 output "redis_endpoint" {
