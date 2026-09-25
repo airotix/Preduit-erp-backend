@@ -1,6 +1,5 @@
 """Application settings, loaded from environment / .env (see .env.example)."""
 from functools import lru_cache
-from urllib.parse import quote_plus
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -10,20 +9,15 @@ class Settings(BaseSettings):
 
     env: str = "dev"
 
-    # Database
-    # sql_server may be "localhost", "localhost\\SQLEXPRESS", or an Azure FQDN.
-    sql_server: str = "localhost"
-    sql_database: str = "preduit"
-    sql_app_user: str = "erp_app"
-    sql_app_password: str = ""
-    sql_system_user: str = "erp_system"
-    sql_system_password: str = ""
-    # Local SQL Server uses a self-signed cert → trust it. On Azure set encrypt=yes, trust=no.
-    sql_encrypt: str = "yes"
-    sql_trust_server_cert: str = "yes"
-    # Windows auth (Trusted_Connection) for local dev — e.g. LocalDB. When "yes",
-    # Uid/Pwd are ignored and the process's Windows identity is used.
-    sql_trusted_connection: str = "no"
+    # Database (PostgreSQL)
+    db_host: str = "localhost"
+    db_port: int = 5432
+    db_name: str = "preduit"
+    db_app_user: str = "erp_app"
+    db_app_password: str = ""
+    db_system_user: str = "erp_system"
+    db_system_password: str = ""
+    db_sslmode: str = "prefer"
 
     # Entra External ID
     entra_tenant_id: str = ""
@@ -141,37 +135,29 @@ class Settings(BaseSettings):
     # Cache
     redis_url: str = "redis://localhost:6379/0"
 
-    # Document storage (local dir for dev; Azure Blob in prod)
+    # Document storage (local dir for dev; S3 in prod).
+    # Set S3_BUCKET to enable S3 mode; leave blank for local filesystem.
     doc_storage_dir: str = "./storage"
+    s3_bucket: str = ""
+    s3_region: str = ""
+    s3_endpoint_url: str = ""
 
-    def _odbc(self, user: str, password: str) -> str:
-        parts = [
-            "Driver={ODBC Driver 18 for SQL Server}",
-            f"Server={self.sql_server}",
-            f"Database={self.sql_database}",
-        ]
-        if self.sql_trusted_connection.lower() in ("yes", "true", "1"):
-            parts.append("Trusted_Connection=yes")
-        else:
-            parts.append(f"Uid={user}")
-            parts.append(f"Pwd={password}")
-        parts += [
-            f"Encrypt={self.sql_encrypt}",
-            f"TrustServerCertificate={self.sql_trust_server_cert}",
-            "Connection Timeout=30",
-        ]
-        conn = ";".join(parts) + ";"
-        return f"mssql+pyodbc:///?odbc_connect={quote_plus(conn)}"
+    def _pg_url(self, user: str, password: str) -> str:
+        return (
+            f"postgresql+psycopg2://{user}:{password}"
+            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+            f"?sslmode={self.db_sslmode}"
+        )
 
     @property
     def app_database_url(self) -> str:
         """Runtime connection — subject to Row-Level Security."""
-        return self._odbc(self.sql_app_user, self.sql_app_password)
+        return self._pg_url(self.db_app_user, self.db_app_password)
 
     @property
     def system_database_url(self) -> str:
         """Provisioning connection — exempt from RLS (erp_system principal)."""
-        return self._odbc(self.sql_system_user, self.sql_system_password)
+        return self._pg_url(self.db_system_user, self.db_system_password)
 
 
 @lru_cache

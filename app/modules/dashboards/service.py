@@ -80,10 +80,10 @@ def _sum_type(session: Session, acct_type: str) -> float:
 def _monthly_revenue(session: Session):
     """(bars 0-100 for the last 12 months, [raw monthly totals])."""
     rows = session.execute(
-        select(func.year(SalesOrder.order_date), func.month(SalesOrder.order_date),
+        select(func.extract('year', SalesOrder.order_date), func.extract('month', SalesOrder.order_date),
                func.coalesce(func.sum(SalesOrder.total), 0))
         .where(SalesOrder.is_deleted == False, SalesOrder.order_date.isnot(None))  # noqa: E712
-        .group_by(func.year(SalesOrder.order_date), func.month(SalesOrder.order_date))
+        .group_by(func.extract('year', SalesOrder.order_date), func.extract('month', SalesOrder.order_date))
     ).all()
     data = {(int(y), int(m)): float(t) for y, m, t in rows}
     today = datetime.date.today()

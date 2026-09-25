@@ -47,7 +47,7 @@ def update_user(session: Session, *, public_id, name, email, role, department) -
 def list_roles(session, *, limit, offset):
     counts = {
         rid: c for rid, c in session.execute(
-            text("SELECT role_id, COUNT(*) AS c FROM dbo.user_roles GROUP BY role_id")
+            text("SELECT role_id, COUNT(*) AS c FROM user_roles GROUP BY role_id")
         )
     }
     stmt = select(Role.public_id, Role.id, Role.name, Role.scope).order_by(Role.name).limit(limit).offset(offset)
@@ -140,8 +140,8 @@ def list_documents(session, *, limit, offset):
 
 def list_audit(session, *, limit):
     rows = session.execute(
-        text("SELECT TOP (:lim) occurred_at, actor_id, action, entity_type, entity_id, detail "
-             "FROM dbo.audit_log ORDER BY occurred_at DESC"),
+        text("SELECT occurred_at, actor_id, action, entity_type, entity_id, detail "
+             "FROM audit_log ORDER BY occurred_at DESC LIMIT :lim"),
         {"lim": limit},
     ).mappings().all()
     return [dict(r) for r in rows]

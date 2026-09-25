@@ -13,7 +13,7 @@ class SupplierBill(Base):
     """Payables — the source for live AP aging."""
     __tablename__ = "supplier_bills"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     bill_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     supplier_name: Mapped[str] = mapped_column(String(200))
@@ -34,7 +34,7 @@ class SupplierBill(Base):
 class Account(Base):
     __tablename__ = "chart_of_accounts"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     code: Mapped[str] = mapped_column(String(20))
     name: Mapped[str] = mapped_column(String(200))
@@ -54,7 +54,7 @@ class Account(Base):
 class JournalEntry(Base):
     __tablename__ = "journal_entries"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     entry_no: Mapped[str] = mapped_column(String(32))
     entry_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -85,7 +85,7 @@ class JournalLine(Base):
 class Payment(Base):
     __tablename__ = "payments"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     payment_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     pay_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -109,7 +109,7 @@ class CreditNote(Base):
     """Customer credit notes — credit entries on the customer ledger."""
     __tablename__ = "credit_notes"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     cn_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     customer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -129,7 +129,7 @@ class LedgerEntry(Base):
     the customer's running balance but is not posted to the GL."""
     __tablename__ = "ledger_entries"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     customer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     supplier_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -144,7 +144,7 @@ class LedgerEntry(Base):
 class FiscalPeriod(Base):
     __tablename__ = "fiscal_periods"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(40))
     start_date: Mapped[datetime.date] = mapped_column(Date)
@@ -156,7 +156,7 @@ class FiscalPeriod(Base):
 class BudgetLine(Base):
     __tablename__ = "budget_lines"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     fiscal_year: Mapped[int] = mapped_column(Integer)
     account_code: Mapped[str] = mapped_column(String(20))
@@ -168,7 +168,7 @@ class BudgetLine(Base):
 class FixedAsset(Base):
     __tablename__ = "fixed_assets"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     asset_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
@@ -185,7 +185,7 @@ class FixedAsset(Base):
 class BankAccount(Base):
     __tablename__ = "bank_accounts"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(120))
     account_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -197,7 +197,7 @@ class BankAccount(Base):
 class BankTransaction(Base):
     __tablename__ = "bank_transactions"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     bank_account_id: Mapped[int] = mapped_column(BigInteger)
     txn_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)

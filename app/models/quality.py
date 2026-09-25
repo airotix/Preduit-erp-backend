@@ -12,7 +12,7 @@ from app.models.base import Base
 class Inspection(Base):
     __tablename__ = "inspections"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     inspection_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     order_ref: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -50,7 +50,7 @@ class InspectionCheck(Base):
     __tablename__ = "inspection_checks"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, default=uuid.uuid4,
-                                                 server_default=text("NEWSEQUENTIALID()"))
+                                                 server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     inspection_id: Mapped[int] = mapped_column(BigInteger)
     seq: Mapped[int] = mapped_column(Integer, default=0)
@@ -69,7 +69,7 @@ class InspectionDefect(Base):
     __tablename__ = "inspection_defects"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, default=uuid.uuid4,
-                                                 server_default=text("NEWSEQUENTIALID()"))
+                                                 server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     inspection_id: Mapped[int] = mapped_column(BigInteger)
     defect_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -88,7 +88,7 @@ class InspectionDefect(Base):
 class DefectType(Base):
     __tablename__ = "defect_types"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(120))
     category: Mapped[str | None] = mapped_column(String(40), nullable=True)

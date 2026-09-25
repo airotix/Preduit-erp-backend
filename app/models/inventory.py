@@ -10,7 +10,7 @@ from app.models.base import Base
 class Location(Base):
     __tablename__ = "locations"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(120))
     code: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -23,7 +23,7 @@ class Location(Base):
 class StockLevel(Base):
     __tablename__ = "stock_levels"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     variant_id: Mapped[int] = mapped_column(BigInteger)
     location_id: Mapped[int] = mapped_column(BigInteger)
@@ -34,7 +34,7 @@ class StockLevel(Base):
 class StockTransfer(Base):
     __tablename__ = "stock_transfers"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     transfer_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
     from_location_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -50,9 +50,9 @@ class StockTransferLine(Base):
     __tablename__ = "stock_transfer_lines"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     # Client-side default so multi-line inserts don't rely on the server
-    # NEWSEQUENTIALID() default (which fails under SQLAlchemy's batch INSERT).
+    # gen_random_uuid() default (which fails under SQLAlchemy's batch INSERT).
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()"), default=uuid.uuid4)
+        Uuid, server_default=text("gen_random_uuid()"), default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     transfer_id: Mapped[int] = mapped_column(BigInteger)
     name: Mapped[str] = mapped_column(String(200))
@@ -66,7 +66,7 @@ class StockTransferLine(Base):
 class ReorderAlert(Base):
     __tablename__ = "reorder_alerts"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     variant_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     sku: Mapped[str] = mapped_column(String(64))

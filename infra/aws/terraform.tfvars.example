@@ -1,0 +1,24 @@
+# Copy to terraform.tfvars and fill in values
+project    = "preduit"
+env        = "prod"
+aws_region = "eu-west-1"
+
+# Database
+db_instance_class  = "db.t4g.medium"
+db_master_username = "erp_admin"
+
+# ECS sizing
+backend_cpu           = 512
+backend_memory        = 1024
+backend_desired_count = 2
+
+frontend_cpu           = 256
+frontend_memory        = 512
+frontend_desired_count = 2
+
+# Redis
+redis_node_type = "cache.t4g.micro"
+
+# Domain & HTTPS (optional — leave blank to use ALB DNS)
+# domain_name     = "app.preduit.com"
+# certificate_arn = "arn:aws:acm:eu-west-1:ACCOUNT:certificate/CERT-ID"

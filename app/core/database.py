@@ -1,13 +1,13 @@
-"""Database engines and the tenant SESSION_CONTEXT plumbing (plan §2).
+"""Database engines and the tenant session-context plumbing.
 
 Two engines:
   * ``app_engine``    — runtime user, subject to Row-Level Security.
   * ``system_engine`` — provisioning user (erp_system), exempt from RLS.
 
 Tenant isolation: before running any tenant-scoped query we set
-``SESSION_CONTEXT('tenant_id')`` on the connection. Because the pool reuses
-connections, we defensively CLEAR the context on every checkout so a stale
-tenant can never leak into the next request.
+``app.tenant_id`` on the connection. Because the pool reuses connections,
+we defensively CLEAR the context on every checkout so a stale tenant can
+never leak into the next request.
 """
 from contextlib import contextmanager
 from typing import Iterator
@@ -28,19 +28,17 @@ SystemSession = sessionmaker(bind=system_engine, autoflush=False, expire_on_comm
 
 @event.listens_for(app_engine, "checkout")
 def _clear_tenant_on_checkout(dbapi_conn, conn_record, conn_proxy):  # noqa: ANN001
-    """Reset tenant context whenever a pooled connection is handed out. Also
-    clears any RLS bypass flag defensively — the app engine must always stay
-    subject to Row-Level Security (only the system session may bypass)."""
+    """Reset tenant context whenever a pooled connection is handed out."""
     cur = dbapi_conn.cursor()
-    cur.execute("EXEC sp_set_session_context @key=N'tenant_id', @value=NULL")
-    cur.execute("EXEC sp_set_session_context @key=N'rls_bypass', @value=NULL")
+    cur.execute("RESET app.tenant_id")
+    cur.execute("RESET app.rls_bypass")
     cur.close()
 
 
 def _set_tenant(session: Session, tenant_id: str) -> None:
     session.execute(
-        text("EXEC sp_set_session_context @key=N'tenant_id', @value=:tid, @read_only=0"),
-        {"tid": tenant_id},
+        text("SET app.tenant_id = :tid"),
+        {"tid": str(tenant_id)},
     )
 
 
@@ -61,14 +59,11 @@ def get_db(tenant_id: str) -> Iterator[Session]:
 @contextmanager
 def system_session() -> Iterator[Session]:
     """Privileged session for provisioning / pre-auth lookups. Opts out of RLS
-    via SESSION_CONTEXT('rls_bypass') so it is exempt even when the connection
-    isn't the erp_system principal (e.g. LocalDB Windows auth). Tenant-scoped
-    reads on this session still filter by tenant_id explicitly."""
+    via app.rls_bypass so it is exempt even when the connection isn't the
+    erp_system principal."""
     session = SystemSession()
     try:
-        session.execute(
-            text("EXEC sp_set_session_context @key=N'rls_bypass', @value=1")
-        )
+        session.execute(text("SET app.rls_bypass = 'true'"))
         yield session
         session.commit()
     except Exception:

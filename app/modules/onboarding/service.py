@@ -30,7 +30,7 @@ def create_organization(principal: Principal, req: CreateOrgRequest) -> CreateOr
     with system_session() as db:
         # Slug uniqueness (friendly error before hitting the DB constraint).
         exists = db.execute(
-            text("SELECT 1 FROM dbo.tenants WHERE slug = :s"), {"s": req.slug}
+            text("SELECT 1 FROM tenants WHERE slug = :s"), {"s": req.slug}
         ).first()
         if exists:
             raise ValueError("slug_taken")
@@ -65,20 +65,20 @@ def create_organization(principal: Principal, req: CreateOrgRequest) -> CreateOr
 
         # Link the creator → Admin role, and grant the Admin role every permission.
         db.execute(
-            text("INSERT INTO dbo.user_roles (tenant_id, user_id, role_id) VALUES (:t,:u,:r)"),
+            text("INSERT INTO user_roles (tenant_id, user_id, role_id) VALUES (:t,:u,:r)"),
             {"t": tenant.id, "u": owner.id, "r": roles["Admin"].id},
         )
         db.execute(
             text(
-                "INSERT INTO dbo.role_permissions (tenant_id, role_id, permission_id) "
-                "SELECT :t, :r, id FROM dbo.permissions"
+                "INSERT INTO role_permissions (tenant_id, role_id, permission_id) "
+                "SELECT :t, :r, id FROM permissions"
             ),
             {"t": tenant.id, "r": roles["Admin"].id},
         )
 
         # Baseline settings + trial window.
         db.execute(
-            text("INSERT INTO dbo.system_settings (tenant_id, [key], value) VALUES (:t, 'onboarded_at', :v)"),
+            text("INSERT INTO system_settings (tenant_id, key, value) VALUES (:t, 'onboarded_at', :v)"),
             {"t": tenant.id, "v": datetime.now(timezone.utc).isoformat()},
         )
 

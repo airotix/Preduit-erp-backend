@@ -15,7 +15,7 @@ class Customer(Base):
     __tablename__ = "customers"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()")
+        Uuid, server_default=text("gen_random_uuid()")
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(200))
@@ -41,7 +41,7 @@ class SalesOrder(Base):
     __tablename__ = "sales_orders"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()")
+        Uuid, server_default=text("gen_random_uuid()")
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     order_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -86,7 +86,7 @@ class Invoice(Base):
     __tablename__ = "invoices"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()")
+        Uuid, server_default=text("gen_random_uuid()")
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     invoice_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -112,7 +112,7 @@ class SalesInvoice(Base):
     colour×size matrix. Mirrors procurement's PoInvoice."""
     __tablename__ = "sales_invoices"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     invoice_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
     order_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -130,7 +130,7 @@ class SalesReturn(Base):
     __tablename__ = "sales_returns"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, server_default=text("NEWSEQUENTIALID()")
+        Uuid, server_default=text("gen_random_uuid()")
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     rma_no: Mapped[str | None] = mapped_column(String(32), nullable=True)

@@ -61,7 +61,7 @@ class Subscription(Base):
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
     external_id: Mapped[str] = mapped_column(String(128), unique=True)
     email: Mapped[str] = mapped_column(String(256))
@@ -84,7 +84,7 @@ class User(Base):
 class Role(Base):
     __tablename__ = "roles"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
     name: Mapped[str] = mapped_column(String(80))
     description: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -95,7 +95,7 @@ class Role(Base):
 class EmailVerification(Base):
     __tablename__ = "email_verifications"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     code_hash: Mapped[str] = mapped_column(String(128))
@@ -108,7 +108,7 @@ class EmailVerification(Base):
 class PasswordReset(Base):
     __tablename__ = "password_resets"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     token_hash: Mapped[str] = mapped_column(String(128))
@@ -132,7 +132,7 @@ class RefreshToken(Base):
 class Invitation(Base):
     __tablename__ = "invitations"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("NEWSEQUENTIALID()"))
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("tenants.id"))
     email: Mapped[str] = mapped_column(String(256))
     role: Mapped[str] = mapped_column(String(60))
