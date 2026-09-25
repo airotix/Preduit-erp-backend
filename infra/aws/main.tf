@@ -191,29 +191,25 @@ resource "aws_db_subnet_group" "main" {
   subnet_ids = aws_subnet.private[*].id
 }
 
-resource "aws_rds_cluster" "main" {
-  cluster_identifier     = local.name
-  engine                 = "aurora-postgresql"
-  engine_version         = "16.4"
-  database_name          = var.db_name
-  master_username        = var.db_master_username
+resource "aws_db_instance" "main" {
+  identifier              = local.name
+  engine                  = "postgres"
+  engine_version          = "16.4"
+  instance_class          = var.db_instance_class
+  allocated_storage       = 20
+  max_allocated_storage   = 100
+  storage_type            = "gp3"
+  db_name                 = var.db_name
+  username                = var.db_master_username
   manage_master_user_password = true
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  storage_encrypted      = true
-  deletion_protection    = true
-  skip_final_snapshot    = false
+  db_subnet_group_name    = aws_db_subnet_group.main.name
+  vpc_security_group_ids  = [aws_security_group.rds.id]
+  storage_encrypted       = true
+  deletion_protection     = true
+  skip_final_snapshot     = false
   final_snapshot_identifier = "${local.name}-final"
-  backup_retention_period = 7
-}
-
-resource "aws_rds_cluster_instance" "main" {
-  count              = var.az_count
-  identifier         = "${local.name}-${count.index}"
-  cluster_identifier = aws_rds_cluster.main.id
-  instance_class     = var.db_instance_class
-  engine             = aws_rds_cluster.main.engine
-  engine_version     = aws_rds_cluster.main.engine_version
+  backup_retention_period = 1
+  multi_az                = false
 }
 
 # ==============================================================================
@@ -473,7 +469,7 @@ resource "aws_ecs_task_definition" "backend" {
     portMappings = [{ containerPort = 8000 }]
     environment = [
       { name = "ENV",       value = var.env },
-      { name = "DB_HOST",   value = aws_rds_cluster.main.endpoint },
+      { name = "DB_HOST",   value = aws_db_instance.main.address },
       { name = "DB_PORT",   value = "5432" },
       { name = "DB_NAME",   value = var.db_name },
       { name = "DB_SSLMODE", value = "require" },
