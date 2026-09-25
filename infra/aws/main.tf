@@ -204,7 +204,7 @@ resource "aws_rds_cluster" "main" {
   deletion_protection    = true
   skip_final_snapshot    = false
   final_snapshot_identifier = "${local.name}-final"
-  backup_retention_period = 7
+  backup_retention_period = 1
 }
 
 resource "aws_rds_cluster_instance" "main" {
