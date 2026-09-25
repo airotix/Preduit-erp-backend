@@ -135,8 +135,12 @@ class Settings(BaseSettings):
     # Cache
     redis_url: str = "redis://localhost:6379/0"
 
-    # Document storage (local dir for dev; Azure Blob in prod)
+    # Document storage (local dir for dev; S3 in prod).
+    # Set S3_BUCKET to enable S3 mode; leave blank for local filesystem.
     doc_storage_dir: str = "./storage"
+    s3_bucket: str = ""
+    s3_region: str = ""
+    s3_endpoint_url: str = ""
 
     def _pg_url(self, user: str, password: str) -> str:
         return (
