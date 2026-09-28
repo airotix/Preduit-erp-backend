@@ -495,14 +495,14 @@ resource "aws_ecs_task_definition" "backend" {
       { name = "S3_BUCKET",        value = aws_s3_bucket.docs.id },
       { name = "S3_REGION",        value = var.aws_region },
       { name = "REDIS_URL",        value = "rediss://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0" },
-      { name = "CORS_ORIGINS",     value = "https://${aws_lb.main.dns_name},http://${aws_lb.main.dns_name}" },
+      { name = "CORS_ORIGINS",     value = "https://predoit.airotix.com,https://${aws_lb.main.dns_name},http://${aws_lb.main.dns_name}" },
       { name = "SMTP_HOST",        value = "email-smtp.${var.aws_region}.amazonaws.com" },
       { name = "SMTP_PORT",        value = "587" },
       { name = "SMTP_USER",        value = "AKIA52KEJ4FNGUZCCY3H" },
       { name = "SMTP_USE_TLS",     value = "true" },
       { name = "MAIL_FROM",        value = "airotixpersonal@gmail.com" },
       { name = "MAIL_FROM_NAME",   value = "Preduit ERP" },
-      { name = "APP_BASE_URL",     value = "http://${aws_lb.main.dns_name}" },
+      { name = "APP_BASE_URL",     value = "https://predoit.airotix.com" },
     ]
     secrets = [
       {
