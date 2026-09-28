@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+infra/
+db/seed_dev_*.sql
+README.md
+*.md
+.vscode/
+.idea/

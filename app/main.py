@@ -29,8 +29,8 @@ app = FastAPI(
     title="Preduit ERP API",
     version="0.1.0",
     description="Multi-tenant apparel ERP backend (Phase 0 foundation).",
-    docs_url="/docs",
-    openapi_url="/api/v1/openapi.json",
+    docs_url="/docs" if settings.env == "dev" else None,
+    openapi_url="/api/v1/openapi.json" if settings.env == "dev" else None,
 )
 
 # Fail fast if the app-issued JWT secret was never overridden outside dev — a
