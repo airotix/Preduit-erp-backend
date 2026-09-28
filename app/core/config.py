@@ -143,8 +143,9 @@ class Settings(BaseSettings):
     s3_endpoint_url: str = ""
 
     def _pg_url(self, user: str, password: str) -> str:
+        from urllib.parse import quote_plus
         return (
-            f"postgresql+psycopg2://{user}:{password}"
+            f"postgresql+psycopg2://{quote_plus(user)}:{quote_plus(password)}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
             f"?sslmode={self.db_sslmode}"
         )
