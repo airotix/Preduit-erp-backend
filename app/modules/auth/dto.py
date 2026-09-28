@@ -72,6 +72,14 @@ class SetupInvite(BaseModel):
     role: str = Field(min_length=1, max_length=60)
 
 
+class WorkspaceRequestForm(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    contactNumber: str = Field(min_length=1, max_length=40)
+    email: str = Field(min_length=3, max_length=256)
+    businessName: str = Field(min_length=1, max_length=200)
+    businessDescription: str = Field(default="", max_length=2000)
+
+
 class CompanySetupRequest(BaseModel):
     """Payload for the post-signup company setup wizard (Outlets/Modules/Team)."""
     companyName: str = Field(min_length=1, max_length=200)

@@ -11,7 +11,8 @@ from app.modules.auth.dto import (AcceptInvitationRequest, CompanySetupRequest,
                                   CreateInvitationRequest, EmailOnlyRequest,
                                   ForgotPasswordRequest, LoginRequest, LogoutRequest,
                                   RefreshRequest, RegisterCompanyRequest, ResetPasswordRequest,
-                                  SwitchBusinessRequest, UpdateUserRequest, VerifyEmailRequest)
+                                  SwitchBusinessRequest, UpdateUserRequest, VerifyEmailRequest,
+                                  WorkspaceRequestForm)
 
 settings = get_settings()
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -243,6 +244,22 @@ def revoke_invitation(invite_id: str, principal: Principal = Depends(require_adm
 @router.get("/companies")
 def list_companies(_: Principal = Depends(require_platform_admin)):
     return {"companies": service.list_companies()}
+
+
+@router.delete("/companies/{company_id}")
+def delete_company(company_id: str, _: Principal = Depends(require_platform_admin)):
+    return service.delete_company(company_id)
+
+
+@router.post("/workspace-request")
+def workspace_request(payload: WorkspaceRequestForm):
+    from app.core import mailer as ml
+    sent = ml.send_workspace_request(
+        name=payload.name, contact_number=payload.contactNumber,
+        email=payload.email, business_name=payload.businessName,
+        business_description=payload.businessDescription,
+    )
+    return {"submitted": True, "emailSent": sent}
 
 
 @router.post("/dev/bootstrap")

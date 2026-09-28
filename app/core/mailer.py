@@ -90,6 +90,29 @@ def send_password_reset(to: str, link: str) -> bool:
                       f"Reset your Preduit password (expires in 30 minutes): {link}")
 
 
+def send_workspace_request(name: str, contact_number: str, email: str,
+                           business_name: str, business_description: str) -> bool:
+    rows = "".join(
+        f'<tr><td style="padding:6px 12px;font-weight:700;color:#3a372f;white-space:nowrap">{k}</td>'
+        f'<td style="padding:6px 12px;color:#6f6a60">{v}</td></tr>'
+        for k, v in [
+            ("Name", name), ("Contact", contact_number), ("Email", email),
+            ("Business", business_name), ("Description", business_description or "—"),
+        ]
+    )
+    body = (
+        f'<p style="font-size:15px;line-height:1.6;color:#6f6a60">'
+        f'A new workspace request has been submitted:</p>'
+        f'<table style="border-collapse:collapse;margin:12px 0;font-size:14px">{rows}</table>'
+        f'<p style="font-size:13px;color:#9a948a">Reply to this person at <b>{email}</b> once their workspace is ready.</p>'
+    )
+    plain = (f"New workspace request\n\nName: {name}\nContact: {contact_number}\n"
+             f"Email: {email}\nBusiness: {business_name}\nDescription: {business_description or '—'}")
+    return send_email("airotixpersonal@gmail.com",
+                      f"Workspace request from {name} — {business_name}",
+                      _shell("New workspace request", body), plain)
+
+
 def send_invitation(to: str, company: str | None, role: str, link: str) -> bool:
     where = f" to <b>{company}</b>" if company else ""
     body = (f'<p style="font-size:15px;line-height:1.6;color:#6f6a60">You&rsquo;ve been invited{where} as '

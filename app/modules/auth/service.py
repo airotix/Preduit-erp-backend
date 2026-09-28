@@ -12,14 +12,14 @@ import uuid
 
 import bcrypt
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 
 from app.core.config import get_settings
 from app.core.database import system_session
 from app.core import mailer
 from app.core.roles import ADMIN, ROLES, SUPER_ADMIN, permissions_for
 from app.models.core import (EmailVerification, Invitation, PasswordReset,
-                             RefreshToken, Subscription, Tenant, User)
+                             RefreshToken, Role, Subscription, Tenant, User)
 from app.modules.auth import tokens
 
 settings = get_settings()
@@ -880,6 +880,20 @@ def list_companies() -> list[dict]:
                 "seatLimit": sub.seat_limit if sub else None,
             })
         return out
+
+
+def delete_company(company_id: str) -> dict:
+    tid = _tid(company_id)
+    with system_session() as db:
+        tenant = db.execute(select(Tenant).where(Tenant.id == tid)).scalars().first()
+        if tenant is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found.")
+        name = tenant.name
+        for model in (RefreshToken, EmailVerification, PasswordReset, Invitation,
+                      Role, Subscription, User):
+            db.execute(delete(model).where(model.tenant_id == tid))
+        db.execute(delete(Tenant).where(Tenant.id == tid))
+    return {"deleted": True, "name": name}
 
 
 def update_user(*, tenant_id: str, user_public_id: str, actor_public_id: str | None,
