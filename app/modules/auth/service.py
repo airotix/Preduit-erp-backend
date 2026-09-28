@@ -889,10 +889,19 @@ def delete_company(company_id: str) -> dict:
         if tenant is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found.")
         name = tenant.name
-        for model in (RefreshToken, EmailVerification, PasswordReset, Invitation,
-                      Role, Subscription, User):
-            db.execute(delete(model).where(model.tenant_id == tid))
-        db.execute(delete(Tenant).where(Tenant.id == tid))
+        tables = db.execute(text(
+            "SELECT table_name FROM information_schema.columns "
+            "WHERE column_name = 'tenant_id' AND table_schema = 'public' "
+            "AND table_name != 'tenants'"
+        )).scalars().all()
+        # Disable FK checks, delete all tenant data, re-enable.
+        db.execute(text("SET session_replication_role = 'replica'"))
+        try:
+            for tbl in tables:
+                db.execute(text(f'DELETE FROM "{tbl}" WHERE tenant_id = :tid'), {"tid": str(tid)})
+            db.execute(text("DELETE FROM tenants WHERE id = :tid"), {"tid": str(tid)})
+        finally:
+            db.execute(text("SET session_replication_role = 'origin'"))
     return {"deleted": True, "name": name}
 
 
