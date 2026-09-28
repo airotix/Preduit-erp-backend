@@ -244,6 +244,15 @@ def login(email: str, password: str, business_name: str | None = None) -> dict:
         user.failed_logins = 0
         user.locked_until = None
         user.last_login = _now()
+
+        if not user.email_verified:
+            code = _create_email_code(db, user)
+            mailer.send_verification_code(user.email, code)
+            out: dict = {"requiresVerification": True, "email": user.email}
+            if _dev_reveal():
+                out["devVerifyCode"] = code
+            return out
+
         return _issue(db, user)
 
 

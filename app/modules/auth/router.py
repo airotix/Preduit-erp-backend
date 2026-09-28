@@ -43,6 +43,8 @@ def _clear_refresh_cookie(response: Response) -> None:
 @router.post("/login")
 def login(payload: LoginRequest, response: Response, _rl: None = rate_limit("login")):
     result = service.login(payload.email, payload.password, business_name=payload.businessName)
+    if result.get("requiresVerification"):
+        return result
     return _issue_with_cookie(response, result, persist=payload.remember)
 
 
