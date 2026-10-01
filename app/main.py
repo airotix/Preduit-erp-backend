@@ -1,5 +1,6 @@
 """Preduit ERP backend — FastAPI application entrypoint."""
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +10,7 @@ from app.core.security_headers import SecurityHeadersMiddleware
 from app.modules.admin.router import router as admin_router
 from app.modules.ai.router import router as ai_router
 from app.modules.auth.router import router as auth_router
+from app.modules.auth import service as auth_service
 from app.modules.catalog.router import router as catalog_router
 from app.modules.dashboards.router import router as dashboards_router
 from app.modules.documents.router import router as documents_router
@@ -24,13 +26,33 @@ from app.modules.sales.router import router as sales_router
 from app.modules.shipments.router import router as shipments_router
 
 settings = get_settings()
+log = logging.getLogger("uvicorn.error")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Local only: make sure the Super Admin + demo owner always exist with
+    # known passwords so you never have to hit /auth/dev/bootstrap by hand.
+    if settings.env == "dev":
+        try:
+            result = auth_service.ensure_local_dev_accounts()
+            accounts = result.get("accounts") or []
+            if accounts:
+                log.info("Local dev accounts ready: %s",
+                         ", ".join(f"{a.get('email') or a.get('tenant')} ({a.get('action', 'ok')})"
+                                   for a in accounts))
+        except Exception as exc:  # noqa: BLE001 — never block startup on seed
+            log.warning("Local dev account seed failed: %s: %s", type(exc).__name__, exc)
+    yield
+
 
 app = FastAPI(
     title="Preduit ERP API",
     version="0.1.0",
     description="Multi-tenant apparel ERP backend (Phase 0 foundation).",
-    docs_url="/docs",
-    openapi_url="/api/v1/openapi.json",
+    docs_url="/docs" if settings.env == "dev" else None,
+    openapi_url="/api/v1/openapi.json" if settings.env == "dev" else None,
+    lifespan=lifespan,
 )
 
 # Fail fast if the app-issued JWT secret was never overridden outside dev — a

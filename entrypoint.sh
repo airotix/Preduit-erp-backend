@@ -44,4 +44,39 @@ print('Schema applied successfully.')
     fi
 fi
 
+# One-time: seed a super admin so the owner can log in without email verification.
+if [ -n "$DB_HOST" ]; then
+    DB_URL="postgresql://${DB_USER:-erp_admin}:${DB_PASS}@${DB_HOST}:${DB_PORT:-5432}/${DB_NAME:-preduit}"
+    python3 -c "
+import sqlalchemy, os, uuid, bcrypt
+engine = sqlalchemy.create_engine('$DB_URL', connect_args={'sslmode': os.getenv('DB_SSLMODE', 'require')})
+with engine.connect() as conn:
+    # Check if super admin already exists
+    exists = conn.execute(sqlalchemy.text(
+        \"SELECT EXISTS(SELECT 1 FROM users WHERE email='superadmin@preduit.local')\"
+    )).scalar()
+    if exists:
+        print('Super admin already exists — skipping seed.')
+    else:
+        # Find the first tenant
+        row = conn.execute(sqlalchemy.text('SELECT id FROM tenants LIMIT 1')).first()
+        if row is None:
+            print('No tenant found — skipping super admin seed.')
+        else:
+            tid = row[0]
+            pw_hash = bcrypt.hashpw(b'Super@12345', bcrypt.gensalt()).decode()
+            ext_id = 'local:' + uuid.uuid4().hex
+            conn.execute(sqlalchemy.text('''
+                INSERT INTO users (tenant_id, external_id, email, display_name,
+                    is_owner, status, role, is_platform_admin, is_active,
+                    password_hash, email_verified)
+                VALUES (:tid, :eid, 'superadmin@preduit.local', 'Super Admin',
+                    false, 'Active', 'Super Admin', true, true,
+                    :pw, true)
+            '''), {'tid': str(tid), 'eid': ext_id, 'pw': pw_hash})
+            conn.commit()
+            print('Super admin seeded successfully.')
+" 2>&1 || echo "Super admin seed failed (non-fatal)."
+fi
+
 exec "$@"

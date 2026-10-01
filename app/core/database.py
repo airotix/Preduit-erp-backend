@@ -12,15 +12,28 @@ never leak into the next request.
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import URL, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 
 settings = get_settings()
 
-app_engine = create_engine(settings.app_database_url, pool_pre_ping=True, pool_size=10, max_overflow=20)
-system_engine = create_engine(settings.system_database_url, pool_pre_ping=True, pool_size=2, max_overflow=2)
+
+def _pg_url(user: str, password: str) -> URL:
+    return URL.create(
+        "postgresql+psycopg2",
+        username=user,
+        password=password,
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        query={"sslmode": settings.db_sslmode},
+    )
+
+
+app_engine = create_engine(_pg_url(settings.db_app_user, settings.db_app_password), pool_pre_ping=True, pool_size=10, max_overflow=20)
+system_engine = create_engine(_pg_url(settings.db_system_user, settings.db_system_password), pool_pre_ping=True, pool_size=2, max_overflow=2)
 
 AppSession = sessionmaker(bind=app_engine, autoflush=False, expire_on_commit=False)
 SystemSession = sessionmaker(bind=system_engine, autoflush=False, expire_on_commit=False)
