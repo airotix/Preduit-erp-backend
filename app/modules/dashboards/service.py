@@ -2,10 +2,10 @@
 
 Each dashboard returns real, domain-specific values keyed for the frontend
 merge (see lib/dashboard-merge.ts): positional `metricsList`, a full `donut`,
-optional `bars`, a `table` (title/cols/rows) and per-module `alerts` (which
-replace the old "Recent activity" panel). Layout/icons/colours stay in the mock.
-Where a module has no time series (inventory/production) `bars` is omitted and
-the mock chart shows through.
+optional `bars`, a `table` (title/cols/rows) and per-module `alerts`.
+Layout/icons/colours stay in the mock. Omit a section only when it should be
+empty — the frontend clears any mock chart/table/activity that the backend
+does not replace, so design placeholders never show through.
 """
 import datetime
 
@@ -508,9 +508,167 @@ def findash(session: Session) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Quality scores
+# --------------------------------------------------------------------------- #
+def qscores(session: Session) -> dict:
+    """Live Quality Scores KPIs from inspections + logged defects.
+
+    Empty tenants return zeros / empty charts so the UI never falls back to
+    the design mock (94% pass rate, fictional suppliers, etc.).
+    """
+    from app.models.quality import InspectionDefect
+
+    base = (Inspection.is_deleted == False,)  # noqa: E712
+    passed = session.execute(
+        select(func.count()).select_from(Inspection)
+        .where(*base, Inspection.result == "Pass")
+    ).scalar_one()
+    failed = session.execute(
+        select(func.count()).select_from(Inspection)
+        .where(*base, Inspection.result == "Fail")
+    ).scalar_one()
+    finalised = passed + failed
+    pass_rate = round(passed / finalised * 100, 1) if finalised else 0.0
+    defect_rate = round(failed / finalised * 100, 1) if finalised else 0.0
+
+    today = datetime.date.today()
+    month_start = today.replace(day=1)
+    week_start = today - datetime.timedelta(days=today.weekday())
+    inspections_month = session.execute(
+        select(func.count()).select_from(Inspection)
+        .where(*base, Inspection.inspection_date >= month_start)
+    ).scalar_one()
+    failed_week = session.execute(
+        select(func.count()).select_from(Inspection)
+        .where(*base, Inspection.result == "Fail",
+               Inspection.inspection_date >= week_start)
+    ).scalar_one()
+
+    # First-pass yield bars — pass rate (%) per month for the last 12 months.
+    month_rows = session.execute(
+        select(func.extract("year", Inspection.inspection_date),
+               func.extract("month", Inspection.inspection_date),
+               Inspection.result, func.count())
+        .where(*base, Inspection.inspection_date.isnot(None),
+               Inspection.result.in_(("Pass", "Fail")))
+        .group_by(func.extract("year", Inspection.inspection_date),
+                  func.extract("month", Inspection.inspection_date),
+                  Inspection.result)
+    ).all()
+    by_ym: dict[tuple[int, int], dict[str, int]] = {}
+    for y, m, result, cnt in month_rows:
+        key = (int(y), int(m))
+        by_ym.setdefault(key, {"Pass": 0, "Fail": 0})
+        by_ym[key][result] = int(cnt)
+    bars: list[int] = []
+    for i in range(11, -1, -1):
+        mm, yy = today.month - i, today.year
+        while mm <= 0:
+            mm += 12
+            yy -= 1
+        bucket = by_ym.get((yy, mm), {"Pass": 0, "Fail": 0})
+        fin = bucket["Pass"] + bucket["Fail"]
+        bars.append(round(bucket["Pass"] / fin * 100) if fin else 0)
+
+    # Defects-by-type donut from inspection_defects.
+    defect_rows = session.execute(
+        select(InspectionDefect.defect_name,
+               func.coalesce(func.sum(InspectionDefect.qty_affected), 0))
+        .where(InspectionDefect.is_deleted == False)  # noqa: E712
+        .group_by(InspectionDefect.defect_name)
+        .order_by(func.coalesce(func.sum(InspectionDefect.qty_affected), 0).desc())
+        .limit(6)
+    ).all()
+    defect_total = sum(int(q) for _, q in defect_rows) or 0
+    donut = [
+        {"label": (name or "Other"),
+         "value": f"{round(int(q) / defect_total * 100) if defect_total else 0}%",
+         "pct": round(int(q) / defect_total * 100) if defect_total else 0}
+        for name, q in defect_rows
+    ]
+
+    # Recent failed / passed inspections for the activity feed.
+    recent = session.execute(
+        select(Inspection.inspection_no, Inspection.result, Inspection.defect_count,
+               Inspection.order_ref, Inspection.finalized_at, Inspection.inspection_date)
+        .where(*base, Inspection.result.in_(("Pass", "Fail")))
+        .order_by(func.coalesce(Inspection.finalized_at,
+                                Inspection.inspection_date).desc().nullslast())
+        .limit(6)
+    ).all()
+    alerts = []
+    for ino, result, dcount, oref, _fin, _idate in recent:
+        label = ino or "Inspection"
+        ref = f" on {oref}" if oref else ""
+        if result == "Fail":
+            alerts.append(_alert(
+                "red",
+                f"{label} failed — {int(dcount or 0)} defect(s){ref}",
+                "quality",
+            ))
+        else:
+            alerts.append(_alert("green", f"{label} passed{ref}", "quality"))
+    if not alerts:
+        alerts = _ok("No inspections yet — scores will appear once QC runs")
+
+    return {
+        "metricsList": [
+            {"label": "Pass rate",
+             "value": f"{pass_rate}%",
+             "delta": "",
+             "sub": "all finalised inspections"},
+            {"label": "Defect rate",
+             "value": f"{defect_rate}%",
+             "delta": "",
+             "sub": "fail share of finalised"},
+            {"label": "Failed lots",
+             "value": f"{int(failed_week):,}",
+             "delta": "",
+             "sub": "this week"},
+            {"label": "Inspections",
+             "value": f"{int(inspections_month):,}",
+             "delta": "",
+             "sub": "this month"},
+        ],
+        "bars": bars,
+        "donut": donut,
+        "donutTotal": f"{defect_total:,}" if defect_total else "0",
+        "donutTitle": "Defects by type",
+        "table": {
+            "title": "Quality by stage",
+            "cols": [{"l": "Stage", "a": "left"}, {"l": "Inspections", "a": "right"},
+                     {"l": "Pass rate", "a": "right"}, {"l": "Fails", "a": "right"}],
+            "rows": _quality_by_stage(session),
+        },
+        "alerts": {"title": "Recent activity", "items": alerts[:6]},
+    }
+
+
+def _quality_by_stage(session: Session) -> list[list]:
+    rows = session.execute(
+        select(Inspection.stage, Inspection.result, func.count())
+        .where(Inspection.is_deleted == False,  # noqa: E712
+               Inspection.result.in_(("Pass", "Fail")))
+        .group_by(Inspection.stage, Inspection.result)
+    ).all()
+    by_stage: dict[str, dict[str, int]] = {}
+    for stage, result, cnt in rows:
+        key = stage or "—"
+        by_stage.setdefault(key, {"Pass": 0, "Fail": 0})
+        by_stage[key][result] = int(cnt)
+    out = []
+    for i, (stage, counts) in enumerate(sorted(by_stage.items())):
+        fin = counts["Pass"] + counts["Fail"]
+        rate = f"{round(counts['Pass'] / fin * 100, 1)}%" if fin else "—"
+        out.append([stage, f"{fin:,}", rate, f"{counts['Fail']:,}", _accent(i)])
+    return out
+
+
 BUILDERS = {
     "overview": overview, "salesdash": salesdash, "invdash": invdash,
-    "proddash": proddash, "findash": findash,
+    "proddash": proddash, "findash": findash, "finreports": findash,
+    "qscores": qscores,
 }
 
 
