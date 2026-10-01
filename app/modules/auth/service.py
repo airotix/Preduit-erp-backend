@@ -262,9 +262,10 @@ def login(email: str, password: str, business_name: str | None = None) -> dict:
 
         if not user.email_verified:
             code = _create_email_code(db, user)
-            mailer.send_verification_code(user.email, code)
+            if code:
+                mailer.send_verification_code(user.email, code)
             out: dict = {"requiresVerification": True, "email": user.email}
-            if _dev_reveal():
+            if _dev_reveal() and code:
                 out["devVerifyCode"] = code
             return out
 
@@ -419,10 +420,11 @@ def register_company(*, company_name: str, owner_name: str, email: str,
         db.flush()
         if additional and owner.email_verified:
             return _issue(db, owner)   # existing verified account → straight in
-        code = _create_email_code(db, owner)   # seed the sign-up verification OTP
-        mailer.send_verification_code(email.strip(), code)
+        code = _create_email_code(db, owner, cooldown_secs=0)  # first code, no cooldown
+        if code:
+            mailer.send_verification_code(email.strip(), code)
         issued = _issue(db, owner)
-        if _dev_reveal():
+        if _dev_reveal() and code:
             issued["devVerifyCode"] = code
         return issued
 
@@ -695,7 +697,18 @@ def dev_bootstrap() -> dict:
 # --------------------------------------------------------------------------- #
 # Email verification (6-digit OTP)
 # --------------------------------------------------------------------------- #
-def _create_email_code(db, user: User) -> str:
+def _create_email_code(db, user: User, *, cooldown_secs: int = 60) -> str | None:
+    """Create a new 6-digit OTP. Returns None (skip sending) if a code for
+    this user was already created within *cooldown_secs*."""
+    if cooldown_secs > 0:
+        recent = db.execute(
+            select(EmailVerification)
+            .where(EmailVerification.user_id == user.id,
+                   EmailVerification.created_at > _now() - datetime.timedelta(seconds=cooldown_secs))
+            .limit(1)
+        ).scalars().first()
+        if recent is not None:
+            return None
     code = f"{secrets.randbelow(1_000_000):06d}"
     db.add(EmailVerification(
         tenant_id=user.tenant_id, user_id=user.id, code_hash=_sha256(code),
@@ -717,9 +730,10 @@ def request_email_verification(email: str) -> dict:
         if user:
             _set_tenant(db, user.tenant_id)
             code = _create_email_code(db, user)
-            mailer.send_verification_code(user.email, code)
-            if _dev_reveal():
-                out["devCode"] = code
+            if code:
+                mailer.send_verification_code(user.email, code)
+                if _dev_reveal():
+                    out["devCode"] = code
         return out  # neutral response whether or not the address exists
 
 
