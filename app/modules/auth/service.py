@@ -6,6 +6,7 @@ because there's no tenant context until a token is issued.
 import datetime
 import hashlib
 import json
+import logging
 import re
 import secrets
 import uuid
@@ -32,7 +33,15 @@ MAX_VERIFY_ATTEMPTS = 5
 
 
 def _now() -> datetime.datetime:
-    return datetime.datetime.utcnow()
+    # Timezone-aware UTC. Postgres TIMESTAMPTZ columns come back aware; comparing
+    # them to naive datetimes raises TypeError (verify-email / lockout / invites).
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _as_utc(dt: datetime.datetime) -> datetime.datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
 
 
 def _sha256(s: str) -> str:
@@ -46,9 +55,15 @@ def _tid(tenant_id) -> uuid.UUID:
 
 
 def _dev_reveal() -> bool:
-    # Email delivery isn't wired yet; in dev we return the code/link in the API
-    # response so the flows are testable. Never true in production.
-    return bool(settings.dev_auth_bypass)
+    # When SMTP isn't configured in local/dev, return OTP codes and invite
+    # links in the API response so the flows are testable without inbox access.
+    # Never reveal codes when ENV!=dev, even if SMTP is down.
+    if settings.env != "dev":
+        return False
+    if settings.dev_auth_bypass:
+        return True
+    from app.core import mailer as _mailer
+    return not _mailer.is_configured()
 
 
 def hash_password(pw: str) -> str:
@@ -128,7 +143,7 @@ def _issue(db, user: User) -> dict:
 
 
 def _raise_locked(locked_until: datetime.datetime):
-    ms = int(locked_until.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    ms = int(_as_utc(locked_until).timestamp() * 1000)
     raise HTTPException(
         status.HTTP_423_LOCKED,
         detail={"message": "Account temporarily locked after repeated sign-in attempts.",
@@ -213,7 +228,7 @@ def login(email: str, password: str, business_name: str | None = None) -> dict:
         # Verify the password against the account (all a person's rows share it).
         verified = [u for u in users if u.is_active and verify_password(password, u.password_hash)]
         if not verified:
-            locked = next((u for u in users if u.locked_until and u.locked_until > _now()), None)
+            locked = next((u for u in users if u.locked_until and _as_utc(u.locked_until) > _now()), None)
             if locked is not None:
                 _set_tenant(db, locked.tenant_id)
                 _raise_locked(locked.locked_until)
@@ -318,7 +333,7 @@ def refresh(refresh_token: str) -> dict:
             db.commit()
             raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                                 "Refresh token reuse detected — please sign in again.")
-        if row.expires_at < _now():
+        if row.expires_at is None or _as_utc(row.expires_at) < _now():
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token expired")
 
         row.revoked_at = _now()          # rotate: retire the presented token
@@ -573,41 +588,108 @@ def save_company_profile(tenant_id: str, p: dict) -> dict:
         return prof
 
 
-def dev_bootstrap() -> dict:
-    """DEV ONLY: set a password on the demo tenant's owner and ensure a Super
-    Admin account, so you can log in immediately. Guarded by dev_auth_bypass."""
-    tid_uuid = None
-    if settings.dev_tenant_id:
-        try:
-            tid_uuid = uuid.UUID(settings.dev_tenant_id)
-        except ValueError:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                                "DEV_TENANT_ID in .env is not a valid GUID")
-    made = []
+def ensure_local_dev_accounts() -> dict:
+    """DEV ONLY: idempotent seed so local login always works without a manual
+    bootstrap call. Ensures a default tenant (if needed) plus:
+      - tenant owner  → Admin@12345  (email verified)
+      - superadmin@preduit.local → Super@12345  (platform admin, verified)
+    Safe to call on every startup; only creates/updates what is missing or
+    out of date. Never runs outside ENV=dev."""
+    if settings.env != "dev":
+        return {"skipped": True}
+
+    made: list[dict] = []
     with system_session() as db:
-        if tid_uuid:
-            _set_tenant(db, tid_uuid)   # dev: scope to the demo tenant for read+write
-            owner = db.execute(
-                select(User).where(User.tenant_id == tid_uuid, User.is_owner == True)  # noqa: E712
-            ).scalars().first()
-            if owner:
-                owner.password_hash = hash_password("Admin@12345")
-                owner.role = ADMIN
-                owner.is_active = True
-                made.append({"email": owner.email, "password": "Admin@12345", "role": ADMIN})
+        _clear_tenant(db)
+        tid_uuid: uuid.UUID | None = None
+        if settings.dev_tenant_id:
+            try:
+                tid_uuid = uuid.UUID(settings.dev_tenant_id)
+            except ValueError:
+                logging.getLogger("uvicorn.error").warning(
+                    "DEV_TENANT_ID is not a valid GUID — ignoring for local seed.")
+                tid_uuid = None
+
+        tenant = db.get(Tenant, tid_uuid) if tid_uuid else None
+        if tenant is None:
+            # Prefer an existing tenant; otherwise create the local Dev Co.
+            tenant = db.execute(select(Tenant).order_by(Tenant.name.asc())).scalars().first()
+            if tenant is None:
+                tid_uuid = tid_uuid or uuid.uuid4()
+                slug = _slugify("Dev Co", db)
+                tenant = Tenant(
+                    id=tid_uuid, name="Dev Co", slug=slug,
+                    base_currency_code="USD", region="primary", status="Active",
+                    setup_complete=True,
+                )
+                db.add(tenant)
+                db.flush()
+                db.add(Subscription(tenant_id=tid_uuid, plan="trial",
+                                    status="trialing", seat_limit=5))
+                made.append({"tenant": "Dev Co", "id": str(tid_uuid)})
+            else:
+                tid_uuid = tenant.id
+
+        _set_tenant(db, tid_uuid)
+
+        # Owner for the demo tenant (optional — only if one already exists or we just created it).
+        owner = db.execute(
+            select(User).where(User.tenant_id == tid_uuid, User.is_owner == True)  # noqa: E712
+        ).scalars().first()
+        if owner is None:
+            owner = User(
+                tenant_id=tid_uuid, external_id=f"local:{uuid.uuid4().hex}",
+                email=(settings.dev_email or "dev@preduit.local").strip(),
+                display_name="Dev Owner", is_owner=True, status="Active",
+                role=ADMIN, is_active=True, email_verified=True,
+                password_hash=hash_password("Admin@12345"),
+            )
+            db.add(owner)
+            made.append({"email": owner.email, "password": "Admin@12345", "role": ADMIN,
+                         "action": "created"})
+        else:
+            owner.password_hash = hash_password("Admin@12345")
+            owner.role = ADMIN
+            owner.is_active = True
+            owner.email_verified = True
+            owner.locked_until = None
+            owner.failed_logins = 0
+            made.append({"email": owner.email, "password": "Admin@12345", "role": ADMIN,
+                         "action": "reset"})
+
+        # Platform Super Admin — always present and login-ready.
         sa = db.execute(
             select(User).where(func.lower(User.email) == "superadmin@preduit.local")
         ).scalars().first()
-        if sa is None and tid_uuid:
-            sa = User(tenant_id=tid_uuid, external_id=f"local:{uuid.uuid4().hex}",
-                      email="superadmin@preduit.local", display_name="Super Admin",
-                      is_owner=False, status="Active", role=SUPER_ADMIN,
-                      is_platform_admin=True, is_active=True,
-                      password_hash=hash_password("Super@12345"))
+        if sa is None:
+            # Cross-tenant lookup may miss under RLS in some local setups; create fresh.
+            sa = User(
+                tenant_id=tid_uuid, external_id=f"local:{uuid.uuid4().hex}",
+                email="superadmin@preduit.local", display_name="Super Admin",
+                is_owner=False, status="Active", role=SUPER_ADMIN,
+                is_platform_admin=True, is_active=True, email_verified=True,
+                password_hash=hash_password("Super@12345"),
+            )
             db.add(sa)
             made.append({"email": "superadmin@preduit.local", "password": "Super@12345",
-                         "role": SUPER_ADMIN})
-        return {"created": made}
+                         "role": SUPER_ADMIN, "action": "created"})
+        else:
+            sa.password_hash = hash_password("Super@12345")
+            sa.role = SUPER_ADMIN
+            sa.is_platform_admin = True
+            sa.is_active = True
+            sa.email_verified = True
+            sa.locked_until = None
+            sa.failed_logins = 0
+            made.append({"email": "superadmin@preduit.local", "password": "Super@12345",
+                         "role": SUPER_ADMIN, "action": "reset"})
+
+    return {"accounts": made}
+
+
+def dev_bootstrap() -> dict:
+    """HTTP-facing alias for ensure_local_dev_accounts (kept for /auth/dev/bootstrap)."""
+    return ensure_local_dev_accounts()
 
 
 # --------------------------------------------------------------------------- #
@@ -655,7 +737,7 @@ def verify_email(email: str, code: str) -> dict:
             .where(EmailVerification.user_id == user.id, EmailVerification.consumed_at.is_(None))
             .order_by(EmailVerification.id.desc())
         ).scalars().all()
-        active = [r for r in rows if r.expires_at >= _now()]
+        active = [r for r in rows if _as_utc(r.expires_at) >= _now()]
         if not active:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "That code has expired — request a new one.")
         target = _sha256(code.strip())
@@ -705,7 +787,7 @@ def reset_password(token: str, new_password: str) -> dict:
             select(PasswordReset)
             .where(PasswordReset.token_hash == _sha256(token), PasswordReset.consumed_at.is_(None))
         ).scalars().first()
-        if rec is None or rec.expires_at < _now():
+        if rec is None or _as_utc(rec.expires_at) < _now():
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "This reset link is invalid or has expired.")
         user = db.execute(select(User).where(User.public_id == claims.get("sub"))).scalars().first()
         if user is None:
@@ -798,7 +880,7 @@ def peek_invitation(token: str) -> dict:
         if tid:
             _set_tenant(db, tid)
             inv = db.execute(select(Invitation).where(Invitation.token_hash == _sha256(token))).scalars().first()
-            if inv is None or inv.status != "pending" or inv.expires_at < _now():
+            if inv is None or inv.status != "pending" or _as_utc(inv.expires_at) < _now():
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "This invitation is invalid or has expired.")
             tenant = db.get(Tenant, uuid.UUID(tid))
             company = tenant.name if tenant else None
@@ -813,7 +895,7 @@ def accept_invitation(token: str, name: str, password: str) -> dict:
         if tid:
             _set_tenant(db, tid)
         inv = db.execute(select(Invitation).where(Invitation.token_hash == _sha256(token))).scalars().first()
-        if inv is None or inv.status != "pending" or inv.expires_at < _now():
+        if inv is None or inv.status != "pending" or _as_utc(inv.expires_at) < _now():
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "This invitation is invalid or has expired.")
         if _find_by_email(db, email):
             raise HTTPException(status.HTTP_409_CONFLICT, "That email already has an account.")
@@ -880,6 +962,76 @@ def list_companies() -> list[dict]:
                 "seatLimit": sub.seat_limit if sub else None,
             })
         return out
+
+
+def admin_create_company(*, owner_name: str, email: str, password: str,
+                         company_name: str, country: str | None, city: str | None,
+                         currency: str, tax_registration: str | None,
+                         modules: list[str], invites: list[dict]) -> dict:
+    """Super Admin: provision a complete workspace (what the self-serve signup +
+    setup stepper used to do) without touching the caller's own session.
+
+    Creates tenant + trial subscription + owner, then applies the setup payload
+    (business details, modules — marks setup complete) and sends team invites.
+    The owner's email is left unverified for a brand-new address, so they prove
+    it with the emailed code on first sign-in. An email that already owns a
+    workspace keeps its existing password / verification state."""
+    name = company_name.strip()
+    email = email.strip()
+    with system_session() as db:
+        existing = _users_by_email(db, email)
+        _clear_tenant(db)
+        for u in existing:
+            t = db.get(Tenant, u.tenant_id)
+            if t is not None and (t.name or "").strip().lower() == name.lower():
+                raise HTTPException(status.HTTP_409_CONFLICT,
+                                    f"{email} already has a workspace named “{name}”.")
+
+        slug = _slugify(name, db)
+        tid = uuid.uuid4()
+        _set_tenant(db, tid)
+        db.add(Tenant(id=tid, name=name, slug=slug,
+                      base_currency_code=(currency or "EUR").upper()[:3],
+                      region="primary", status="Active"))
+        db.flush()
+        db.add(Subscription(tenant_id=tid, plan="trial", status="trialing", seat_limit=5))
+        prior = next((u for u in existing if u.is_active), existing[0] if existing else None)
+        owner = User(
+            tenant_id=tid, external_id=f"local:{uuid.uuid4().hex}",
+            email=email, display_name=owner_name.strip() or email,
+            is_owner=True, status="Active", role=ADMIN, is_active=True,
+            password_hash=prior.password_hash if prior else hash_password(password),
+            email_verified=bool(prior and prior.email_verified),
+        )
+        db.add(owner)
+        db.flush()
+        owner_public_id = str(owner.public_id)
+        existing_account = prior is not None
+    # Tenant + owner are committed; now apply the stepper payload.
+    complete_company_setup(
+        tenant_id=str(tid), actor_public_id=owner_public_id, company_name=name,
+        country=country, city=city, currency=currency,
+        tax_registration=tax_registration, modules=modules,
+    )
+    invited: list[dict] = []
+    skipped: list[dict] = []
+    for inv in invites:
+        addr = (inv.get("email") or "").strip()
+        if not addr:
+            continue
+        try:
+            invited.append(create_invitation(
+                tenant_id=str(tid), inviter_public_id=owner_public_id,
+                email=addr, role=inv.get("role") or ""))
+        except HTTPException as exc:
+            skipped.append({"email": addr, "reason": str(exc.detail)})
+    return {
+        "company": {"id": str(tid), "name": name, "slug": slug},
+        "owner": {"email": email, "name": owner_name.strip() or email,
+                  "existingAccount": existing_account,
+                  "emailVerified": bool(prior and prior.email_verified)},
+        "invited": invited, "skipped": skipped,
+    }
 
 
 def delete_company(company_id: str) -> dict:

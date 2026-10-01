@@ -8,7 +8,8 @@ from app.core.security import (Principal, get_principal, require_permission,
                                 require_platform_admin, require_tenant)
 from app.modules.auth import service
 from app.modules.auth.dto import (AcceptInvitationRequest, CompanySetupRequest,
-                                  CreateInvitationRequest, EmailOnlyRequest,
+                                  CreateInvitationRequest, CreateWorkspaceRequest,
+                                  EmailOnlyRequest,
                                   ForgotPasswordRequest, LoginRequest, LogoutRequest,
                                   RefreshRequest, RegisterCompanyRequest, ResetPasswordRequest,
                                   SwitchBusinessRequest, UpdateUserRequest, VerifyEmailRequest,
@@ -246,6 +247,17 @@ def list_companies(_: Principal = Depends(require_platform_admin)):
     return {"companies": service.list_companies()}
 
 
+@router.post("/companies", status_code=status.HTTP_201_CREATED)
+def create_company(payload: CreateWorkspaceRequest, _: Principal = Depends(require_platform_admin)):
+    """Super Admin: provision a workspace (owner + setup stepper payload) in one go."""
+    return service.admin_create_company(
+        owner_name=payload.ownerName, email=payload.email, password=payload.password,
+        company_name=payload.companyName, country=payload.country, city=payload.city,
+        currency=payload.currency, tax_registration=payload.taxRegistration,
+        modules=payload.modules, invites=[i.model_dump() for i in payload.invites],
+    )
+
+
 @router.delete("/companies/{company_id}")
 def delete_company(company_id: str, _: Principal = Depends(require_platform_admin)):
     return service.delete_company(company_id)
@@ -264,12 +276,11 @@ def workspace_request(payload: WorkspaceRequestForm):
 
 @router.post("/dev/bootstrap")
 def dev_bootstrap():
-    # Dev-only helper (sets the demo owner's password, seeds a super admin).
-    # Available in any local-dev run; blocked outside dev.
+    # Dev-only helper — same seed that now also runs on startup when ENV=dev.
     if settings.env != "dev":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
     try:
-        return service.dev_bootstrap()
+        return service.ensure_local_dev_accounts()
     except HTTPException:
         raise
     except Exception as exc:  # dev-only: surface the real cause in the response
