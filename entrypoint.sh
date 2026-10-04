@@ -44,6 +44,42 @@ print('Schema applied successfully.')
     fi
 fi
 
+# --------------------------------------------------------------------------- #
+# Incremental migrations: run any db/V0*_pg__*.sql not yet recorded.
+# --------------------------------------------------------------------------- #
+if [ -n "$DB_HOST" ]; then
+    DB_URL="postgresql://${DB_USER:-erp_admin}:${DB_PASS}@${DB_HOST}:${DB_PORT:-5432}/${DB_NAME:-preduit}"
+    python3 -c "
+import sqlalchemy, os, glob, sys
+engine = sqlalchemy.create_engine('$DB_URL', connect_args={'sslmode': os.getenv('DB_SSLMODE', 'require')})
+with engine.connect() as conn:
+    conn.execute(sqlalchemy.text(
+        'CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT now())'
+    ))
+    conn.commit()
+    applied = set(r[0] for r in conn.execute(sqlalchemy.text('SELECT name FROM schema_migrations')).fetchall())
+    scripts = sorted(glob.glob('db/V0*_pg__*.sql'))
+    for path in scripts:
+        name = os.path.basename(path)
+        if name in applied:
+            continue
+        print(f'Applying {name} ...', end=' ', flush=True)
+        with open(path) as f:
+            sql = f.read()
+        try:
+            conn.execute(sqlalchemy.text(sql))
+            conn.execute(sqlalchemy.text('INSERT INTO schema_migrations (name) VALUES (:n)'), {'n': name})
+            conn.commit()
+            print('OK')
+        except Exception as e:
+            conn.rollback()
+            print(f'FAILED: {e}', file=sys.stderr)
+            sys.exit(1)
+    if not [s for s in scripts if os.path.basename(s) not in applied]:
+        print('All migrations already applied.')
+" 2>&1
+fi
+
 # One-time: seed a super admin so the owner can log in without email verification.
 if [ -n "$DB_HOST" ]; then
     DB_URL="postgresql://${DB_USER:-erp_admin}:${DB_PASS}@${DB_HOST}:${DB_PORT:-5432}/${DB_NAME:-preduit}"
