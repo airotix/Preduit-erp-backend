@@ -11,8 +11,22 @@ from app.models.catalog import AttributeValue, Category, Product, ProductVariant
 _SKU_RE = re.compile(r"^SKU-(\d{1,6})$")
 
 
+def list_seasons(session: Session, *, tenant_id: UUID) -> list[str]:
+    values = session.scalars(select(Product.season).where(
+        Product.tenant_id == tenant_id, Product.is_deleted.is_(False),
+        Product.season.is_not(None),
+    ).distinct()).all()
+    names = {}
+    for value in sorted(values):
+        name = value.strip()
+        if name:
+            names.setdefault(name.casefold(), name)
+    return sorted(names.values(), key=str.casefold)
+
+
 def next_sku(session: Session) -> str:
-    """Next sequential SKU across the tenant: SKU-000001 … SKU-999999."""
+    """Next sequential SKU across the tenant: SKU-000001 … SKU-999999.
+    Kept for internal/variant seeding paths that don't take a user SKU."""
     mx = 0
     for s in session.execute(
         select(ProductVariant.sku).where(ProductVariant.sku.like("SKU-%"))
@@ -21,6 +35,14 @@ def next_sku(session: Session) -> str:
         if m:
             mx = max(mx, int(m.group(1)))
     return f"SKU-{mx + 1:06d}"
+
+
+def sku_taken(session: Session, *, sku: str, exclude_product_id: int | None = None) -> bool:
+    """True if another variant in this tenant already owns `sku`."""
+    stmt = select(ProductVariant.id).where(ProductVariant.sku == sku)
+    if exclude_product_id is not None:
+        stmt = stmt.where(ProductVariant.product_id != exclude_product_id)
+    return session.execute(stmt.limit(1)).scalar_one_or_none() is not None
 
 
 def list_products(session: Session, *, limit: int, offset: int) -> tuple[list[dict], int]:
@@ -43,7 +65,7 @@ def list_products(session: Session, *, limit: int, offset: int) -> tuple[list[di
             func.min(ProductVariant.wholesale_price).label("wholesale"),
             func.min(ProductVariant.supplier_price).label("supplier"),
         )
-        .outerjoin(ProductVariant, ProductVariant.product_id == Product.id)
+        .outerjoin(ProductVariant, (ProductVariant.product_id == Product.id) & (ProductVariant.status != "Archived"))
         .outerjoin(Category, Category.id == Product.category_id)
         .where(Product.is_deleted == False)  # noqa: E712
         .group_by(
@@ -73,7 +95,7 @@ def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
             func.min(ProductVariant.supplier_price).label("supplier"),
             func.min(ProductVariant.currency_code).label("currency_code"),
         )
-        .outerjoin(ProductVariant, ProductVariant.product_id == Product.id)
+        .outerjoin(ProductVariant, (ProductVariant.product_id == Product.id) & (ProductVariant.status != "Archived"))
         .where(Product.is_deleted == False, Product.title.ilike(f"%{q}%"))  # noqa: E712
         .group_by(Product.id, Product.title)
         .order_by(Product.title)
@@ -86,7 +108,7 @@ def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
         rows = session.execute(
             select(ProductVariant.product_id, AttributeValue.value, AttributeValue.hex)
             .join(AttributeValue, AttributeValue.id == ProductVariant.color_id)
-            .where(ProductVariant.product_id.in_(ids), AttributeValue.attr_type == "Color")
+            .where(ProductVariant.product_id.in_(ids), ProductVariant.status != "Archived", AttributeValue.attr_type == "Color")
             .distinct()
             .order_by(AttributeValue.value)
         )
@@ -197,7 +219,7 @@ def update_product(session: Session, *, public_id: str, title: str, category_id:
     # provided are changed; other fields on each variant are left alone.
     if any(p is not None for p in (retail, wholesale, online, supplier)):
         variants = session.execute(
-            select(ProductVariant).where(ProductVariant.product_id == product.id)
+            select(ProductVariant).where(ProductVariant.product_id == product.id, ProductVariant.status != "Archived")
             .order_by(ProductVariant.id)
         ).scalars().all()
         if not variants:
@@ -254,7 +276,7 @@ def get_product_detail(session: Session, *, public_id: str) -> dict | None:
         )
         .outerjoin(Color, Color.id == ProductVariant.color_id)
         .outerjoin(Size, Size.id == ProductVariant.size_id)
-        .where(ProductVariant.product_id == product.id)
+        .where(ProductVariant.product_id == product.id, ProductVariant.status != "Archived")
         .order_by(ProductVariant.sku)
     )
     variants = [dict(r._mapping) for r in session.execute(vstmt)]
@@ -280,6 +302,21 @@ def create_variant(session: Session, *, tenant_id: UUID, product_id: int, sku: s
     from app.modules.inventory import repository as inv_repo
     inv_repo.ensure_stock_row(session, tenant_id=tenant_id, variant_id=variant.id)
     return variant
+
+
+def set_product_sku(session: Session, *, product: Product, sku: str,
+                    currency_code: str = "EUR") -> None:
+    """Set the product's primary (first) variant SKU, creating a variant if needed."""
+    variants = session.execute(
+        select(ProductVariant).where(ProductVariant.product_id == product.id)
+        .order_by(ProductVariant.id)
+    ).scalars().all()
+    if variants:
+        variants[0].sku = sku
+        session.flush()
+    else:
+        create_variant(session, tenant_id=product.tenant_id, product_id=product.id,
+                       sku=sku, currency_code=currency_code)
 
 
 # ---------- Categories ----------

@@ -61,6 +61,10 @@ class OrderLineIn(BaseModel):
     price: Decimal = Field(ge=0)
 
 
+class ShortagePOCreate(BaseModel):
+    supplierId: UUID
+
+
 class OrderCreate(BaseModel):
     """Matches the frontend 'New order' form (customer + channel + line items).
     `newCustomer` carries the full Reach/Account/Finance details from the New

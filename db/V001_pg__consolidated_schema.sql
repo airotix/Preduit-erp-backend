@@ -734,6 +734,8 @@ CREATE TABLE IF NOT EXISTS supplier_bills (
     is_deleted    BOOLEAN       NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS ix_bill_tenant ON supplier_bills (tenant_id);
+ALTER TABLE po_invoices ADD COLUMN IF NOT EXISTS supplier_bill_id BIGINT REFERENCES supplier_bills(id);
+CREATE INDEX IF NOT EXISTS ix_po_invoice_bill ON po_invoices (tenant_id, supplier_bill_id);
 
 CREATE TABLE IF NOT EXISTS credit_notes (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1143,6 +1145,27 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS ix_rtok_user ON refresh_tokens (user_id, revoked_at);
 
+-- Order-owned holds and source links for stock-aware sales fulfillment (V064).
+ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS fulfillment_tracked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE sales_order_lines ADD COLUMN IF NOT EXISTS variant_id BIGINT REFERENCES product_variants(id);
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS sales_order_id BIGINT REFERENCES sales_orders(id);
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS inventory_received BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE purchase_order_lines ADD COLUMN IF NOT EXISTS sales_order_line_id BIGINT REFERENCES sales_order_lines(id);
+ALTER TABLE shipments ADD COLUMN IF NOT EXISTS sales_order_id BIGINT REFERENCES sales_orders(id);
+CREATE INDEX IF NOT EXISTS ix_purchase_sales_order ON purchase_orders (tenant_id, sales_order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_shipment_sales_order ON shipments (tenant_id, sales_order_id)
+    WHERE sales_order_id IS NOT NULL AND NOT is_deleted;
+CREATE TABLE IF NOT EXISTS order_stock_reservations (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    order_id BIGINT NOT NULL REFERENCES sales_orders(id),
+    order_line_id BIGINT NOT NULL REFERENCES sales_order_lines(id),
+    stock_level_id BIGINT NOT NULL REFERENCES stock_levels(id),
+    qty INTEGER NOT NULL CHECK (qty > 0),
+    UNIQUE (order_line_id, stock_level_id)
+);
+CREATE INDEX IF NOT EXISTS ix_order_reservations ON order_stock_reservations (tenant_id, order_id);
+
 /* ==================================================================
  * 19. Row-Level Security (RLS)
  *
@@ -1183,7 +1206,7 @@ BEGIN
             'customers', 'sales_orders', 'invoices', 'sales_returns',
             'sales_order_lines', 'invoice_lines', 'sales_invoices',
             'locations', 'stock_levels', 'stock_transfers', 'stock_transfer_lines',
-            'reorder_alerts',
+            'reorder_alerts', 'order_stock_reservations',
             'suppliers', 'purchase_orders', 'purchase_order_lines',
             'goods_receipts', 'goods_receipt_lines', 'po_invoices',
             'chart_of_accounts', 'journal_entries', 'journal_lines',
@@ -1266,5 +1289,15 @@ INSERT INTO permissions (code, description) VALUES
     ('finance.read',    'View finance'),
     ('finance.write',   'Post finance entries')
 ON CONFLICT (code) DO NOTHING;
+
+-- Procurement is the source of new production orders (V063).
+ALTER TABLE production_orders
+    ADD COLUMN IF NOT EXISTS purchase_order_id BIGINT REFERENCES purchase_orders(id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_production_purchase_order
+    ON production_orders (purchase_order_id) WHERE purchase_order_id IS NOT NULL;
+ALTER TABLE purchase_order_lines
+    ADD COLUMN IF NOT EXISTS production_line_id BIGINT REFERENCES production_order_lines(id);
+CREATE INDEX IF NOT EXISTS ix_purchase_production_line
+    ON purchase_order_lines (tenant_id, production_line_id);
 
 COMMIT;

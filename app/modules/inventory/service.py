@@ -85,9 +85,7 @@ def stock_article_detail(session: Session, *, public_id: str) -> dict | None:
         return None
     product = data["product"]
 
-    # Matrix column headers = the full Size catalog (ordered), plus any size
-    # actually held that isn't in the catalog (appended at the end). Sizes with
-    # no stock still appear as a column and render as 0.
+    # Always show the standard apparel scale, even before variants exist.
     size_order: dict[str, int] = {
         s["value"]: (s["sort_order"] or 0) for s in data["all_sizes"]
     }
@@ -95,7 +93,9 @@ def stock_article_detail(session: Session, *, public_id: str) -> dict | None:
         sname = r["size"] or "—"
         if sname not in size_order:
             size_order[sname] = (r["size_order"] or 0) + 1000  # keep extras last
-    sizes = sorted(size_order, key=lambda s: (size_order[s], s))
+    standard_sizes = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL", "7XL"]
+    sizes = standard_sizes + sorted(
+        (s for s in size_order if s not in standard_sizes), key=lambda s: (size_order[s], s))
 
     # Group by color, summing on-hand per size, then align to the size list.
     by_color: dict[str, dict] = {}
@@ -144,39 +144,9 @@ def stock_article_detail(session: Session, *, public_id: str) -> dict | None:
 
 def save_article_matrix(session: Session, *, tenant_id: str | UUID, public_id: str,
                         payload: MatrixUpdate) -> dict | None:
-    """Persist the edited color × size grid: upsert colors, variants and stock."""
-    tid = _tid(tenant_id)
-    product = repo.get_product_by_public_id(session, public_id=public_id)
-    if product is None:
-        return None
-    location_id = repo.primary_location_id(session, product_id=product.id)
-    if location_id is None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                            "No inventory location exists to store stock. Create a location first.")
-    price, currency = repo.variant_defaults(session, product_id=product.id)
-
-    for col in payload.colors:
-        name = col.color.strip()
-        if not name:
-            continue
-        color = repo.find_attr_value(session, attr_type="Color", value=name)
-        if color is None:
-            color = repo.create_color(session, tenant_id=tid, value=name, hex=col.hex)
-        for cell in col.cells:
-            if not (cell.size or "").strip():
-                continue
-            # Auto-create the size if the tenant hasn't configured its scale
-            # (mirrors colour creation) — otherwise the cell would be dropped.
-            size = (repo.find_attr_value(session, attr_type="Size", value=cell.size)
-                    or repo.create_size(session, tenant_id=tid, value=cell.size))
-            variant = repo.find_or_create_variant(
-                session, tenant_id=tid, product_id=product.id, color_id=color.id,
-                size_id=size.id, price=price, currency=currency,
-            )
-            repo.set_variant_on_hand(session, tenant_id=tid, variant_id=variant.id,
-                                     location_id=location_id, on_hand=cell.qty)
-
-    return stock_article_detail(session, public_id=public_id)
+    from app.modules.inventory.matrix import save_matrix
+    product = save_matrix(session, tenant_id=tenant_id, public_id=public_id, payload=payload)
+    return stock_article_detail(session, public_id=public_id) if product is not None else None
 
 
 def search_stock_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
@@ -191,6 +161,8 @@ def create_stock_receipt(session: Session, *, tenant_id: str | UUID, payload: St
     location_id = repo.find_location_id_by_name(session, name=payload.location)
     if location_id is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"No location named {payload.location}")
+    from app.modules.sales import fulfillment
+    waiting_orders = fulfillment.lock_waiting_orders(session, tenant_id=tid)
     received = 0
     for l in payload.lines:
         product = repo.find_product_by_title(session, title=l.name)
@@ -207,6 +179,8 @@ def create_stock_receipt(session: Session, *, tenant_id: str | UUID, payload: St
         repo.add_stock(session, tenant_id=tid, variant_id=variant.id,
                        location_id=location_id, qty=int(l.qty or 0))
         received += int(l.qty or 0)
+    if received:
+        fulfillment.refresh_waiting_orders(session, waiting_orders)
     return received
 
 

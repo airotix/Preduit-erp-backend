@@ -1,7 +1,7 @@
 """Shipments ORM models."""
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, Integer, String, Uuid, text
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, String, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -9,6 +9,7 @@ from app.models.base import Base
 
 class Shipment(Base):
     __tablename__ = "shipments"
+    sales_order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_orders.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)

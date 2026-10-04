@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models.production import BomLine, ProductionOrder, ProductionOrderLine, ProductionStage
 from app.models.sales import SalesOrder, SalesOrderLine
+from app.models.procurement import PurchaseOrder, PurchaseOrderLine
 from app.models.shipments import Shipment
 
 
@@ -36,10 +37,23 @@ def list_porders(session, *, limit, offset):
         .where(SalesOrder.id == ProductionOrder.sales_order_id)
         .correlate(ProductionOrder).scalar_subquery()
     )
+    source_po = (
+        select(PurchaseOrder.po_no)
+        .where(PurchaseOrder.id == ProductionOrder.purchase_order_id,
+               PurchaseOrder.tenant_id == ProductionOrder.tenant_id)
+        .correlate(ProductionOrder).scalar_subquery()
+    )
+    supplier = (
+        select(PurchaseOrder.supplier_name)
+        .where(PurchaseOrder.id == ProductionOrder.purchase_order_id,
+               PurchaseOrder.tenant_id == ProductionOrder.tenant_id)
+        .correlate(ProductionOrder).scalar_subquery()
+    )
     stmt = (
         select(ProductionOrder.public_id, ProductionOrder.order_no, ProductionOrder.style,
                ProductionOrder.factory, ProductionOrder.qty, ProductionOrder.stage,
                ProductionOrder.progress, customer.label("customer"),
+               source_po.label("source_po"), supplier.label("supplier"),
                stage_count.label("stage_count"),
                done_count.label("done_count"), shipped_count.label("shipped_count"))
         .where(ProductionOrder.is_deleted == False)  # noqa: E712
@@ -67,9 +81,11 @@ def list_porders_all(session):
 
 
 def create_porder(session: Session, *, tenant_id: UUID, style, factory, qty,
-                  sales_order_id: int | None = None) -> ProductionOrder:
+                  sales_order_id: int | None = None,
+                  purchase_order_id: int | None = None) -> ProductionOrder:
     po = ProductionOrder(tenant_id=tenant_id, style=style, factory=factory, qty=qty,
-                         stage="Trims", progress=0, sales_order_id=sales_order_id)
+                         stage="Trims", progress=0, sales_order_id=sales_order_id,
+                         purchase_order_id=purchase_order_id)
     session.add(po)
     session.flush()
     po.order_no = f"MO-{3300 + po.id}"
@@ -148,9 +164,21 @@ def get_porder_detail(session: Session, *, public_id: str) -> dict | None:
         select(BomLine.component, BomLine.material, BomLine.qty_per_unit, BomLine.cost)
         .where(BomLine.style == po.style, BomLine.is_deleted == False)  # noqa: E712
     )]
-    # The originating sales order + its line items (for the Summary tab).
+    # Procurement is the source for new work; retain legacy sales summaries.
+    purchase_order = None
     sales_order, order_lines = None, []
-    if po.sales_order_id:
+    if po.purchase_order_id:
+        purchase_order = session.execute(select(PurchaseOrder).where(
+            PurchaseOrder.id == po.purchase_order_id,
+            PurchaseOrder.tenant_id == po.tenant_id)).scalar_one_or_none()
+        if purchase_order is not None:
+            order_lines = [dict(r._mapping) for r in session.execute(
+                select(PurchaseOrderLine.name, PurchaseOrderLine.color, PurchaseOrderLine.size,
+                       PurchaseOrderLine.qty, PurchaseOrderLine.price, PurchaseOrderLine.line_total)
+                .where(PurchaseOrderLine.po_id == purchase_order.id,
+                       PurchaseOrderLine.tenant_id == po.tenant_id)
+                .order_by(PurchaseOrderLine.id))]
+    elif po.sales_order_id:
         sales_order = session.get(SalesOrder, po.sales_order_id)
         order_lines = [dict(r._mapping) for r in session.execute(
             select(SalesOrderLine.name, SalesOrderLine.color, SalesOrderLine.size,
@@ -162,7 +190,8 @@ def get_porder_detail(session: Session, *, public_id: str) -> dict | None:
     lines = [{"line": ln, "stages": list_line_stages(session, ln.id)}
              for ln in list_lines(session, po.id)]
     return {"order": po, "materials": materials, "stages": list_stages(session, po.id),
-            "sales_order": sales_order, "order_lines": order_lines, "lines": lines}
+            "sales_order": sales_order, "purchase_order": purchase_order,
+            "order_lines": order_lines, "lines": lines}
 
 
 # ---------- Production stage timeline ----------

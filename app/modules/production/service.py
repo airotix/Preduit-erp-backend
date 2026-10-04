@@ -2,11 +2,13 @@
 import uuid
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.modules.production import repository as repo
 from app.models.production import ProductionOrder, ProductionOrderLine
-from app.modules.production.dto import BomCreate, BomUpdate, ProductionOrderCreate
+from app.models.procurement import PurchaseOrder, PurchaseOrderLine
+from app.modules.production.dto import BomCreate, BomUpdate
 from app.presenters.screen import board_config, initials, list_config, text_cell
 
 STAGES = ["Trims", "Lining", "Cutting", "Sewing", "Finishing", "Packed"]
@@ -32,8 +34,8 @@ def porders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dic
         [
             text_cell(r["order_no"] or "—", strong=True, mono=True),
             r["style"],
-            r.get("customer") or "—",
-            r["factory"] or "—",
+            r.get("source_po") or "—",
+            r.get("supplier") or r.get("customer") or "—",
             text_cell(f"{r['qty']:,}", align="right", mono=True),
             text_cell(r["stage"], badge=_STAGE_TONE.get(r["stage"], "neutral")),
             text_cell(f"{r['progress']}%", align="right", mono=True, strong=True),
@@ -41,8 +43,7 @@ def porders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dic
         for r in rows
     ]
     return list_config(
-        columns=[{"label": "Order"}, {"label": "Style"}, {"label": "Customer"},
-                 {"label": "Factory"},
+        columns=[{"label": "Order"}, {"label": "Style"}, {"label": "Source PO"}, {"label": "Supplier / Customer"},
                  {"label": "Qty", "align": "right"}, {"label": "Stage"},
                  {"label": "Progress", "align": "right"}],
         rows=grid, total=total,
@@ -50,7 +51,7 @@ def porders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dic
         records=[{"status": r["stage"], "started": r.get("started", False),
                   "shippable": r.get("shippable", False), "shipped": r.get("shipped", False)}
                  for r in rows],
-        search="Search production orders…", action="New order", filters=["Factory", "Stage"],
+        search="Search production orders…", filters=["Stage"],
     )
 
 
@@ -61,6 +62,11 @@ def ship_order(session, *, tenant_id, public_id, carrier, eta, destination):
     po = repo.order_by_public(session, public_id)
     if po is None:
         return None
+    if po.purchase_order_id:
+        source = session.get(PurchaseOrder, po.purchase_order_id)
+        if source:
+            from fastapi import HTTPException
+            raise HTTPException(409, "Procurement production enters inventory after final QC; fully stocked sales orders ship together.")
     s = ship_repo.create_shipment(session, tenant_id=_tid(tenant_id), order_ref=po.order_no,
                                   carrier=carrier, destination=destination)
     s.eta = eta
@@ -112,9 +118,46 @@ def send_for_inspection(session, *, tenant_id, public_id):
     return po
 
 
-def create_porder(session, *, tenant_id, payload: ProductionOrderCreate):
-    return repo.create_porder(session, tenant_id=_tid(tenant_id), style=payload.style,
-                              factory=payload.factory, qty=payload.qty)
+def create_for_purchase_order(session, *, tenant_id, purchase_order: PurchaseOrder):
+    """One unstarted work order per procurement PO, one TNA item per style.
+
+    Lock the source PO so repeated/concurrent calls cannot create duplicates.
+    Each variant line retains its details and links to its production item.
+    No commit here: procurement and production share the request transaction.
+    """
+    tid = _tid(tenant_id)
+    source = session.execute(select(PurchaseOrder).where(
+        PurchaseOrder.id == purchase_order.id, PurchaseOrder.tenant_id == tid,
+        PurchaseOrder.is_deleted == False).with_for_update()).scalar_one_or_none()
+    if source is None:
+        raise ValueError("Purchase order does not belong to this tenant")
+    existing = session.execute(select(ProductionOrder).where(
+        ProductionOrder.purchase_order_id == source.id,
+        ProductionOrder.tenant_id == tid)).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    lines = session.execute(select(PurchaseOrderLine).where(
+        PurchaseOrderLine.po_id == source.id, PurchaseOrderLine.tenant_id == tid)
+        .order_by(PurchaseOrderLine.id)).scalars().all()
+    if not lines:
+        raise ValueError("Purchase order must have line items")
+    styles: dict[str, list[PurchaseOrderLine]] = {}
+    for line in lines:
+        styles.setdefault(line.name.strip(), []).append(line)
+    names = list(styles)
+    label = names[0] if len(names) == 1 else f"{names[0][:180]} +{len(names) - 1} more"
+    work = repo.create_porder(session, tenant_id=tid, style=label, factory=None,
+        qty=sum(line.qty for line in lines), purchase_order_id=source.id)
+    for name, variants in styles.items():
+        single = variants[0] if len(variants) == 1 else None
+        item = repo.create_porder_line(session, tenant_id=tid, order_id=work.id,
+            name=name, qty=sum(line.qty for line in variants),
+            sku=single.sku if single else None, color=single.color if single else None,
+            size=single.size if single else None)
+        for variant in variants:
+            variant.production_line_id = item.id
+    session.flush()
+    return work
 
 
 def set_stage(session, *, public_id, status):
@@ -243,9 +286,12 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         return None
     po, mats, stages = data["order"], data["materials"], data["stages"]
     sales_order, order_lines = data.get("sales_order"), data.get("order_lines") or []
+    purchase_order = data.get("purchase_order")
     today = datetime.date.today()
 
     def _money(v) -> str:
+        if purchase_order is not None:
+            return f"{purchase_order.currency_code} {float(v or 0):,.2f}"
         return f"€{float(v or 0):,.2f}"
 
     order_lines_out = [
@@ -274,7 +320,10 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
     ]
 
     meta = []
-    if sales_order is not None:
+    if purchase_order is not None:
+        meta.append({"k": "Source PO", "v": purchase_order.po_no or "—"})
+        meta.append({"k": "Supplier", "v": purchase_order.supplier_name})
+    elif sales_order is not None:
         meta.append({"k": "Order", "v": sales_order.order_no or "—"})
         meta.append({"k": "Customer", "v": sales_order.customer_name or "—"})
     else:
@@ -293,6 +342,8 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         "meta": meta,
         "orderLines": order_lines_out,
         "orderTotal": order_total,
+        "sourcePurchaseOrder": {"publicId": str(purchase_order.public_id),
+                                "poNo": purchase_order.po_no} if purchase_order else None,
         "started": started,
         "progress": progress,
         "canInspect": can_inspect,
@@ -335,6 +386,9 @@ def stage_action(session, *, action, public_id, days=None, worker=None, notes=No
                     qc_repo.create_inspection(session, tenant_id=stage.tenant_id,
                                               order_ref=po.order_no, stage="Final", aql="2.5",
                                               product=po.style, prod_qty=po.qty)
+            if po is not None:
+                from app.modules.sales import fulfillment
+                fulfillment.receive_inspected_production(session, tenant_id=stage.tenant_id, order_ref=po.order_no)
         return stage
     if action == "extend":
         return repo.extend_stage(session, public_id=public_id, days=days or 0)

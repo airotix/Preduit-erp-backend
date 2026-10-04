@@ -61,7 +61,7 @@ def resolve_variant_id(session: Session, *, sku: str | None = None, name: str | 
         .join(Product, Product.id == ProductVariant.product_id)
         .outerjoin(color_av, color_av.id == ProductVariant.color_id)
         .outerjoin(size_av, size_av.id == ProductVariant.size_id)
-        .where(Product.title == name, Product.is_deleted == False)  # noqa: E712
+        .where(Product.title == name, Product.is_deleted == False, ProductVariant.status != "Archived")  # noqa: E712
     )
     if color:
         stmt = stmt.where(color_av.value == color)
@@ -74,16 +74,29 @@ def adjust_stock(session: Session, *, tenant_id: UUID, variant_id: int, location
                  on_hand_delta: int = 0, reserved_delta: int = 0) -> None:
     """Apply signed deltas to a stock level (upsert), never letting a count go
     below zero. This is the single primitive for reserve/relieve/transfer."""
+    if on_hand_delta > 0:
+        variant = session.get(ProductVariant, variant_id)
+        if variant is not None and variant.tenant_id == tenant_id and variant.status == "Archived":
+            variant.status = "Active"
     row = session.execute(
         select(StockLevel).where(StockLevel.variant_id == variant_id,
-                                 StockLevel.location_id == location_id)
+                                 StockLevel.location_id == location_id, StockLevel.tenant_id == tenant_id)
+        .with_for_update().execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if row is None:
         row = StockLevel(tenant_id=tenant_id, variant_id=variant_id,
                          location_id=location_id, on_hand=0, reserved=0)
         session.add(row)
-    row.on_hand = max(0, (row.on_hand or 0) + on_hand_delta)
-    row.reserved = max(0, (row.reserved or 0) + reserved_delta)
+    from fastapi import HTTPException
+    from app.models.inventory import OrderStockReservation
+    owned = session.scalar(select(func.coalesce(func.sum(OrderStockReservation.qty), 0)).where(
+        OrderStockReservation.stock_level_id == row.id, OrderStockReservation.tenant_id == tenant_id)) if row.id else 0
+    new_hand = max(0, (row.on_hand or 0) + on_hand_delta)
+    new_reserved = max(0, (row.reserved or 0) + reserved_delta)
+    if new_hand < owned or new_reserved < owned or (on_hand_delta < 0 and reserved_delta == 0 and new_hand < new_reserved):
+        raise HTTPException(409, "Stock is reserved for sales orders and cannot be moved or removed.")
+    row.on_hand = new_hand
+    row.reserved = new_reserved
     session.flush()
 
 
@@ -121,20 +134,18 @@ def list_stock(session: Session, *, limit: int, offset: int) -> tuple[list[dict]
             func.min(ProductVariant.online_price).label("online"),
             func.min(ProductVariant.wholesale_price).label("wholesale"),
         )
-        .select_from(StockLevel)
-        .join(ProductVariant, ProductVariant.id == StockLevel.variant_id)
-        .join(Product, Product.id == ProductVariant.product_id)
+        .select_from(Product)
+        .outerjoin(ProductVariant, (ProductVariant.product_id == Product.id) & (ProductVariant.status != "Archived"))
+        .outerjoin(StockLevel, StockLevel.variant_id == ProductVariant.id)
         .outerjoin(Category, Category.id == Product.category_id)
+        .where(Product.is_deleted == False)
         .group_by(Product.public_id, Product.title, Category.name)
         .order_by(Product.title)
         .limit(limit).offset(offset)
     )
     rows = [dict(r._mapping) for r in session.execute(stmt)]
     total = session.execute(
-        select(func.count(func.distinct(Product.id)))
-        .select_from(StockLevel)
-        .join(ProductVariant, ProductVariant.id == StockLevel.variant_id)
-        .join(Product, Product.id == ProductVariant.product_id)
+        select(func.count(Product.id)).where(Product.is_deleted == False)
     ).scalar_one()
     return rows, total
 
@@ -160,19 +171,22 @@ def get_article_stock(session: Session, *, public_id: str) -> dict | None:
             func.coalesce(func.sum(StockLevel.on_hand), 0).label("on_hand"),
             func.coalesce(func.sum(StockLevel.reserved), 0).label("reserved"),
         )
-        .select_from(StockLevel)
-        .join(ProductVariant, ProductVariant.id == StockLevel.variant_id)
+        .select_from(ProductVariant)
+        .outerjoin(StockLevel, StockLevel.variant_id == ProductVariant.id)
         .outerjoin(Color, Color.id == ProductVariant.color_id)
         .outerjoin(Size, Size.id == ProductVariant.size_id)
-        .where(ProductVariant.product_id == product.id)
+        .where(ProductVariant.product_id == product.id, ProductVariant.status != "Archived",
+               ProductVariant.color_id.is_not(None), ProductVariant.size_id.is_not(None))
         .group_by(Color.value, Color.hex, Color.sort_order, Size.value, Size.sort_order)
     ).mappings().all()
 
-    # Full size scale from the Size attribute catalog (ordered), so every
-    # size shows as a column even when this article carries no stock in it.
+    # Only this article's active sizes; removing a column must remove it here.
     all_sizes = session.execute(
         select(AttributeValue.value, AttributeValue.sort_order)
-        .where(AttributeValue.attr_type == "Size")
+        .join(ProductVariant, ProductVariant.size_id == AttributeValue.id)
+        .where(AttributeValue.attr_type == "Size", ProductVariant.product_id == product.id,
+               ProductVariant.status != "Archived", ProductVariant.color_id.is_not(None))
+        .distinct()
         .order_by(AttributeValue.sort_order, AttributeValue.value)
     ).mappings().all()
 
@@ -186,7 +200,7 @@ def get_article_stock(session: Session, *, public_id: str) -> dict | None:
         .select_from(StockLevel)
         .join(ProductVariant, ProductVariant.id == StockLevel.variant_id)
         .join(Location, Location.id == StockLevel.location_id)
-        .where(ProductVariant.product_id == product.id)
+        .where(ProductVariant.product_id == product.id, ProductVariant.status != "Archived")
         .group_by(Location.name)
         .order_by(Location.name)
     ).mappings().all()
@@ -206,7 +220,7 @@ def search_stock_products(session: Session, *, q: str, limit: int = 10) -> list[
         .select_from(StockLevel)
         .join(ProductVariant, ProductVariant.id == StockLevel.variant_id)
         .join(Product, Product.id == ProductVariant.product_id)
-        .where(Product.is_deleted == False, Product.title.ilike(f"%{q}%"))  # noqa: E712
+        .where(Product.is_deleted == False, ProductVariant.status != "Archived", Product.title.ilike(f"%{q}%"))  # noqa: E712
         .group_by(Product.id, Product.title)
         .order_by(Product.title).limit(limit)
     )]
@@ -216,7 +230,7 @@ def search_stock_products(session: Session, *, q: str, limit: int = 10) -> list[
         for pid, val, hexv in session.execute(
             select(ProductVariant.product_id, AttributeValue.value, AttributeValue.hex)
             .join(AttributeValue, AttributeValue.id == ProductVariant.color_id)
-            .where(ProductVariant.product_id.in_(ids), AttributeValue.attr_type == "Color")
+            .where(ProductVariant.product_id.in_(ids), ProductVariant.status != "Archived", AttributeValue.attr_type == "Color")
             .distinct().order_by(AttributeValue.value)
         ):
             colors_by.setdefault(pid, []).append({"name": val, "hex": hexv or "#CBD1DC"})
@@ -234,9 +248,15 @@ def find_product_by_title(session: Session, *, title: str) -> Product | None:
 def add_stock(session: Session, *, tenant_id: UUID, variant_id: int, location_id: int,
               qty: int) -> StockLevel:
     """Receive stock: add qty to the on-hand at a location (create the row if new)."""
+    if qty > 0:
+        variant = session.get(ProductVariant, variant_id)
+        if variant is not None and variant.tenant_id == tenant_id and variant.status == "Archived":
+            variant.status = "Active"
     existing = session.execute(
         select(StockLevel).where(StockLevel.variant_id == variant_id,
-                                 StockLevel.location_id == location_id)
+                                 StockLevel.location_id == location_id,
+                                 StockLevel.tenant_id == tenant_id)
+        .with_for_update().execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if existing:
         existing.on_hand = (existing.on_hand or 0) + qty
@@ -279,7 +299,7 @@ def variant_defaults(session: Session, *, product_id: int) -> tuple[Decimal, str
     """Price/currency to copy onto brand-new variants of this product."""
     row = session.execute(
         select(ProductVariant.price, ProductVariant.currency_code)
-        .where(ProductVariant.product_id == product_id).limit(1)
+        .where(ProductVariant.product_id == product_id, ProductVariant.status != "Archived").limit(1)
     ).first()
     if row:
         return row[0], row[1]
@@ -342,6 +362,9 @@ def find_or_create_variant(session: Session, *, tenant_id: UUID, product_id: int
                                      ProductVariant.size_id == size_id)
     ).scalars().first()
     if existing:
+        if existing.status == "Archived":
+            existing.status = "Active"
+            session.flush()
         return existing
     from app.modules.catalog.repository import next_sku  # local import avoids cycle
     sku = next_sku(session)

@@ -25,8 +25,8 @@ def porders_screen(limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
 @router.post("/porders", status_code=status.HTTP_201_CREATED)
 def create_porder(payload: ProductionOrderCreate, principal: Principal = Depends(write),
                   db: Session = Depends(tenant_db)):
-    po = service.create_porder(db, tenant_id=principal.tenant_id, payload=payload)
-    return {"public_id": str(po.public_id), "order_no": po.order_no}
+    raise HTTPException(status.HTTP_409_CONFLICT,
+                        "Create a purchase order in Procurement to create production work.")
 
 
 @router.post("/porders/{public_id}/status")

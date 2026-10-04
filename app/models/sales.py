@@ -4,7 +4,7 @@ import uuid
 from decimal import Decimal
 
 from sqlalchemy import (
-    BigInteger, Boolean, Date, DateTime, Integer, Numeric, String, Text, Uuid, text,
+    BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -53,11 +53,13 @@ class SalesOrder(Base):
     currency_code: Mapped[str] = mapped_column(String(3), default="EUR")
     status: Mapped[str] = mapped_column(String(20), default="New")
     order_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    fulfillment_tracked: Mapped[bool] = mapped_column(Boolean, default=False)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class SalesOrderLine(Base):
     __tablename__ = "sales_order_lines"
+    variant_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("product_variants.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     order_id: Mapped[int] = mapped_column(BigInteger)

@@ -1,5 +1,13 @@
 """Quality API contracts."""
 from pydantic import BaseModel, Field
+from typing import Literal
+
+
+class ReopenIn(BaseModel):
+    mode: Literal["inspection", "production"]
+    notes: str | None = Field(default=None, max_length=400)
+    assignedTo: str | None = Field(default=None, max_length=120)
+    dueDate: str | None = Field(default=None, max_length=20)
 
 
 class InspectionCreate(BaseModel):
@@ -42,6 +50,7 @@ class DefectIn(BaseModel):
     """A defect logged against an inspection (from the Defect Types catalog)."""
     defectTypeId: str | None = Field(default=None, max_length=64)   # public_id of a DefectType
     defectName: str | None = Field(default=None, max_length=120)    # free-text fallback
+    newDefect: DefectTypeCreate | None = None  # create and log together from the inspection
     qtyAffected: int = Field(default=1, ge=1)
     location: str | None = Field(default=None, max_length=120)
     description: str | None = Field(default=None, max_length=400)

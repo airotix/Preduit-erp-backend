@@ -3,7 +3,7 @@ import datetime
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, String, Text, Uuid, text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -43,6 +43,8 @@ class Supplier(Base):
 
 class PurchaseOrder(Base):
     __tablename__ = "purchase_orders"
+    sales_order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_orders.id"), nullable=True)
+    inventory_received: Mapped[bool] = mapped_column(Boolean, default=False)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
@@ -88,6 +90,7 @@ class GoodsReceiptLine(Base):
 
 class PurchaseOrderLine(Base):
     __tablename__ = "purchase_order_lines"
+    sales_order_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_order_lines.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     # Client-side default so multi-line POs insert cleanly: SQLAlchemy batches
     # multiple lines into one INSERT…SELECT (VALUES…), and the DB's
@@ -98,6 +101,8 @@ class PurchaseOrderLine(Base):
         Uuid, server_default=text("gen_random_uuid()"), default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     po_id: Mapped[int] = mapped_column(BigInteger)
+    production_line_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("production_order_lines.id"), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
     color: Mapped[str | None] = mapped_column(String(60), nullable=True)
     size: Mapped[str | None] = mapped_column(String(60), nullable=True)
@@ -115,6 +120,7 @@ class PoInvoice(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     invoice_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
     po_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    supplier_bill_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("supplier_bills.id"), nullable=True)
     supplier_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     currency_code: Mapped[str | None] = mapped_column(String(3), nullable=True)
     total: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)

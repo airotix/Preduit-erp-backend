@@ -7,11 +7,12 @@ from sqlalchemy.orm import Session
 
 from app.models.production import ProductionOrder
 from app.models.sales import SalesOrder
+from app.models.shipments import Shipment
 from app.modules.shipments import repository as repo
 from app.modules.shipments.dto import CarrierCreate, CarrierUpdate, ShipmentCreate
 from app.presenters.screen import list_config, text_cell
 
-_SHIP_TONE = {"Label created": "neutral", "In transit": "amber",
+_SHIP_TONE = {"Pending": "neutral", "Label created": "neutral", "In transit": "amber",
               "Customs": "navy", "Out for delivery": "amber", "Delivered": "green"}
 _CARRIER_TONE = {"Active": "green", "Paused": "amber", "Inactive": "red"}
 
@@ -53,6 +54,17 @@ def shipments_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
 
 
 def create_shipment(session, *, tenant_id, payload: ShipmentCreate):
+    from app.modules.sales import fulfillment
+    from fastapi import HTTPException
+    order = session.scalar(select(SalesOrder).where(SalesOrder.order_no == payload.order,
+        SalesOrder.tenant_id == _tid(tenant_id), SalesOrder.is_deleted.is_(False)).with_for_update())
+    if order and order.fulfillment_tracked:
+        shipment = fulfillment.refresh_order(session, order)
+        if shipment is None:
+            raise HTTPException(409, "This order is waiting for stock, final QC or inventory receipt.")
+        shipment.carrier, shipment.destination = payload.carrier, payload.destination
+        session.flush()
+        return shipment
     return repo.create_shipment(session, tenant_id=_tid(tenant_id), order_ref=payload.order,
                                 carrier=payload.carrier, destination=payload.destination)
 
@@ -75,6 +87,11 @@ def _mark_sales_order_shipped(session: Session, order_ref: str | None) -> None:
         ).scalar_one_or_none()
         if po is not None and po.sales_order_id:
             so = session.get(SalesOrder, po.sales_order_id)
+    if so is not None and so.fulfillment_tracked:
+        from app.modules.sales import fulfillment
+        so = fulfillment.lock_order(session, tenant_id=so.tenant_id, order_id=so.id)
+        fulfillment.complete_shipment(session, so)
+        return
     if so is not None and so.status != "Shipped":
         so.status = "Shipped"
         session.flush()
@@ -94,7 +111,25 @@ def search_carriers(session, *, q, limit: int = 50):
     return repo.search_carriers(session, q=q or "", limit=limit)
 
 
+def _validate_order_shipment(session, public_id, status):
+    from fastapi import HTTPException
+    from app.modules.sales import fulfillment
+    shipment = session.scalar(select(Shipment).where(Shipment.public_id == UUID(str(public_id)),
+        Shipment.is_deleted.is_(False)))
+    if shipment is None or not shipment.sales_order_id:
+        return
+    order = fulfillment.lock_order(session, tenant_id=shipment.tenant_id, order_id=shipment.sales_order_id)
+    session.refresh(shipment)
+    if order.status == "Cancelled":
+        raise HTTPException(409, "This sales order has been cancelled.")
+    if shipment.status == "Delivered" and status != "Delivered":
+        raise HTTPException(409, "A completed shipment cannot be reopened.")
+    if shipment.status != "Delivered" and any(r["reserved"] < r["ordered"] for r in fulfillment.stock_summary(session, order)):
+        raise HTTPException(409, "The full order must be ready before its shipment can progress.")
+
+
 def set_status(session, *, public_id, status):
+    _validate_order_shipment(session, public_id, status)
     s = repo.set_status(session, public_id=public_id, status=status)
     if s is not None and status == "Delivered":
         _mark_sales_order_shipped(session, s.order_ref)
@@ -102,6 +137,7 @@ def set_status(session, *, public_id, status):
 
 
 def update_shipment(session, *, public_id, payload):
+    _validate_order_shipment(session, public_id, payload.status)
     s = repo.update_shipment(session, public_id=public_id, carrier=payload.carrier,
                              destination=payload.destination, eta=payload.eta, status=payload.status)
     if s is not None and payload.status == "Delivered":
@@ -153,7 +189,7 @@ def shipment_detail(session: Session, *, public_id: str) -> dict | None:
                 "carrier": s.carrier or "", "destination": s.destination or "",
                 "eta": s.eta or "", "status": s.status,
             },
-            "statusOptions": [name for name, _ in _TRACK],
+            "statusOptions": ["Pending"] + [name for name, _ in _TRACK],
         },
     }
 

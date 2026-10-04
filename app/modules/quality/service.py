@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.production import ProductionOrder, ProductionOrderLine
+from app.models.quality import Inspection
 from app.modules.quality import aql as aql_engine
 from app.modules.quality import repository as repo
 from app.modules.quality.dto import DefectTypeCreate, DefectTypeUpdate, InspectionCreate
@@ -169,6 +170,10 @@ def update_inspection(session, *, public_id, payload):
 
 def start_inspection(session, *, public_id, tenant_id=None):
     """Pending → In Progress. Guard: only a Pending inspection can be started."""
+    ins = repo.get_inspection(session, public_id=public_id)
+    if ins and inspection_waits_for_rework(session, ins):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Complete the reopened production TNA before starting reinspection.")
     return repo.start_inspection(session, public_id=public_id,
                                  tenant_id=_tid(tenant_id) if tenant_id else None)
 
@@ -217,11 +222,31 @@ def defect_options(session):
 
 
 def add_defect(session, *, tenant_id, public_id, payload):
-    ins = repo.get_inspection(session, public_id=public_id)
+    from fastapi import HTTPException
+    ins = session.scalar(select(Inspection).where(Inspection.public_id == UUID(str(public_id)),
+        Inspection.tenant_id == _tid(tenant_id), Inspection.is_deleted.is_(False)).with_for_update())
     if ins is None:
         return None
+    if ins.result != "In Progress":
+        raise HTTPException(409, "Start the inspection before adding defects.")
+    defect_type_id = payload.defectTypeId
+    if payload.newDefect:
+        from sqlalchemy import func
+        from app.models.quality import DefectType
+        if defect_type_id:
+            raise HTTPException(422, "Select an existing defect or create a new one.")
+        name, category = payload.newDefect.name.strip(), payload.newDefect.category.strip()
+        if not name or not category:
+            raise HTTPException(422, "Defect name and category are required.")
+        existing = session.scalar(select(DefectType).where(DefectType.tenant_id == _tid(tenant_id),
+            DefectType.is_deleted.is_(False), func.lower(func.trim(DefectType.name)) == name.lower()).limit(1))
+        defect_type = existing or repo.create_defect(session, tenant_id=_tid(tenant_id),
+            name=name, category=category, severity=payload.newDefect.severity)
+        defect_type_id = str(defect_type.public_id)
+    if not defect_type_id and not (payload.defectName or "").strip():
+        raise HTTPException(422, "Select a defect type or enter a defect name.")
     return repo.add_defect(session, tenant_id=_tid(tenant_id), ins=ins,
-                           defect_type_public=payload.defectTypeId, defect_name=payload.defectName,
+                           defect_type_public=defect_type_id, defect_name=(payload.defectName or "").strip(),
                            qty_affected=payload.qtyAffected, location=payload.location,
                            description=payload.description, corrective=payload.corrective,
                            image_doc_id=payload.imageDocId)
@@ -241,6 +266,11 @@ def set_disposition(session, *, public_id, payload):
         return None
     if ins.result != "Fail":
         return {"error": "not_failed"}
+    child = session.scalar(select(Inspection).where(Inspection.parent_inspection_id == ins.id,
+        Inspection.tenant_id == ins.tenant_id, Inspection.is_deleted.is_(False)).limit(1))
+    if child and payload.disposition != ins.disposition:
+        from fastapi import HTTPException
+        raise HTTPException(409, "Recovery is already underway; keep its selected disposition.")
     import datetime as _dt
     due = None
     if payload.dueDate:
@@ -254,19 +284,93 @@ def set_disposition(session, *, public_id, payload):
 
 
 def create_reinspection(session, *, tenant_id, public_id):
-    """Create a new Pending inspection linked to a failed original."""
-    parent = repo.get_inspection(session, public_id=public_id)
+    return reopen_failed(session, tenant_id=tenant_id, public_id=public_id, mode="inspection")
+
+
+def production_for_inspection(session, ins):
+    return session.scalar(select(ProductionOrder).where(ProductionOrder.tenant_id == ins.tenant_id,
+        ProductionOrder.order_no == ins.order_ref, ProductionOrder.is_deleted.is_(False)))
+
+
+def inspection_waits_for_rework(session, ins):
+    if not ins.parent_inspection_id:
+        return False
+    parent = session.get(Inspection, ins.parent_inspection_id)
+    if parent is None or parent.disposition != "Rework":
+        return False
+    work = production_for_inspection(session, ins)
+    if work is None:
+        return False
+    lines = session.scalars(select(ProductionOrderLine).where(ProductionOrderLine.order_id == work.id,
+        ProductionOrderLine.tenant_id == ins.tenant_id, ProductionOrderLine.is_deleted.is_(False))).all()
+    from app.modules.production.service import _line_is_complete
+    targets = [line for line in lines if not ins.item or line.name == ins.item]
+    return not targets or not all(_line_is_complete(session, line.id) for line in targets)
+
+
+def reopen_failed(session, *, tenant_id, public_id, mode, notes=None, assigned_to=None, due_date=None):
+    from fastapi import HTTPException
+    from app.models.quality import Inspection
+    from app.models.procurement import PurchaseOrder
+    from app.models.production import ProductionStage
+    from app.modules.production import repository as production
+    import datetime
+    tid = _tid(tenant_id)
+    parent = session.scalar(select(Inspection).where(Inspection.public_id == UUID(str(public_id)),
+        Inspection.tenant_id == tid, Inspection.is_deleted.is_(False)).with_for_update())
     if parent is None:
-        return None
+        raise HTTPException(404, "Inspection not found")
     if parent.result != "Fail":
-        return {"error": "not_failed"}
-    child = repo.create_reinspection(session, tenant_id=_tid(tenant_id), parent=parent)
-    # Mark the original's disposition as Re-inspection if not already dispositioned.
-    if not parent.disposition:
-        repo.set_disposition(session, public_id=public_id, disposition="Re-inspection",
-                             notes=parent.disposition_notes, assigned_to=parent.assigned_to,
-                             due_date=parent.due_date)
-    return {"inspection": child}
+        raise HTTPException(409, "Only a failed inspection can be reopened.")
+    parsed_due = None
+    if due_date:
+        try:
+            parsed_due = datetime.date.fromisoformat(due_date)
+        except ValueError:
+            raise HTTPException(422, "Enter a valid corrective-action due date.")
+    child = session.scalar(select(Inspection).where(Inspection.parent_inspection_id == parent.id,
+        Inspection.tenant_id == tid, Inspection.is_deleted.is_(False)).order_by(Inspection.id).limit(1))
+    if child:
+        if (parent.disposition == "Rework") != (mode == "production"):
+            raise HTTPException(409, "This failure already has a recovery action. Open its new inspection.")
+        return {"inspection": child, "production": production_for_inspection(session, parent)}
+    work = production_for_inspection(session, parent)
+    if work:
+        work = session.scalar(select(ProductionOrder).where(ProductionOrder.id == work.id,
+            ProductionOrder.tenant_id == tid).with_for_update())
+        po = session.get(PurchaseOrder, work.purchase_order_id) if work.purchase_order_id else None
+        if po and po.inventory_received:
+            raise HTTPException(409, "This PO has already entered inventory; reconcile received stock before reopening it.")
+    if mode == "production":
+        if work is None:
+            raise HTTPException(409, "This inspection has no production TNA to reopen.")
+        lines = [line for line in production.list_lines(session, work.id) if not parent.item or line.name == parent.item]
+        if not lines:
+            raise HTTPException(409, "Production item not found")
+        from app.modules.production.service import STAGES
+        for line in lines:
+            old = production.list_line_stages(session, line.id)
+            specs = [(s.name, s.duration_days, s.worker) for s in old] or [(name, 1, None) for name in STAGES]
+            for stage in old:
+                stage.is_deleted = True
+            cursor = datetime.date.today()
+            for seq, (name, days, worker) in enumerate(specs, 1):
+                end = cursor + datetime.timedelta(days=days)
+                session.add(ProductionStage(tenant_id=tid, order_id=work.id, line_id=line.id,
+                    seq=seq, name=name, duration_days=days, worker=worker, status="Pending", start_on=cursor, end_on=end))
+                cursor = end
+        session.flush()
+        production._recompute_order(session, work.id)
+    parent.disposition = "Rework" if mode == "production" else "Re-inspection"
+    if notes is not None:
+        parent.disposition_notes = notes.strip() or None
+    if assigned_to is not None:
+        parent.assigned_to = assigned_to.strip() or None
+    if due_date is not None:
+        parent.due_date = parsed_due
+    child = repo.create_reinspection(session, tenant_id=tid, parent=parent)
+    session.flush()
+    return {"inspection": child, "production": work}
 
 
 def ai_insights(session):
@@ -287,6 +391,9 @@ def complete_inspection(session, *, public_id):
         return None
     if ins.result != "In Progress":
         return {"error": "not_in_progress"}
+    if inspection_waits_for_rework(session, ins):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Complete the reopened production TNA before completing reinspection.")
     checks = repo.list_checks(session, inspection_id=ins.id)
     if not checks:
         return {"error": "no_checks"}
@@ -307,13 +414,24 @@ def complete_inspection(session, *, public_id):
     ins.result = result
     ins.finalized_at = _dt.datetime.utcnow()
     session.flush()
+    if result == "Pass" and ins.stage == "Final":
+        from app.modules.sales import fulfillment
+        fulfillment.receive_inspected_production(session, tenant_id=ins.tenant_id, order_ref=ins.order_ref)
     return {"inspection": ins, "result": result,
             "reason": "Checklist failure" if checklist_fail else
                       ("AQL exceeded" if aql_exceeded else "Within acceptance criteria")}
 
 
-def set_result(session, *, public_id, status):
-    return repo.set_result(session, public_id=public_id, result=status)
+def set_result(session, *, public_id, status, tenant_id=None):
+    current = repo.get_inspection(session, public_id=public_id)
+    if current and status == "Pass" and inspection_waits_for_rework(session, current):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Complete the reopened production TNA before passing reinspection.")
+    ins = repo.set_result(session, public_id=public_id, result=status)
+    if ins is not None and status == "Pass" and ins.stage == "Final":
+        from app.modules.sales import fulfillment
+        fulfillment.receive_inspected_production(session, tenant_id=tenant_id or ins.tenant_id, order_ref=ins.order_ref)
+    return ins
 
 
 def pass_and_ship(session, *, tenant_id, public_id, carrier, destination):
@@ -329,8 +447,26 @@ def pass_and_ship(session, *, tenant_id, public_id, carrier, destination):
     if ins.result == "Pending":
         # Can't create a shipment straight from a never-started inspection.
         return {"error": "not_started", "inspection": ins}
+    if inspection_waits_for_rework(session, ins):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Complete the reopened production TNA before passing reinspection.")
     from app.modules.shipments import repository as ship_repo
     ins = repo.set_result(session, public_id=public_id, result="Pass")
+
+    # Sales shortage production replenishes inventory; it never ships alone.
+    from sqlalchemy import select
+    from app.models.production import ProductionOrder
+    from app.models.procurement import PurchaseOrder
+    from app.modules.sales import fulfillment
+    source_po = session.scalar(select(PurchaseOrder).join(ProductionOrder,
+        ProductionOrder.purchase_order_id == PurchaseOrder.id).where(
+        ProductionOrder.order_no == ins.order_ref, ProductionOrder.tenant_id == _tid(tenant_id),
+        PurchaseOrder.tenant_id == _tid(tenant_id)))
+    if source_po is not None:
+        shipment = fulfillment.receive_inspected_production(session, tenant_id=tenant_id, order_ref=ins.order_ref)
+        if shipment:
+            repo.link_shipment(session, ins=ins, shipment_no=shipment.shipment_no)
+        return {"inspection": ins, "shipment_no": shipment.shipment_no if shipment else None}
 
     # Order-level gate: a shipment is only created once EVERY item's inspection
     # on this order is a FINAL-stage Pass. A passed Pre-Production / In-line item
@@ -356,6 +492,46 @@ _STATUS_STEP = {"Pending": "Sampling", "In Progress": "Inspection",
 
 def _iso(d) -> str | None:
     return d.isoformat() if d else None
+
+
+def size_breakdown(session, ins):
+    """The inspected item's actual production quantities, never current stock."""
+    from math import gcd
+    from functools import reduce
+    from app.models.procurement import PurchaseOrderLine
+    from app.models.sales import SalesOrderLine
+    from app.modules.sales.service import _size_rank
+    work = production_for_inspection(session, ins)
+    if work is None:
+        return {"sizes": [], "rows": [], "totals": [], "total": 0, "ratio": [], "source": "Unavailable"}
+    if work.purchase_order_id:
+        source = "Purchase order"
+        lines = session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.po_id == work.purchase_order_id,
+            PurchaseOrderLine.tenant_id == ins.tenant_id)).all()
+    elif work.sales_order_id:
+        source = "Sales order"
+        lines = session.scalars(select(SalesOrderLine).where(SalesOrderLine.order_id == work.sales_order_id,
+            SalesOrderLine.tenant_id == ins.tenant_id)).all()
+    else:
+        source = "Production"
+        lines = session.scalars(select(ProductionOrderLine).where(ProductionOrderLine.order_id == work.id,
+            ProductionOrderLine.tenant_id == ins.tenant_id, ProductionOrderLine.is_deleted.is_(False))).all()
+    groups, size_names = {}, set()
+    for line in lines:
+        if ins.item and line.name != ins.item:
+            continue
+        color, size = (line.color or "Unspecified").strip(), (line.size or "Unspecified").strip()
+        key = (line.name, color)
+        cells = groups.setdefault(key, {})
+        cells[size] = cells.get(size, 0) + int(line.qty or 0)
+        size_names.add(size)
+    sizes = sorted(size_names, key=lambda size: (_size_rank(size), size))
+    rows = [{"article": name, "color": color, "quantities": [cells.get(size, 0) for size in sizes],
+             "total": sum(cells.values())} for (name, color), cells in groups.items()]
+    totals = [sum(row["quantities"][i] for row in rows) for i in range(len(sizes))]
+    divisor = reduce(gcd, totals, 0) or 1
+    return {"sizes": sizes, "rows": rows, "totals": totals, "total": sum(totals),
+            "ratio": [qty // divisor for qty in totals], "source": source}
 
 
 def _build_workspace(session: Session, ins, *, focus_id: str) -> dict:
@@ -413,6 +589,7 @@ def _build_workspace(session: Session, ins, *, focus_id: str) -> dict:
 
     return {
             "publicId": str(ins.public_id),
+            "sizeBreakdown": size_breakdown(session, ins),
             "item": ins.item or ins.product or "Item",
             "header": {
                 "inspectionNo": ins.inspection_no or "—",
@@ -442,7 +619,9 @@ def _build_workspace(session: Session, ins, *, focus_id: str) -> dict:
                 "evaluation": evaluation,
             },
             "shipmentRef": ins.shipment_ref,
-            "canStart": ins.result == "Pending",
+            "canStart": ins.result == "Pending" and not inspection_waits_for_rework(session, ins),
+            "waitingForTNA": inspection_waits_for_rework(session, ins),
+            "canReopenProduction": production_for_inspection(session, ins) is not None,
             "canDecide": ins.result == "In Progress",
             "canDispose": ins.result == "Fail",
             "disposition": ins.disposition,
@@ -514,23 +693,48 @@ def inspection_detail(session: Session, *, public_id: str) -> dict | None:
             seen[base] = seen.get(base, 0) + 1
             it["tabLabel"] = base if seen[base] == 1 else f"{base} ({seen[base]})"
 
-    status_label, status_tone = _order_status(all_items)
+    # Historical failures remain visible, but only each item's latest run
+    # contributes to current order status and clearance.
+    latest = {}
+    for it in items:
+        if it["header"]["result"] != "Cancelled":
+            latest[(it["item"], it["header"]["stage"])] = it
+    current_items = list(latest.values())
+    # Show current runs as working tabs. Direct links retain historical details.
+    all_items = current_items + placeholders
+    focused = next((it for it in items if it["publicId"] == str(public_id)), None)
+    if focused and focused not in current_items:
+        focused["historical"] = True
+        focused["tabLabel"] = f"History · {focused['header']['inspectionNo']}"
+        all_items.insert(0, focused)
+    counts = {}
+    for it in current_items:
+        counts[it["item"]] = counts.get(it["item"], 0) + 1
+    for it in current_items:
+        it["tabLabel"] = it["item"] if counts[it["item"]] == 1 else f"{it['item']} · {it['header']['stage']}"
+    status_label, status_tone = _order_status(current_items + placeholders)
     # "Cleared" for shipment = a FINAL-stage Pass inspection (not a placeholder,
     # not Pre-Production/In-line). Every order item must be cleared to ship.
     def _cleared(it: dict) -> bool:
         return (not it.get("placeholder")
                 and it["header"]["result"] == "Pass" and it["header"]["stage"] == "Final")
     if order_names:
-        cleared_names = {it["item"] for it in items if _cleared(it)}
+        cleared_names = {it["item"] for it in current_items if _cleared(it)}
         total = len(set(order_names))
         passed = len(set(order_names) & cleared_names)
         all_passed = not placeholders and set(order_names).issubset(cleared_names)
     else:
-        total = len(items)
-        passed = sum(1 for it in items if _cleared(it))
-        all_passed = bool(items) and passed == total
+        total = len(current_items)
+        passed = sum(1 for it in current_items if _cleared(it))
+        all_passed = bool(current_items) and passed == total
     ship_ref = next((it["shipmentRef"] for it in items if it.get("shipmentRef")), None)
-    ship_target = next((it["publicId"] for it in items if _cleared(it)),
+    from app.models.procurement import PurchaseOrder
+    from app.models.production import ProductionOrder
+    source_po = session.scalar(select(PurchaseOrder).join(ProductionOrder,
+        ProductionOrder.purchase_order_id == PurchaseOrder.id).where(
+        ProductionOrder.order_no == focus.order_ref, ProductionOrder.tenant_id == focus.tenant_id,
+        PurchaseOrder.tenant_id == focus.tenant_id))
+    ship_target = next((it["publicId"] for it in current_items if _cleared(it)),
                        items[0]["publicId"] if items else None)
     return {
         "variant": "inspection",
@@ -540,7 +744,7 @@ def inspection_detail(session: Session, *, public_id: str) -> dict | None:
         "statusTone": status_tone,
         "meta": [
             {"k": "Order", "v": focus.order_ref or "—"},
-            {"k": "Items", "v": str(len(all_items))},
+            {"k": "Items", "v": str(len({it["item"] for it in current_items + placeholders}))},
             {"k": "Passed", "v": f"{passed}/{total}"},
             {"k": "Stage", "v": focus.stage or "—"},
         ],
@@ -550,6 +754,8 @@ def inspection_detail(session: Session, *, public_id: str) -> dict | None:
             # Shipment is order-level: unlocked only when EVERY item is a
             # Final-stage pass (idempotent /pass links the shipment back).
             "shipment": {
+                "replenishmentPO": {"publicId": str(source_po.public_id), "poNo": source_po.po_no,
+                                    "received": source_po.inventory_received} if source_po else None,
                 "allPassed": all_passed,
                 "passedCount": passed,
                 "total": total,

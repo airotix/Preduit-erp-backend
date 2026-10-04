@@ -14,12 +14,14 @@ from app.presenters.screen import board_config, initials, list_config, text_cell
 
 _TYPE_TONE = {"Wholesale": "navy", "Retail": "neutral"}
 _CHANNEL_TONE = {"Wholesale": "navy", "Online": "green", "Marketplace": "amber", "Retail": "neutral"}
-_ORDER_STATUS_TONE = {"New": "gray", "Packed": "navy", "Shipped": "green", "Cancelled": "red"}
+_ORDER_STATUS_TONE = {"New": "gray", "PO needed": "amber", "Awaiting stock": "amber", "Packed": "navy", "Shipped": "green", "Cancelled": "red"}
 _INV_STATUS_TONE = {"Open": "amber", "Paid": "green", "Overdue": "red"}
 _RET_STATUS_TONE = {"Inspecting": "amber", "Refunded": "green", "Rejected": "red"}
 
 # Fulfillment board columns: (status, title, accent, tone, metaIcon)
 _BOARD_COLUMNS = [
+    ("PO needed", "PO needed", "#D29A22", "amber", "package"),
+    ("Awaiting stock", "Awaiting stock", "#D29A22", "amber", "package"),
     ("New", "New", "#9499A6", "neutral", "package"),
     ("Packed", "Packed", "#3A4256", "navy", "package"),
     ("Shipped", "Shipped", "#2E9E6B", "green", "truck"),
@@ -141,10 +143,10 @@ def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreat
         session, tenant_id=tid, customer_id=customer_id, customer_name=payload.customer,
         channel=payload.channel, lines=lines,
     )
-    # Reserve stock for the order's lines (best-effort; released + relieved when
-    # the order ships).
-    from app.modules.inventory import service as inv_service
-    inv_service.reserve_order_stock(session, tenant_id=tid, lines=lines)
+    from app.modules.sales import fulfillment
+    order.fulfillment_tracked = True
+    session.flush()
+    fulfillment.refresh_order(session, order)
     # Raise a receivable for the order so it lands on the customer ledger as a
     # Debit (posted to the GL). Payment (Credit) is confirmed separately via the
     # settle endpoint from the New Order payment modal.
@@ -166,24 +168,6 @@ def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreat
     inv_draft = build_sales_invoice_draft(session, order_no=order.order_no or "", invoice_type=inv_type)
     if inv_draft is not None:
         create_sales_invoice_doc(session, tenant_id=tid, data=inv_draft)
-    # Kick off production: one work order for the whole sales order, with one
-    # production line per distinct style (each gets its own timeline), linked
-    # back so its detail can show the order's line items (Production → Orders).
-    from app.modules.production import repository as prod_repo
-    total_qty = sum(int(l["qty"] or 0) for l in lines)
-    style_qty: dict[str, int] = {}
-    for l in lines:
-        nm = (l["name"] or "").strip()
-        if nm:
-            style_qty[nm] = style_qty.get(nm, 0) + int(l["qty"] or 0)
-    if total_qty > 0 and style_qty:
-        names = list(style_qty)
-        style_label = names[0] if len(names) == 1 else f"{names[0]} +{len(names) - 1} more"
-        po = prod_repo.create_porder(session, tenant_id=tid, style=style_label, factory=None,
-                                     qty=total_qty, sales_order_id=order.id)
-        for style, qty in style_qty.items():
-            prod_repo.create_porder_line(session, tenant_id=tid, order_id=po.id,
-                                         name=style, qty=qty)
     return {
         "order": order,
         "total": order_total,
@@ -336,6 +320,36 @@ def returns_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dic
 
 
 def set_order_status(session, *, public_id, status):
+    from app.models.sales import SalesOrder
+    from sqlalchemy import select
+    from fastapi import HTTPException
+    from app.modules.sales import fulfillment
+    order = session.scalar(select(SalesOrder).where(SalesOrder.public_id == UUID(str(public_id)),
+        SalesOrder.is_deleted.is_(False)).with_for_update().execution_options(populate_existing=True))
+    if order is not None and order.fulfillment_tracked:
+        if status not in ("New", "Packed", "Shipped", "Cancelled"):
+            raise HTTPException(400, "Stock statuses are set automatically.")
+        if order.status in ("Cancelled", "Shipped") and status != order.status:
+            raise HTTPException(409, "A shipped or cancelled order cannot be reopened.")
+        if status == order.status:
+            return order
+        if status == "Cancelled":
+            fulfillment.release_holds(session, order)
+            from app.models.shipments import Shipment
+            for shipment in session.scalars(select(Shipment).where(Shipment.sales_order_id == order.id,
+                Shipment.tenant_id == order.tenant_id, Shipment.is_deleted.is_(False))).all():
+                shipment.status = "Cancelled"
+        elif status == "Shipped":
+            fulfillment.complete_shipment(session, order)
+            from app.models.shipments import Shipment
+            for shipment in session.scalars(select(Shipment).where(Shipment.sales_order_id == order.id,
+                Shipment.tenant_id == order.tenant_id, Shipment.is_deleted.is_(False))).all():
+                shipment.status = "Delivered"
+        elif status in ("New", "Packed") and any(r["missing"] for r in fulfillment.stock_summary(session, order)):
+            raise HTTPException(409, "This order is waiting for stock.")
+        order.status = status
+        session.flush()
+        return order
     return repo.set_order_status(session, public_id=public_id, status=status)
 
 
@@ -382,6 +396,7 @@ _ORDER_STAGES = ["New", "Packed", "Shipped"]
 
 
 def order_detail(session: Session, *, public_id: str) -> dict | None:
+    from app.modules.sales import fulfillment
     data = repo.get_order_detail(session, public_id=public_id)
     if data is None:
         return None
@@ -394,6 +409,7 @@ def order_detail(session: Session, *, public_id: str) -> dict | None:
                 for i, (ic, tn, ti) in enumerate(stages)]
     return {
         "variant": "order",
+        "fulfillment": fulfillment.fulfillment_detail(session, o),
         "ref": f"#{o.order_no}" if o.order_no else "—",
         "title": o.customer_name,
         "statusLabel": o.status,
@@ -430,6 +446,8 @@ def invoice_detail(session: Session, *, public_id: str) -> dict | None:
     if data is None:
         return None
     inv, lines, cust = data["invoice"], data["lines"], data["customer"]
+    from app.modules.invoice_banking import company_bank
+    banking = company_bank(repo.company_info(session))
     subtotal = sum((l["line_total"] or 0) for l in lines)
     paid = inv.status == "Paid"
     balance = 0 if paid else (inv.amount or 0)
@@ -461,6 +479,8 @@ def invoice_detail(session: Session, *, public_id: str) -> dict | None:
             "partyTitle": "Billed to",
             "timeline": timeline,
             "party": _party(cust, inv.customer_name),
+            "bankDetails": [{"k": label, "v": banking[key]} for label, key in
+                [("Account title", "title"), ("Bank", "bank"), ("Account", "account"), ("IBAN", "iban"), ("SWIFT", "swift")]],
         },
     }
 
@@ -741,7 +761,10 @@ def get_sales_invoice_doc(session: Session, *, public_id: str) -> dict | None:
     inv = repo.get_sales_invoice(session, public_id=public_id)
     if inv is None:
         return None
-    return {**_sinv_summary(inv), "data": json.loads(inv.data)}
+    from app.modules.invoice_banking import company_bank, fill_missing
+    data = json.loads(inv.data)
+    data["remit"] = fill_missing(data.get("remit"), company_bank(repo.company_info(session)))
+    return {**_sinv_summary(inv), "data": data}
 
 
 def update_sales_invoice_doc(session: Session, *, public_id: str, data: dict) -> dict | None:

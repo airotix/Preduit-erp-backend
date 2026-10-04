@@ -1,7 +1,7 @@
 """Inventory ORM models."""
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, Integer, String, Uuid, text
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, String, UniqueConstraint, CheckConstraint, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -29,6 +29,20 @@ class StockLevel(Base):
     location_id: Mapped[int] = mapped_column(BigInteger)
     on_hand: Mapped[int] = mapped_column(Integer, default=0)
     reserved: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class OrderStockReservation(Base):
+    __tablename__ = "order_stock_reservations"
+    __table_args__ = (
+        UniqueConstraint("order_line_id", "stock_level_id"),
+        CheckConstraint("qty > 0"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("sales_orders.id"))
+    order_line_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("sales_order_lines.id"))
+    stock_level_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stock_levels.id"))
+    qty: Mapped[int] = mapped_column(Integer)
 
 
 class StockTransfer(Base):

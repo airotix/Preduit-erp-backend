@@ -43,21 +43,25 @@ def overview_metrics(session: Session) -> dict:
     cash_count = sum(1 for m in mags if _is_cash(m))
 
     # AR — unpaid customer invoices.
-    ar_rows = session.execute(
-        select(Invoice.amount).where(
+    ar_docs = session.execute(
+        select(Invoice).where(
             Invoice.is_deleted == False,  # noqa: E712
             Invoice.status.notin_(["Paid", "Void"]),
         )
     ).scalars().all()
+    ar_rows = [remaining_invoice(session, doc) for doc in ar_docs]
+    ar_rows = [amount for amount in ar_rows if amount > 0]
     ar_total = float(sum(ar_rows) or 0)
 
     # AP — unpaid supplier bills.
-    ap_rows = session.execute(
-        select(SupplierBill.amount).where(
+    ap_docs = session.execute(
+        select(SupplierBill).where(
             SupplierBill.is_deleted == False,  # noqa: E712
             SupplierBill.status != "Paid",
         )
     ).scalars().all()
+    ap_rows = [remaining_bill(session, doc) for doc in ap_docs]
+    ap_rows = [amount for amount in ap_rows if amount > 0]
     ap_total = float(sum(ap_rows) or 0)
 
     revenue = _sum(lambda m: m["acct_type"] in ("Income", "Revenue"))
@@ -92,28 +96,27 @@ def revenue_by_month(session: Session, *, months: int = 6) -> list[dict]:
     return [{"label": _MONTHS[m - 1], "revenue": agg[(y, m)]} for (y, m) in ordered]
 
 
-def recent_journal_lines(session: Session, *, limit: int = 6) -> list[dict]:
-    """Most recent journal lines (one row per posting) for the Overview feed."""
-    entries = session.execute(
-        select(JournalEntry.id, JournalEntry.entry_no, JournalEntry.entry_date)
-        .where(JournalEntry.is_deleted == False)  # noqa: E712
-        .order_by(JournalEntry.id.desc()).limit(limit)
-    ).all()
-    out: list[dict] = []
-    for eid, entry_no, entry_date in entries:
-        for ln in session.execute(
-            select(JournalLine.account, JournalLine.description, JournalLine.debit, JournalLine.credit)
-            .where(JournalLine.entry_id == eid).order_by(JournalLine.id)
-        ):
-            m = ln._mapping
-            out.append({
-                "date": entry_date, "entry": entry_no, "account": m["account"],
-                "memo": m["description"], "debit": float(m["debit"] or 0),
-                "credit": float(m["credit"] or 0),
-            })
-            if len(out) >= limit:
-                return out
-    return out
+def recent_journal_lines(session: Session, *, limit: int = 6, tenant_id=None) -> list[dict]:
+    """Recent posting lines, with an explicit summary for journals without lines.
+
+    Legacy/simple journal forms save totals on the header only. These must not
+    disappear from the feed or exhaust a header limit before any lines are read.
+    """
+    stmt = (select(JournalEntry, JournalLine)
+        .outerjoin(JournalLine, and_(JournalLine.entry_id == JournalEntry.id,
+                                    JournalLine.tenant_id == JournalEntry.tenant_id))
+        .where(JournalEntry.is_deleted.is_(False))
+        .order_by(JournalEntry.id.desc(), JournalLine.id.asc()).limit(limit))
+    if tenant_id is not None:
+        stmt = stmt.where(JournalEntry.tenant_id == UUID(str(tenant_id)))
+    return [{
+        "date": entry.entry_date or (entry.entry_on.isoformat() if entry.entry_on else None),
+        "entry": entry.entry_no,
+        "account": line.account if line is not None else "Summary only",
+        "memo": (line.description if line is not None else None) or entry.memo,
+        "debit": float((line.debit if line is not None else entry.total_debit) or 0),
+        "credit": float((line.credit if line is not None else entry.total_credit) or 0),
+    } for entry, line in session.execute(stmt).all()]
 
 
 def _list(session, columns, model, order, limit, offset):
@@ -250,6 +253,7 @@ def _apply_payment_fields(p: Payment, *, party, amount, pay_type, method, refere
     p.amount = amount
     p.pay_type = pay_type
     p.method = method
+    p.payment_type = "cash" if (method or "").strip().lower() == "cash" else "bank"
     p.reference = reference
     p.allocated_to = allocated_to
     p.pay_date = pay_date
@@ -314,16 +318,18 @@ def list_ar_aging(session: Session) -> list[dict]:
     """Live AR aging: unpaid invoices bucketed by how overdue they are."""
     today = datetime.date.today()
     stmt = (
-        select(Invoice.customer_name, Customer.region, Invoice.amount, Invoice.due_on)
+        select(Invoice, Customer.region)
         .outerjoin(Customer, Customer.id == Invoice.customer_id)
-        .where(Invoice.status != "Paid", Invoice.is_deleted == False)  # noqa: E712
+        .where(Invoice.status.notin_(["Paid", "Void"]), Invoice.is_deleted == False)  # noqa: E712
     )
     agg: dict[tuple, dict] = {}
-    for r in session.execute(stmt):
-        m = r._mapping
-        k = (m["customer_name"], m["region"])
-        row = agg.setdefault(k, {"customer_name": m["customer_name"], "region": m["region"], **_EMPTY_BUCKETS})
-        row[_bucket(m["due_on"], today)] += float(m["amount"] or 0)
+    for doc, region in session.execute(stmt):
+        amount = remaining_invoice(session, doc)
+        if amount <= 0:
+            continue
+        k = (doc.customer_name, region)
+        row = agg.setdefault(k, {"customer_name": doc.customer_name, "region": region, **_EMPTY_BUCKETS})
+        row[_bucket(doc.due_on, today)] += amount
     return sorted(agg.values(), key=lambda x: x["customer_name"])
 
 
@@ -331,16 +337,18 @@ def list_ap_aging(session: Session) -> list[dict]:
     """Live AP aging: unpaid supplier bills (Open or Scheduled) bucketed by age."""
     today = datetime.date.today()
     stmt = (
-        select(SupplierBill.supplier_name, Supplier.region, SupplierBill.amount, SupplierBill.due_on)
-        .outerjoin(Supplier, Supplier.name == SupplierBill.supplier_name)
+        select(SupplierBill, Supplier.region)
+        .outerjoin(Supplier, Supplier.id == SupplierBill.supplier_id)
         .where(SupplierBill.status != "Paid", SupplierBill.is_deleted == False)  # noqa: E712
     )
     agg: dict[tuple, dict] = {}
-    for r in session.execute(stmt):
-        m = r._mapping
-        k = (m["supplier_name"], m["region"])
-        row = agg.setdefault(k, {"supplier_name": m["supplier_name"], "region": m["region"], **_EMPTY_BUCKETS})
-        row[_bucket(m["due_on"], today)] += float(m["amount"] or 0)
+    for doc, region in session.execute(stmt):
+        amount = remaining_bill(session, doc)
+        if amount <= 0:
+            continue
+        k = (doc.supplier_name, region)
+        row = agg.setdefault(k, {"supplier_name": doc.supplier_name, "region": region, **_EMPTY_BUCKETS})
+        row[_bucket(doc.due_on, today)] += amount
     return sorted(agg.values(), key=lambda x: x["supplier_name"])
 
 
@@ -457,7 +465,7 @@ def _customer_entries(session: Session, customer_id: int, customer_name: str | N
                         "paid": inv.status == "Paid", "base_amount": float(inv.amount or 0)})
     for p in session.execute(
         select(Payment).where(
-            Payment.is_deleted == False, Payment.pay_type == "Receipt",  # noqa: E712
+            Payment.is_deleted == False, Payment.status == "Cleared", Payment.pay_type == "Receipt",  # noqa: E712
             or_(*pay_match),
         )
     ).scalars():
@@ -496,14 +504,14 @@ def _supplier_entries(session: Session, supplier_id: int, supplier_name: str | N
     ).scalars():
         entries.append({"date": b.issued_date or b.due_on, "ref": b.bill_no or "BILL",
                         "desc": b.po_ref or "Supplier bill",
-                        "debit": float(b.amount or 0), "credit": 0.0})
+                        "debit": 0.0, "credit": float(b.amount or 0)})
     for p in session.execute(
         select(Payment).where(
-            Payment.is_deleted == False,  # noqa: E712
+            Payment.is_deleted == False, Payment.status == "Cleared",  # noqa: E712
             Payment.pay_type.in_(["Disbursement", "Payment"]), or_(*pay_match))
     ).scalars():
         entries.append({"date": _parse_dm(p.pay_date), "ref": p.payment_no or "PAY",
-                        "desc": p.notes or "Payment", "debit": 0.0, "credit": float(p.amount or 0)})
+                        "desc": p.notes or "Payment", "debit": float(p.amount or 0), "credit": 0.0})
     for le in session.execute(
         select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
                                   LedgerEntry.supplier_id == supplier_id)
@@ -523,7 +531,7 @@ def customer_parties(session: Session) -> list[dict]:
         entries = _customer_entries(session, c.id, c.name)
         debit = sum(e["debit"] for e in entries)
         credit = sum(e["credit"] for e in entries)
-        bal = float(c.opening_balance or 0) + credit - debit
+        bal = float(c.opening_balance or 0) + debit - credit
         out.append({"public_id": str(c.public_id), "name": c.name, "code": c.code, "balance": bal})
     return out
 
@@ -566,7 +574,7 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
 
     receipts = session.execute(
         select(Payment).where(
-            Payment.is_deleted == False, Payment.pay_type == "Receipt",  # noqa: E712
+            Payment.is_deleted == False, Payment.status == "Cleared", Payment.pay_type == "Receipt",  # noqa: E712
             or_(and_(Payment.party_type == "customer", Payment.party_id == c.id),
                 Payment.party == c.name),
         )
@@ -689,35 +697,17 @@ def update_ledger_payment_type(session: Session, *, edit_type: str, public_id: s
 
 
 def cash_bank_ledger(session: Session, *, payment_type: str) -> list[dict]:
-    """All lines tagged Cash or Bank, across both customer and supplier ledgers —
-    invoices, bills, receipts/disbursements, credit notes, manual entries — using
-    the same debit/credit convention as customer_statement/supplier_statement so
-    it reads exactly like those ledgers, just consolidated across every party."""
+    """Cleared money movements and manual entries: inflow credit, outflow debit.
+    Unpaid invoices, payables and noncash credit notes are not bank/cash movements.
+    """
     rows: list[dict] = []
 
-    for inv in session.execute(
-        select(Invoice).where(Invoice.is_deleted == False,  # noqa: E712
-                              Invoice.payment_type == payment_type)
-    ).scalars():
-        rows.append({"date": inv.issued_date, "ref": inv.invoice_no or "INV",
-                     "party": inv.customer_name, "partyType": "customer", "source": "Invoice",
-                     "desc": inv.memo or "Sales invoice",
-                     "debit": float(inv.amount or 0), "credit": 0.0,
-                     "editType": "invoice", "editId": str(inv.public_id)})
-
-    for b in session.execute(
-        select(SupplierBill).where(SupplierBill.is_deleted == False,  # noqa: E712
-                                   SupplierBill.payment_type == payment_type)
-    ).scalars():
-        rows.append({"date": b.issued_date or b.due_on, "ref": b.bill_no or "BILL",
-                     "party": b.supplier_name, "partyType": "supplier", "source": "Bill",
-                     "desc": b.memo or b.po_ref or "Supplier bill",
-                     "debit": float(b.amount or 0), "credit": 0.0,
-                     "editType": "bill", "editId": str(b.public_id)})
-
     for p in session.execute(
-        select(Payment).where(Payment.is_deleted == False,  # noqa: E712
-                              Payment.payment_type == payment_type)
+        select(Payment).where(Payment.is_deleted == False, Payment.status == "Cleared",  # noqa: E712
+                              or_(Payment.payment_type == payment_type,
+                                  and_(Payment.payment_type.is_(None),
+                                       (func.lower(func.coalesce(Payment.method, "Bank")) == "cash" if payment_type == "cash"
+                                        else func.lower(func.coalesce(Payment.method, "Bank")) != "cash"))))
     ).scalars():
         is_receipt = p.pay_type == "Receipt"
         rows.append({"date": _parse_dm(p.pay_date),
@@ -725,18 +715,9 @@ def cash_bank_ledger(session: Session, *, payment_type: str) -> list[dict]:
                      "party": p.party, "partyType": p.party_type or ("customer" if is_receipt else "supplier"),
                      "source": "Receipt" if is_receipt else "Disbursement",
                      "desc": p.notes or ("Payment received" if is_receipt else "Payment"),
-                     "debit": 0.0, "credit": float(p.amount or 0),
+                     "debit": 0.0 if is_receipt else float(p.amount or 0),
+                     "credit": float(p.amount or 0) if is_receipt else 0.0,
                      "editType": "payment", "editId": str(p.public_id)})
-
-    for cn in session.execute(
-        select(CreditNote).where(CreditNote.is_deleted == False,  # noqa: E712
-                                 CreditNote.payment_type == payment_type)
-    ).scalars():
-        rows.append({"date": cn.cn_date, "ref": cn.cn_no or "CN",
-                     "party": cn.customer_name, "partyType": "customer", "source": "Credit note",
-                     "desc": cn.reason or "Credit note",
-                     "debit": 0.0, "credit": float(cn.amount or 0),
-                     "editType": "cn", "editId": str(cn.public_id)})
 
     entries = session.execute(
         select(LedgerEntry).where(LedgerEntry.is_deleted == False,  # noqa: E712
@@ -776,6 +757,22 @@ def cash_bank_ledger(session: Session, *, payment_type: str) -> list[dict]:
     return rows
 
 
+def remaining_invoice(session, invoice):
+    if invoice.status in ("Paid", "Void"):
+        return 0.0
+    applied = receipts_applied_to_invoice(session, invoice_no=invoice.invoice_no,
+        customer_id=invoice.customer_id, customer_name=invoice.customer_name)
+    return max(round(float(invoice.amount or 0) - applied, 2), 0.0)
+
+
+def remaining_bill(session, bill):
+    if bill.status == "Paid":
+        return 0.0
+    applied = disbursements_applied_to_bill(session, bill_no=bill.bill_no,
+        supplier_id=bill.supplier_id, supplier_name=bill.supplier_name)
+    return max(round(float(bill.amount or 0) - applied, 2), 0.0)
+
+
 def receipts_applied_to_invoice(session: Session, *, invoice_no: str | None,
                                 customer_id: int | None, customer_name: str | None) -> float:
     """Total receipts already allocated to a specific invoice for a customer."""
@@ -786,7 +783,7 @@ def receipts_applied_to_invoice(session: Session, *, invoice_no: str | None,
         party.append(Payment.party == customer_name)
     total = session.execute(
         select(func.coalesce(func.sum(Payment.amount), 0)).where(
-            Payment.is_deleted == False, Payment.pay_type == "Receipt",  # noqa: E712
+            Payment.is_deleted == False, Payment.status == "Cleared", Payment.pay_type == "Receipt",  # noqa: E712
             Payment.allocated_to == invoice_no, or_(*party),
         )
     ).scalar_one()
@@ -817,7 +814,7 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
 
     disbursements = session.execute(
         select(Payment).where(
-            Payment.is_deleted == False,  # noqa: E712
+            Payment.is_deleted == False, Payment.status == "Cleared",  # noqa: E712
             Payment.pay_type.in_(["Disbursement", "Payment"]),
             or_(and_(Payment.party_type == "supplier", Payment.party_id == s.id),
                 Payment.party == s.name),
@@ -831,10 +828,10 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
         allocated = bool(alloc and alloc in bill_nos)
         if allocated:  # tracked to compute the bill's paid/remaining status
             debit_by_bill[alloc] = debit_by_bill.get(alloc, 0.0) + amt
-        # Each payment is its own credit line, dated when recorded, referencing its bill.
+        # Each cleared payment is its own debit line, referencing its bill.
         extras.append({"date": _parse_dm(p.pay_date),
                        "ref": alloc if allocated else (p.payment_no or "PAY"),
-                       "desc": p.notes or "Payment", "debit": 0.0, "credit": amt,
+                       "desc": p.notes or "Payment", "debit": amt, "credit": 0.0,
                        "editType": "payment", "editId": str(p.public_id),
                        "paymentType": p.payment_type})
     for le in session.execute(
@@ -854,7 +851,7 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
         bill_rows.append({
             "date": b.issued_date or b.due_on, "ref": b.bill_no or "BILL",
             "desc": b.memo or b.po_ref or "Supplier bill",
-            "debit": amt, "credit": 0.0, "remaining": round(amt - applied, 2),
+            "debit": 0.0, "credit": amt, "remaining": max(round(amt - applied, 2), 0),
             "public_id": str(b.public_id), "editType": "bill", "editId": str(b.public_id),
             "paid": (b.status == "Paid") or (amt > 0 and applied >= amt),
             "paymentType": b.payment_type,
@@ -874,7 +871,7 @@ def supplier_by_public(session: Session, *, public_id: str) -> Supplier | None:
 def bill_by_public(session: Session, *, public_id: str) -> SupplierBill | None:
     return session.execute(
         select(SupplierBill).where(SupplierBill.public_id == public_id,
-                                   SupplierBill.is_deleted == False)  # noqa: E712
+                                   SupplierBill.is_deleted == False).with_for_update()  # noqa: E712
     ).scalar_one_or_none()
 
 
@@ -888,7 +885,7 @@ def disbursements_applied_to_bill(session: Session, *, bill_no: str | None,
         party.append(Payment.party == supplier_name)
     total = session.execute(
         select(func.coalesce(func.sum(Payment.amount), 0)).where(
-            Payment.is_deleted == False,  # noqa: E712
+            Payment.is_deleted == False, Payment.status == "Cleared",  # noqa: E712
             Payment.pay_type.in_(["Disbursement", "Payment"]),
             Payment.allocated_to == bill_no, or_(*party),
         )
@@ -941,7 +938,8 @@ def unposted_bills(session):
 
 
 def unposted_payments(session):
-    return _unposted(session, Payment)
+    return session.scalars(select(Payment).where(Payment.is_deleted.is_(False),
+        Payment.posted.is_(False), Payment.status == "Cleared")).all()
 
 
 def unposted_credit_notes(session):

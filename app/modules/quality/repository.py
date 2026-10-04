@@ -191,9 +191,9 @@ def defect_options(session: Session) -> list[dict]:
              "category": r.category, "severity": r.severity} for r in rows]
 
 
-def _defect_type_by_public(session: Session, public_id: str) -> DefectType | None:
+def _defect_type_by_public(session: Session, public_id: str, tenant_id: UUID) -> DefectType | None:
     return session.execute(
-        select(DefectType).where(DefectType.public_id == public_id,
+        select(DefectType).where(DefectType.public_id == UUID(str(public_id)), DefectType.tenant_id == tenant_id,
                                  DefectType.is_deleted == False)  # noqa: E712
     ).scalar_one_or_none()
 
@@ -220,7 +220,10 @@ def recompute_defect_count(session: Session, *, ins: Inspection) -> None:
 def add_defect(session: Session, *, tenant_id: UUID, ins: Inspection, defect_type_public: str | None,
                defect_name: str | None, qty_affected: int, location, description, corrective,
                image_doc_id: str | None = None) -> InspectionDefect:
-    dt = _defect_type_by_public(session, defect_type_public) if defect_type_public else None
+    dt = _defect_type_by_public(session, defect_type_public, tenant_id) if defect_type_public else None
+    if defect_type_public and dt is None:
+        from fastapi import HTTPException
+        raise HTTPException(404, "Defect type not found. Refresh the list or enter a defect name.")
     d = InspectionDefect(
         tenant_id=tenant_id, inspection_id=ins.id,
         defect_type_id=dt.id if dt else None,
@@ -345,7 +348,7 @@ def create_reinspection(session: Session, *, tenant_id: UUID, parent: Inspection
     context forward (its own id + result; history shares the order_ref)."""
     plan = aql_engine.sampling_plan(parent.prod_qty, parent.aql)
     ins = Inspection(
-        tenant_id=tenant_id, order_ref=parent.order_ref, stage=parent.stage, aql=plan["aql"],
+        tenant_id=tenant_id, order_ref=parent.order_ref, item=parent.item, stage=parent.stage, aql=plan["aql"],
         result="Pending", defect_count=0, sku=parent.sku, product=parent.product,
         batch_lot=parent.batch_lot, inspection_type=parent.inspection_type,
         prod_qty=parent.prod_qty, sample_size=plan["sampleSize"], max_defects=plan["maxDefects"],

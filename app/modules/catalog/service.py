@@ -2,6 +2,8 @@
 import uuid
 from uuid import UUID
 
+from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.audit import write_audit
@@ -19,6 +21,10 @@ _ATTR_TONE = {"Color": "navy", "Size": "neutral"}
 
 def _tid(tenant_id: str | UUID) -> UUID:
     return tenant_id if isinstance(tenant_id, uuid.UUID) else uuid.UUID(str(tenant_id))
+
+
+def list_seasons(session: Session, *, tenant_id: str | UUID) -> list[str]:
+    return repo.list_seasons(session, tenant_id=_tid(tenant_id))
 
 
 def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
@@ -95,8 +101,14 @@ def products_screen(session: Session, *, limit: int = 25, offset: int = 0) -> di
         ],
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
-        records=[{"title": r["title"], "category": r["category"],
-                  "season": r["season"], "status": r["status"]} for r in rows],
+        records=[{"title": r["title"], "sku": r["sku"] or "",
+                  "category": r["category"],
+                  "season": r["season"], "status": r["status"],
+                  "retailPrice": float(r["retail"]) if r["retail"] is not None else None,
+                  "onlinePrice": float(r["online"]) if r["online"] is not None else None,
+                  "wholesalePrice": float(r["wholesale"]) if r["wholesale"] is not None else None,
+                  "supplierPrice": float(r["supplier"]) if r["supplier"] is not None else None}
+                 for r in rows],
         search="Search products, SKU…", action="New product",
         filters=["Category", "Season", "Status"],
     )
@@ -106,32 +118,8 @@ _PRODUCT_STATUS_TONE = {"Active": "green", "Draft": "neutral", "Discontinued": "
 
 
 def save_product_matrix(session: Session, *, tenant_id, public_id: str, payload):
-    """Edit a product's variant matrix in place: upsert colors, variants and
-    per-(color,size) on-hand quantities. Mirrors the inventory stock editor."""
-    tid = _tid(tenant_id)
-    product = inv_repo.get_product_by_public_id(session, public_id=public_id)
-    if product is None:
-        return None
-    price, currency = inv_repo.variant_defaults(session, product_id=product.id)
-    for col in payload.colors:
-        name = (col.color or "").strip()
-        if not name:
-            continue
-        color = (inv_repo.find_attr_value(session, attr_type="Color", value=name)
-                 or inv_repo.create_color(session, tenant_id=tid, value=name, hex=col.hex))
-        for cell in col.cells:
-            if not (cell.size or "").strip():
-                continue
-            # Auto-create the size if the tenant hasn't set up its scale yet
-            # (mirrors colour creation) — otherwise the cell would be dropped.
-            size = (inv_repo.find_attr_value(session, attr_type="Size", value=cell.size)
-                    or inv_repo.create_size(session, tenant_id=tid, value=cell.size))
-            variant = inv_repo.find_or_create_variant(
-                session, tenant_id=tid, product_id=product.id, color_id=color.id,
-                size_id=size.id, price=price, currency=currency)
-            variant.qty_on_hand = int(cell.qty or 0)
-    session.flush()
-    return product
+    from app.modules.inventory.matrix import save_matrix
+    return save_matrix(session, tenant_id=tenant_id, public_id=public_id, payload=payload)
 
 
 def product_detail(session: Session, *, public_id: str) -> dict | None:
@@ -152,40 +140,14 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
     prices = {"retail": _minp("retail_price"), "wholesale": _minp("wholesale_price"),
               "online": _minp("online_price"), "supplier": _minp("supplier_price")}
 
-    # Full catalog size scale (XS…7XL) so the matrix shows every size column,
-    # with 0 where this product has no variant — matching the stock editor.
-    # Any size a variant uses that isn't in the catalog is appended.
-    sizes = repo.list_sizes(session)
-    for v in variants:
-        if v["size"] and v["size"] not in sizes:
-            sizes.append(v["size"])
-
-    # Colors in first-seen order, with swatch hex.
-    colors: dict[str, str] = {}
-    for v in variants:
-        if v["color"] and v["color"] not in colors:
-            colors[v["color"]] = v["color_hex"] or "#C9C2B3"
-
-    # On-hand units per (color, size) → matrix cells.
-    qty: dict[tuple[str, str], int] = {}
-    for v in variants:
-        if v["color"] and v["size"]:
-            qty[(v["color"], v["size"])] = qty.get((v["color"], v["size"]), 0) + (v["qty_on_hand"] or 0)
-
-    def _tone(q: int) -> str:
-        return "red" if q == 0 else "amber" if q < 40 else "neutral"
-
-    matrix = [
-        {
-            "name": color,
-            "hex": hex_,
-            "cells": [
-                {"q": qty.get((color, s), 0), "tone": _tone(qty.get((color, s), 0))}
-                for s in sizes
-            ],
-        }
-        for color, hex_ in colors.items()
-    ]
+    # Both screens derive their axes and quantities from the same active variants
+    # and stock levels, including variants with no inventory location yet.
+    from app.modules.inventory.service import stock_article_detail
+    stock = stock_article_detail(session, public_id=public_id)["stock"]
+    sizes = stock["sizes"]
+    matrix = [{"name": c["name"], "hex": c["hex"],
+               "cells": [{"q": q, "tone": "red" if q == 0 else "amber" if q < 40 else "neutral"}
+                         for q in c["cells"]]} for c in stock["colors"]]
 
     specs = [
         {"k": "Composition", "v": prod.composition or "—"},
@@ -241,21 +203,33 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
 
 def create_product(session: Session, *, tenant_id: str | UUID, payload: ProductCreate):
     tid = _tid(tenant_id)
+    sku = (payload.sku or "").strip()
+    if not sku:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "SKU ID is required")
+    if repo.sku_taken(session, sku=sku):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"SKU ID “{sku}” is already in use — choose a different one",
+        )
     category_id = repo.get_or_create_category(session, tenant_id=tid, name=payload.category)
     product = repo.create_product(
         session, tenant_id=tid, title=payload.title,
         category_id=category_id, season=payload.season, status=payload.status,
         image_url=payload.imageUrl,
     )
-    # Seed the first variant with an auto-generated SKU when any price is given.
-    if any(p is not None for p in (payload.retailPrice, payload.wholesalePrice,
-                                   payload.onlinePrice, payload.supplierPrice)):
+    # Always seed the first variant with the user-supplied SKU (prices optional).
+    try:
         repo.create_variant(
-            session, tenant_id=tid, product_id=product.id,
+            session, tenant_id=tid, product_id=product.id, sku=sku,
             retail=payload.retailPrice, wholesale=payload.wholesalePrice,
             online=payload.onlinePrice, supplier=payload.supplierPrice,
             currency_code=payload.currency_code,
         )
+    except IntegrityError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"SKU ID “{sku}” is already in use — choose a different one",
+        ) from exc
     write_audit(
         session, tenant_id=tid, action="CREATE", entity_type="product",
         entity_id=str(product.public_id), detail=f"Created product “{product.title}”",
@@ -279,9 +253,19 @@ def update_product(session: Session, *, tenant_id: str | UUID, public_id: str, p
                "care": payload.care, "origin": payload.origin,
                "hsCode": payload.hsCode, "weight": payload.weight},
     )
-    if product is not None:
-        write_audit(session, tenant_id=tid, action="UPDATE", entity_type="product",
-                    entity_id=str(product.public_id), detail=f"Updated product “{product.title}”")
+    if product is None:
+        return None
+    sku = (payload.sku or "").strip()
+    if sku:
+        if repo.sku_taken(session, sku=sku, exclude_product_id=product.id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"SKU ID “{sku}” is already in use — choose a different one",
+            )
+        repo.set_product_sku(session, product=product, sku=sku,
+                             currency_code=payload.currency_code)
+    write_audit(session, tenant_id=tid, action="UPDATE", entity_type="product",
+                entity_id=str(product.public_id), detail=f"Updated product “{product.title}”")
     return product
 
 
@@ -296,7 +280,6 @@ def categories_screen(session: Session, *, limit: int = 50, offset: int = 0) -> 
     grid = [
         [
             text_cell(r["name"], strong=True),
-            r["parent"] or "—",
             text_cell(str(r["products"] or 0), align="center", mono=True),
             text_cell(str(int(r["active"] or 0)), align="center", mono=True),
         ]
@@ -304,13 +287,13 @@ def categories_screen(session: Session, *, limit: int = 50, offset: int = 0) -> 
     ]
     return list_config(
         columns=[
-            {"label": "Category"}, {"label": "Parent"},
+            {"label": "Category"},
             {"label": "Products", "align": "center"},
             {"label": "Active", "align": "center"},
         ],
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
-        records=[{"name": r["name"], "parent": r["parent"] or "", "active": bool(r["is_active"])}
+        records=[{"name": r["name"], "active": bool(r["is_active"])}
                  for r in rows],
         search="Search categories…", action="New category", filters=[],
     )

@@ -106,6 +106,12 @@ def category_names(_: Principal = Depends(read), db: Session = Depends(tenant_db
     return service.list_category_names(db)
 
 
+@router.get("/seasons")
+def season_names(principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    """Previously saved season names for the product form's suggestions."""
+    return service.list_seasons(db, tenant_id=principal.tenant_id)
+
+
 @router.get("/categories/screen")
 def categories_screen(
     limit: int = Query(50, le=200), offset: int = Query(0, ge=0),

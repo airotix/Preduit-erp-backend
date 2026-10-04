@@ -1,16 +1,18 @@
 """Catalog API contracts (Pydantic v2), decoupled from ORM models."""
 from decimal import Decimal
 from uuid import UUID
+from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 
 class ProductCreate(BaseModel):
     """Matches the frontend 'New product' form. category/season are names;
-    price seeds the first variant (its SKU is auto-generated: SKU-000001…)."""
+    sku is required and must be unique per tenant (stored on the first variant)."""
     title: str = Field(min_length=1, max_length=200)
+    sku: str = Field(min_length=1, max_length=64)
     category: str | None = None
-    season: str | None = None
+    season: Annotated[str, StringConstraints(strip_whitespace=True, max_length=40)] | None = None
     status: str = "Draft"
     retailPrice: Decimal | None = None
     wholesalePrice: Decimal | None = None
@@ -29,7 +31,8 @@ class ProductCreate(BaseModel):
 
 
 class ProductUpdate(ProductCreate):
-    """Same field set; price optional (updates the first variant)."""
+    """Same field set; SKU optional so the detail editor can omit it."""
+    sku: str | None = Field(default=None, max_length=64)
 
 
 class ProductOut(BaseModel):

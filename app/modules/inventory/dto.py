@@ -57,14 +57,17 @@ class StatusUpdate(BaseModel):
 
 class MatrixCellIn(BaseModel):
     size: str = Field(min_length=1, max_length=60)
+    originalSize: str | None = Field(default=None, max_length=60)
     qty: int = Field(ge=0)
 
 
 class MatrixColorIn(BaseModel):
     color: str = Field(min_length=1, max_length=60)
+    originalColor: str | None = Field(default=None, max_length=60)
     hex: str | None = Field(default=None, max_length=9)
     cells: list[MatrixCellIn] = Field(default_factory=list)
 
 
 class MatrixUpdate(BaseModel):
     colors: list[MatrixColorIn] = Field(default_factory=list)
+    location: str | None = Field(default=None, min_length=1, max_length=120)

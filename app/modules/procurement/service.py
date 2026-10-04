@@ -4,9 +4,11 @@ import json
 import uuid
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.procurement import Supplier
+from app.models.production import ProductionOrder
 from app.modules.procurement import repository as repo
 from app.modules.procurement.dto import (
     GoodsReceiptCreate, PurchaseOrderCreate, SupplierCreate, SupplierUpdate,
@@ -126,23 +128,53 @@ def create_po(session: Session, *, tenant_id: str | UUID, payload: PurchaseOrder
         # on the supplier ledger — mirrors how a new customer is created on order.
         supplier = repo.create_supplier(session, tenant_id=tid, name=payload.supplier,
                                         region=None, lead_time=None, category=None)
-    lines = [{"name": l.name, "color": l.color, "sku": l.sku, "qty": l.qty, "price": l.price}
+    lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku, "qty": l.qty, "price": l.price}
              for l in payload.lines]
     po = repo.create_po(
         session, tenant_id=tid, supplier=supplier, supplier_name=payload.supplier,
         expected=payload.expected, lines=lines,
     )
-    # Raise a payable for the PO so it lands on the supplier ledger as a Credit
-    # (posted to the GL). Payment (Debit) is confirmed later via Record payment.
-    total = float(po.total or 0)
-    if total > 0:
-        from app.modules.finance import repository as fin_repo
-        from app.modules.finance import service as fin_service
-        due_on = datetime.date.today() + datetime.timedelta(days=30)
-        fin_repo.create_bill(session, tenant_id=tid, supplier_name=payload.supplier,
-                             po_ref=po.po_no, amount=po.total, due_on=due_on, status="Open")
-        fin_service.post_unposted(session, tenant_id=tid)
+    # The PO and its production work are committed together by tenant_db.
+    from app.modules.production import service as prod_service
+    prod_service.create_for_purchase_order(session, tenant_id=tid, purchase_order=po)
+    # Invoice generation creates/reuses and posts the payable atomically.
+    ensure_po_invoice(session, tenant_id=tid, po_id=po.id)
     return po
+
+
+def ensure_po_invoice(session, *, tenant_id, po_id):
+    """Serialize automatic generation per PO, including sales-linked POs."""
+    from fastapi import HTTPException
+    from app.models.procurement import PurchaseOrder, PoInvoice
+    tid = _tid(tenant_id)
+    po = session.scalar(select(PurchaseOrder).where(PurchaseOrder.id == po_id,
+        PurchaseOrder.tenant_id == tid, PurchaseOrder.is_deleted.is_(False)).with_for_update())
+    if po is None:
+        raise HTTPException(404, "Purchase order not found")
+    existing = session.scalar(select(PoInvoice).where(PoInvoice.tenant_id == tid,
+        PoInvoice.po_no == po.po_no, PoInvoice.is_deleted.is_(False)).limit(1))
+    if existing is not None:
+        ensure_invoice_payable(session, existing)
+        return False
+    draft = build_invoice_draft(session, po_no=po.po_no)
+    if draft is None:
+        raise HTTPException(409, f"Could not generate invoice for {po.po_no}.")
+    create_invoice(session, tenant_id=tid, data=draft)
+    return True
+
+
+def generate_missing_invoices(session, *, tenant_id):
+    from app.models.procurement import PurchaseOrder, PoInvoice
+    tid = _tid(tenant_id)
+    exists = select(PoInvoice.id).where(PoInvoice.tenant_id == tid,
+        PoInvoice.po_no == PurchaseOrder.po_no, PoInvoice.is_deleted.is_(False)).exists()
+    unlinked = select(PoInvoice.id).where(PoInvoice.tenant_id == tid,
+        PoInvoice.po_no == PurchaseOrder.po_no, PoInvoice.is_deleted.is_(False),
+        PoInvoice.supplier_bill_id.is_(None)).exists()
+    ids = session.scalars(select(PurchaseOrder.id).where(PurchaseOrder.tenant_id == tid,
+        PurchaseOrder.is_deleted.is_(False), (~exists) | unlinked).order_by(PurchaseOrder.id)).all()
+    generated = sum(ensure_po_invoice(session, tenant_id=tid, po_id=po_id) for po_id in ids)
+    return {"generated": generated}
 
 
 def _po_money(v) -> str:
@@ -162,6 +194,9 @@ def po_detail(session: Session, *, public_id: str) -> dict | None:
     idx = order.index(po.status) if po.status in order else 0
     timeline = [{"icon": ic, "tone": tn, "title": ti, "time": "", "done": i <= idx}
                 for i, (_, ic, tn, ti) in enumerate(stages)]
+    work = session.execute(select(ProductionOrder).where(
+        ProductionOrder.purchase_order_id == po.id, ProductionOrder.tenant_id == po.tenant_id,
+        ProductionOrder.is_deleted == False)).scalar_one_or_none()
     return {
         "variant": "order",  # reuse the doc (line-items) renderer
         "ref": po.po_no or "—",
@@ -175,6 +210,7 @@ def po_detail(session: Session, *, public_id: str) -> dict | None:
             {"k": "Total", "v": _po_money(po.total)},
         ],
         "tabs": ["Summary", "Items", "Activity"],
+        "productionOrder": {"publicId": str(work.public_id), "orderNo": work.order_no} if work else None,
         "doc": {
             "lines": [
                 {"name": l["name"],
@@ -252,6 +288,32 @@ def receipts_screen(session: Session, *, limit: int = 50, offset: int = 0) -> di
 
 def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsReceiptCreate):
     tid = _tid(tenant_id)
+    from sqlalchemy import select
+    from fastapi import HTTPException
+    from app.models.procurement import PurchaseOrder, PurchaseOrderLine, GoodsReceipt
+    from app.models.inventory import Location, StockLevel
+    from types import SimpleNamespace
+    from app.modules.sales import fulfillment
+    po = repo.po_by_no(session, po_no=payload.po) if payload.po else None
+    order = None
+    if po is not None:
+        if po.sales_order_id:
+            order = fulfillment.lock_order(session, tenant_id=tid, order_id=po.sales_order_id)
+        po = session.scalar(select(PurchaseOrder).where(PurchaseOrder.id == po.id,
+            PurchaseOrder.tenant_id == tid).with_for_update().execution_options(populate_existing=True))
+        if po is None:
+            raise HTTPException(404, "Purchase order not found")
+        if po.inventory_received:
+            return session.scalar(select(GoodsReceipt).where(GoodsReceipt.tenant_id == tid,
+                GoodsReceipt.po_ref == po.po_no).order_by(GoodsReceipt.id))
+        if order is not None and order.status == "Cancelled":
+            raise HTTPException(409, "This sales order has been cancelled.")
+        if not fulfillment.qc_cleared(session, po):
+            raise HTTPException(409, "Every production item must pass final QC before inventory receipt.")
+        location = session.scalar(select(Location).where(Location.tenant_id == tid,
+            Location.is_deleted.is_(False)).order_by(Location.id).limit(1))
+        if location is None:
+            raise HTTPException(409, "Create an inventory location before receiving this PO.")
     supplier = repo.find_supplier(session, name=payload.supplier)
     if supplier is None and (payload.supplier or "").strip():
         # Auto-register an unknown supplier on receipt too, so it always appears
@@ -263,23 +325,44 @@ def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsRec
         supplier_name=payload.supplier, lines=payload.lines,
     )
     # Receiving goods against a PO increments inventory for that PO's line items.
-    po = repo.po_by_no(session, po_no=payload.po) if payload.po else None
     if po is not None:
-        from app.modules.inventory import service as inv_service
-        inv_service.receive_stock_lines(session, tenant_id=tid,
-                                        lines=repo.po_lines(session, po_id=po.id))
+        for line in session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.po_id == po.id,
+            PurchaseOrderLine.tenant_id == tid).order_by(PurchaseOrderLine.id)).all():
+            variant = fulfillment.variant_for(session, order or SimpleNamespace(tenant_id=tid), line)
+            if variant is None:
+                raise HTTPException(409, f"Catalog variant missing for {line.name}; restore it before receipt.")
+            level = session.scalar(select(StockLevel).where(StockLevel.tenant_id == tid,
+                StockLevel.variant_id == variant.id, StockLevel.location_id == location.id).with_for_update().execution_options(populate_existing=True))
+            if level is None:
+                level = StockLevel(tenant_id=tid, variant_id=variant.id, location_id=location.id, on_hand=0, reserved=0)
+                session.add(level)
+            level.on_hand += line.qty
+            variant.status = "Active"
+            # Persist before resolving the next line: a PO may repeat a variant,
+            # and sessions disable autoflush while reading/locking stock rows.
+            session.flush()
+        po.inventory_received = True
+        po.status = "Received"
+        grn.status = "Received"
+        grn.received_count = grn.line_count
+        grn.received_date = datetime.date.today().strftime("%d %b %Y")
+        grn.location = location.name
+        session.flush()
+        if order is not None:
+            fulfillment.refresh_order(session, order)
     return grn
 
 
 def set_po_status(session, *, public_id, status, tenant_id=None):
+    from fastapi import HTTPException
+    data = repo.get_po_detail(session, public_id=public_id)
+    if data and data["po"].sales_order_id and status == "Received" and not data["po"].inventory_received:
+        raise HTTPException(409, "Use Receive against PO after final QC to receive this order's inventory.")
     po = repo.set_po_status(session, public_id=public_id, status=status)
     # On approval, auto-generate the commercial invoice for the PO (once) so it
     # shows up in the Invoices list immediately.
     if po is not None and status == "Approved" and tenant_id is not None:
-        if not repo.po_invoice_exists(session, po_no=po.po_no):
-            draft = build_invoice_draft(session, po_no=po.po_no)
-            if draft is not None:
-                create_invoice(session, tenant_id=tenant_id, data=draft)
+        ensure_po_invoice(session, tenant_id=tenant_id, po_id=po.id)
     return po
 
 
@@ -485,7 +568,7 @@ def receipt_detail(session: Session, *, public_id: str) -> dict | None:
             "lines": [_line(l) for l in lines],
             "note": (
                 f"Receiving against {g.po_ref or 'the PO'} posts received quantities into "
-                f"{g.location or 'inventory'} and accrues accounts payable. Outstanding units "
+                f"{g.location or 'inventory'}. The supplier invoice already created the payable. Outstanding units "
                 "stay open until fully received."
             ),
         },
@@ -618,15 +701,50 @@ def _persist_fields(data: dict) -> dict:
     return {
         "invoice_no": (data.get("invoiceNo") or "").strip() or None,
         "po_no": data.get("poNo"),
-        "supplier_name": (data.get("exporter") or {}).get("name"),
+        "supplier_name": (data.get("buyer") or {}).get("name"),
         "currency_code": (data.get("currency") or "USD")[:3],
         "total": float(totals.get("total") or 0),
     }
 
 
+def ensure_invoice_payable(session, invoice):
+    from fastapi import HTTPException
+    from app.models.finance import SupplierBill
+    from app.models.procurement import PurchaseOrder
+    from app.modules.finance import repository as finance_repo, service as finance
+    tid = invoice.tenant_id
+    if invoice.supplier_bill_id:
+        bill = session.scalar(select(SupplierBill).where(SupplierBill.id == invoice.supplier_bill_id,
+            SupplierBill.tenant_id == tid, SupplierBill.is_deleted.is_(False)))
+        if bill is None:
+            raise HTTPException(409, "The invoice's linked payable is missing; reconcile it before proceeding.")
+        return bill
+    if invoice.po_no:
+        session.scalar(select(PurchaseOrder).where(PurchaseOrder.tenant_id == tid,
+            PurchaseOrder.po_no == invoice.po_no).with_for_update())
+        # Reuse another invoice's payable for the same PO, or an older PO bill.
+        bills = session.scalars(select(SupplierBill).where(SupplierBill.tenant_id == tid,
+            SupplierBill.po_ref == invoice.po_no, SupplierBill.is_deleted.is_(False)).order_by(SupplierBill.id)).all()
+        if len(bills) > 1:
+            raise HTTPException(409, f"Multiple payables exist for {invoice.po_no}; reconcile them before linking the invoice.")
+        bill = bills[0] if bills else None
+    else:
+        bill = None
+    if bill is None and invoice.total > 0:
+        bill = finance_repo.create_bill(session, tenant_id=tid, supplier_name=invoice.supplier_name or "Supplier",
+            po_ref=invoice.po_no, amount=invoice.total,
+            due_on=datetime.date.today() + datetime.timedelta(days=30), status="Open")
+    if bill:
+        invoice.supplier_bill_id = bill.id
+        session.flush()
+        finance.post_unposted(session, tenant_id=tid)
+    return bill
+
+
 def create_invoice(session: Session, *, tenant_id, data: dict) -> dict:
     f = _persist_fields(data)
     inv = repo.create_po_invoice(session, tenant_id=_tid(tenant_id), data=json.dumps(data), **f)
+    ensure_invoice_payable(session, inv)
     return {"publicId": str(inv.public_id), "invoiceNo": inv.invoice_no}
 
 
@@ -634,7 +752,14 @@ def get_invoice(session: Session, *, public_id: str) -> dict | None:
     inv = repo.get_po_invoice(session, public_id=public_id)
     if inv is None:
         return None
-    return {**_invoice_summary(inv), "data": json.loads(inv.data)}
+    from app.modules.invoice_banking import fill_missing, supplier_bank
+    data = json.loads(inv.data)
+    po = repo.po_by_no(session, po_no=inv.po_no) if inv.po_no else None
+    supplier = session.get(Supplier, po.supplier_id) if po and po.supplier_id else repo.find_supplier(session, name=inv.supplier_name)
+    if supplier is not None and supplier.tenant_id != inv.tenant_id:
+        supplier = None
+    data["bank"] = fill_missing(data.get("bank"), supplier_bank(supplier, inv.supplier_name))
+    return {**_invoice_summary(inv), "data": data}
 
 
 def update_invoice(session: Session, *, public_id: str, data: dict) -> dict | None:
@@ -642,6 +767,13 @@ def update_invoice(session: Session, *, public_id: str, data: dict) -> dict | No
     if inv is None:
         return None
     f = _persist_fields(data)
+    if inv.supplier_bill_id and any((
+        f["po_no"] != inv.po_no, f["supplier_name"] != inv.supplier_name,
+        f["currency_code"] != inv.currency_code,
+        round(f["total"], 2) != round(float(inv.total or 0), 2),
+    )):
+        from fastapi import HTTPException
+        raise HTTPException(409, "This invoice has a finance payable. Reconcile that payable before changing its supplier, PO, currency or total. Other invoice details can still be edited.")
     inv.invoice_no = f["invoice_no"] or inv.invoice_no
     inv.po_no = f["po_no"]
     inv.supplier_name = f["supplier_name"]

@@ -23,6 +23,8 @@ class ProductionOrder(Base):
     stage: Mapped[str] = mapped_column(String(20), default="Trims")
     progress: Mapped[int] = mapped_column(Integer, default=0)
     sales_order_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    purchase_order_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("purchase_orders.id"), nullable=True, unique=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Relationship to lines (lazy dynamic for per-line queries)

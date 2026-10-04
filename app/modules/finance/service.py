@@ -3,6 +3,7 @@ import datetime
 import uuid
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.audit import write_audit
@@ -34,6 +35,7 @@ _PMT_TONE = {"Cleared": "green", "Pending": "amber", "Failed": "red"}
 _MONEY_KEYS = {
     "value", "revenue", "cogs", "gross", "opex", "tax", "net", "debit", "credit",
     "balance", "opening", "closing", "totalDebit", "totalCredit",
+    "customerDue", "customerCredit", "supplierDue", "supplierAdvance", "bankBalance", "cashBalance",
     # statement fields (Phase C)
     "amount", "totalRevenue", "totalExpense", "netProfit", "grossProfit",
     "operatingProfit", "totalAssets", "totalLiabilities", "totalEquity",
@@ -135,6 +137,15 @@ def post_unposted(session: Session, *, tenant_id) -> int:
     """Post every not-yet-posted invoice, bill, payment and credit note into the
     GL as a balanced journal. Idempotent (skips already-posted docs)."""
     tid = tenant_id if isinstance(tenant_id, uuid.UUID) else uuid.UUID(str(tenant_id))
+    # Repair older Pending/Failed payments that were posted before clearing.
+    from app.models.finance import Payment, JournalEntry
+    for stale in session.scalars(select(Payment).where(Payment.tenant_id == tid,
+        Payment.status != "Cleared", Payment.posted.is_(True))).all():
+        journal = session.get(JournalEntry, stale.gl_journal_id) if stale.gl_journal_id else None
+        if journal:
+            repo.reverse_journal(session, public_id=journal.public_id)
+        stale.posted, stale.gl_journal_id = False, None
+    session.flush()
     ar = repo.find_account(session, name_like="%receivable%")
     ap = repo.find_account(session, name_like="%payable%")
     revenue = repo.find_account(session, acct_type="Income") or repo.find_account(session, name_like="%revenue%")
@@ -160,7 +171,7 @@ def post_unposted(session: Session, *, tenant_id) -> int:
             amt = float(b.amount or 0)
             if amt <= 0:
                 continue
-            _post_lines(session, tid, entry_on=b.due_on,
+            _post_lines(session, tid, entry_on=b.issued_date or datetime.date.today(),
                         memo=f"Bill {b.bill_no or ''}".strip(),
                         lines=[{"account": _label(dr_bill), "debit": amt, "credit": 0},
                                {"account": _label(ap), "debit": 0, "credit": amt}], doc=b)
@@ -172,12 +183,13 @@ def post_unposted(session: Session, *, tenant_id) -> int:
             if amt <= 0:
                 continue
             eon = repo._parse_dm(p.pay_date)
+            payment_account = repo.find_account(session, name_like="%cash%" if p.payment_type == "cash" else "%bank%") or cash
             if p.pay_type == "Receipt":
-                lines = [{"account": _label(cash), "debit": amt, "credit": 0},
+                lines = [{"account": _label(payment_account), "debit": amt, "credit": 0},
                          {"account": _label(ar), "debit": 0, "credit": amt}]
             else:
                 lines = [{"account": _label(ap), "debit": amt, "credit": 0},
-                         {"account": _label(cash), "debit": 0, "credit": amt}]
+                         {"account": _label(payment_account), "debit": 0, "credit": amt}]
             _post_lines(session, tid, entry_on=eon,
                         memo=f"Payment {p.payment_no or ''}".strip(), lines=lines, doc=p)
             count += 1
@@ -280,13 +292,21 @@ def overview_screen(session: Session, *, tenant_id=None) -> dict:
          "accountTone": _account_tone(r["account"]),
          "memo": r["memo"] or "—",
          "debit": r["debit"] or None, "credit": r["credit"] or None}
-        for r in repo.recent_journal_lines(session, limit=6)
+        for r in repo.recent_journal_lines(session, limit=6, tenant_id=tenant_id)
     ]
 
     def s(n: int) -> str:
         return "" if n == 1 else "s"
 
     return {
+        "ledgerSummary": {
+            "customerDue": sum(max(p["balance"], 0) for p in repo.customer_parties(session)),
+            "customerCredit": sum(max(-p["balance"], 0) for p in repo.customer_parties(session)),
+            "supplierDue": sum(max(-p["balance"], 0) for p in repo.supplier_parties(session)),
+            "supplierAdvance": sum(max(p["balance"], 0) for p in repo.supplier_parties(session)),
+            "bankBalance": cash_bank_ledger(session, kind="bank")["closing"],
+            "cashBalance": cash_bank_ledger(session, kind="cash")["closing"],
+        },
         "kpis": {
             "cashBank": {"value": m["cash_total"], "sub": f"Across {m['cash_count']} account{s(m['cash_count'])}"},
             "ar": {"value": m["ar_total"], "sub": f"{m['ar_count']} open invoice{s(m['ar_count'])}"},
@@ -330,7 +350,7 @@ def supplier_ledger_screen(session: Session) -> dict:
         "parties": [
             {"public_id": p["public_id"], "name": p["name"], "code": p["code"] or "—",
              "initials": initials(p["name"]), "balance": p["balance"],
-             "balanceTone": "accent" if p["balance"] > 0 else "green"}
+             "balanceTone": "accent" if p["balance"] < 0 else "green"}
             for p in repo.supplier_parties(session)
         ],
     }
@@ -632,7 +652,7 @@ def _build_customer_statement(data: dict) -> dict:
     for it in items:
         debit = float(it.get("debit") or 0)
         credit = float(it.get("credit") or 0)
-        running += credit - debit
+        running += debit - credit
         total_debit += debit
         total_credit += credit
         open_inv = (it["kind"] == "invoice" and not it.get("paid")
@@ -656,7 +676,7 @@ def _build_customer_statement(data: dict) -> dict:
         "email": getattr(party, "email", "") or "", "initials": initials(party.name),
         "standingLabel": standing_label, "standingTone": standing_tone,
         "opening": opening, "totalDebit": total_debit, "totalCredit": total_credit,
-        "closing": closing, "balanceLabel": "Receivable", "balanceTone": "orange",
+        "closing": closing, "balanceLabel": "Receivable" if closing > 0 else "Customer credit" if closing < 0 else "Settled", "balanceTone": "orange",
         "rows": rows,
     }
 
@@ -693,16 +713,28 @@ def update_ledger_description(session: Session, *, edit_type: str, public_id: st
 
 def update_ledger_payment_type(session: Session, *, edit_type: str, public_id: str,
                                payment_type: str | None) -> bool:
+    if edit_type == "payment":
+        from app.models.finance import Payment
+        payment = session.scalar(select(Payment).where(Payment.public_id == UUID(str(public_id)),
+            Payment.is_deleted.is_(False)))
+        if payment is None:
+            return False
+        update_payment(session, public_id=public_id, payload=PaymentUpdate(
+            party=payment.party, amount=payment.amount, type=payment.pay_type,
+            method="Cash" if payment_type == "cash" else "Bank",
+            allocatedTo=payment.allocated_to, date=payment.pay_date or "",
+            status=payment.status, reference=payment.reference, notes=payment.notes))
+        return True
     return repo.update_ledger_payment_type(session, edit_type=edit_type,
                                            public_id=public_id, payment_type=payment_type)
 
 
-def _build_cash_bank_ledger(rows: list[dict], *, kind: str) -> dict:
+def _build_cash_bank_ledger(rows: list[dict], *, kind: str, opening: float = 0) -> dict:
     """Running-balance ledger consolidated across every customer and supplier —
     same shape/behaviour as the customer/supplier ledger tables (inline-editable
     description and payment type), just filtered to one payment type."""
     out_rows = []
-    running = 0.0
+    running = opening
     total_debit = total_credit = 0.0
     for r in rows:
         debit = float(r.get("debit") or 0)
@@ -720,14 +752,18 @@ def _build_cash_bank_ledger(rows: list[dict], *, kind: str) -> dict:
         })
     return {
         "kind": kind, "label": "Cash ledger" if kind == "cash" else "Bank ledger",
-        "opening": 0.0, "totalDebit": total_debit, "totalCredit": total_credit,
+        "opening": opening, "totalDebit": total_debit, "totalCredit": total_credit,
         "closing": round(running, 2), "rows": out_rows,
     }
 
 
 def cash_bank_ledger(session: Session, *, kind: str) -> dict:
     rows = repo.cash_bank_ledger(session, payment_type=kind)
-    return _build_cash_bank_ledger(rows, kind=kind)
+    from app.models.finance import Account
+    from sqlalchemy import func
+    opening = session.scalar(select(func.coalesce(func.sum(Account.opening_balance), 0)).where(
+        Account.is_deleted.is_(False), Account.acct_type == "Asset", func.lower(Account.name).like(f"%{kind}%")))
+    return _build_cash_bank_ledger(rows, kind=kind, opening=float(opening or 0))
 
 
 def _build_supplier_statement(data: dict) -> dict:
@@ -745,7 +781,7 @@ def _build_supplier_statement(data: dict) -> dict:
     for it in items:
         debit = float(it.get("debit") or 0)
         credit = float(it.get("credit") or 0)
-        running += debit - credit  # bill = debit (payable), payment = credit
+        running += debit - credit  # invoice = credit, supplier payment = debit
         total_debit += debit
         total_credit += credit
         open_bill = (it["kind"] == "bill" and not it.get("paid")
@@ -760,14 +796,14 @@ def _build_supplier_statement(data: dict) -> dict:
             "baseAmount": round(float(it.get("remaining") or 0), 2) if open_bill else None,
         })
     closing = round(running, 2)
-    standing_label, standing_tone = (("Payment due", "accent") if closing > 0
+    standing_label, standing_tone = (("Payment due", "accent") if closing < 0
                                      else ("Current", "green"))
     return {
         "name": party.name, "code": party.code or "—", "terms": party.terms or "—",
         "email": getattr(party, "email", "") or "", "initials": initials(party.name),
         "standingLabel": standing_label, "standingTone": standing_tone,
         "opening": opening, "totalDebit": total_debit, "totalCredit": total_credit,
-        "closing": closing, "balanceLabel": "Payable", "balanceTone": "accent",
+        "closing": closing, "balanceLabel": "Supplier advance" if closing > 0 else "Payable" if closing < 0 else "Settled", "balanceTone": "accent",
         "rows": rows,
     }
 
@@ -994,18 +1030,97 @@ def payments_screen(session: Session, *, limit: int = 50, offset: int = 0) -> di
 
 def _payment_fields(p) -> dict:
     return {"party": p.party, "amount": p.amount, "pay_type": p.type, "method": p.method,
-            "reference": p.reference, "allocated_to": p.allocatedTo, "pay_date": p.date,
+            "reference": p.reference, "allocated_to": (p.allocatedTo or "").strip() or None, "pay_date": p.date,
             "status": p.status, "notes": p.notes}
 
 
+def _allocation_document(session, *, tenant_id, pay_type, party, allocated_to):
+    from app.models.sales import Invoice
+    from app.models.finance import SupplierBill
+    from fastapi import HTTPException
+    if not (allocated_to or "").strip():
+        return None
+    model = Invoice if pay_type == "Receipt" else SupplierBill
+    number = model.invoice_no if pay_type == "Receipt" else model.bill_no
+    name = model.customer_name if pay_type == "Receipt" else model.supplier_name
+    doc = session.scalar(select(model).where(model.tenant_id == _tid(tenant_id),
+        number == allocated_to.strip(), name == party, model.is_deleted.is_(False)).with_for_update())
+    if doc is None:
+        raise HTTPException(409, "Allocation must reference an invoice or payable belonging to this party.")
+    return doc
+
+
+def _sync_payment_document(session, doc, pay_type):
+    if doc is None:
+        return
+    if pay_type == "Receipt":
+        applied = repo.receipts_applied_to_invoice(session, invoice_no=doc.invoice_no,
+            customer_id=doc.customer_id, customer_name=doc.customer_name)
+    else:
+        applied = repo.disbursements_applied_to_bill(session, bill_no=doc.bill_no,
+            supplier_id=doc.supplier_id, supplier_name=doc.supplier_name)
+    doc.status = "Paid" if applied >= float(doc.amount) else "Open"
+    session.flush()
+
+
+def _validate_allocation(session, doc, payload, exclude_id=None):
+    from app.models.finance import Payment
+    from sqlalchemy import func
+    from fastapi import HTTPException
+    if doc is None or payload.status != "Cleared":
+        return
+    applied = session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(
+        Payment.tenant_id == doc.tenant_id, Payment.party == payload.party, Payment.pay_type == payload.type,
+        Payment.allocated_to == (doc.invoice_no if payload.type == "Receipt" else doc.bill_no),
+        Payment.status == "Cleared", Payment.is_deleted.is_(False),
+        Payment.id != exclude_id if exclude_id else Payment.id.isnot(None)))
+    if payload.amount + applied > doc.amount:
+        raise HTTPException(409, "Payment exceeds this document's outstanding amount. Record any excess as an unallocated advance.")
+
+
 def create_payment(session, *, tenant_id, payload: PaymentCreate):
+    doc = _allocation_document(session, tenant_id=tenant_id, pay_type=payload.type,
+        party=payload.party, allocated_to=payload.allocatedTo)
+    _validate_allocation(session, doc, payload)
     p = repo.create_payment(session, tenant_id=_tid(tenant_id), **_payment_fields(payload))
+    _sync_payment_document(session, doc, p.pay_type)
     post_unposted(session, tenant_id=tenant_id)  # post to the GL at transaction time
     return p
 
 
 def update_payment(session, *, public_id: str, payload: PaymentUpdate):
-    return repo.update_payment(session, public_id=public_id, **_payment_fields(payload))
+    from app.models.finance import Payment, JournalEntry
+    p = session.scalar(select(Payment).where(Payment.public_id == UUID(str(public_id)),
+        Payment.is_deleted.is_(False)).with_for_update())
+    if p is None:
+        return None
+    old_type = p.pay_type
+    old_doc = _allocation_document(session, tenant_id=p.tenant_id, pay_type=p.pay_type,
+        party=p.party, allocated_to=p.allocated_to)
+    doc = _allocation_document(session, tenant_id=p.tenant_id, pay_type=payload.type,
+        party=payload.party, allocated_to=payload.allocatedTo)
+    _validate_allocation(session, doc, payload, exclude_id=p.id)
+    changed = any([p.amount != payload.amount, p.party != payload.party, p.pay_type != payload.type,
+        p.method != payload.method, p.status != payload.status, p.pay_date != payload.date])
+    if changed and p.posted and p.gl_journal_id:
+        old_journal = session.get(JournalEntry, p.gl_journal_id)
+        if old_journal:
+            repo.reverse_journal(session, public_id=old_journal.public_id)
+        p.posted, p.gl_journal_id = False, None
+    p = repo.update_payment(session, public_id=p.public_id, **_payment_fields(payload))
+    p.party_id, p.party_type = None, None
+    from app.models.sales import Customer
+    from app.models.procurement import Supplier
+    party_model = Customer if p.pay_type == "Receipt" else Supplier
+    party_id = session.scalar(select(party_model.id).where(party_model.tenant_id == p.tenant_id,
+        party_model.name == p.party, party_model.is_deleted.is_(False)).limit(1))
+    if party_id:
+        p.party_id, p.party_type = party_id, "customer" if p.pay_type == "Receipt" else "supplier"
+    session.flush()
+    _sync_payment_document(session, old_doc, old_type)
+    _sync_payment_document(session, doc, p.pay_type)
+    post_unposted(session, tenant_id=p.tenant_id)
+    return p
 
 
 # ---------- Aging ----------
@@ -1122,4 +1237,12 @@ def create_bill(session, *, tenant_id, payload: BillCreate):
 
 
 def update_bill(session, *, public_id: str, payload: BillUpdate):
+    from app.models.procurement import PoInvoice
+    from fastapi import HTTPException
+    bill = repo.bill_by_public(session, public_id=public_id)
+    if bill and session.scalar(select(PoInvoice.id).where(PoInvoice.supplier_bill_id == bill.id,
+        PoInvoice.tenant_id == bill.tenant_id, PoInvoice.is_deleted.is_(False)).limit(1)):
+        if (payload.supplier != bill.supplier_name or payload.poRef != bill.po_ref
+                or payload.amount != bill.amount):
+            raise HTTPException(409, "This payable is linked to a procurement invoice. Reconcile the linked invoice before changing its supplier, PO or amount.")
     return repo.update_bill(session, public_id=public_id, **_bill_fields(payload))

@@ -7,7 +7,7 @@ from app.core.security import Principal, require_module
 from app.modules.quality import service
 from app.modules.quality.dto import (
     CheckIn, DefectIn, DefectTypeCreate, DefectTypeUpdate, DispositionIn,
-    InspectionCreate, InspectionHeaderUpdate, PassShipIn, StatusUpdate,
+    InspectionCreate, InspectionHeaderUpdate, PassShipIn, StatusUpdate, ReopenIn,
 )
 
 router = APIRouter(prefix="/quality", tags=["quality"])
@@ -174,13 +174,25 @@ def set_disposition(public_id: str, payload: DispositionIn, principal: Principal
 @router.post("/inspections/{public_id}/reinspect", status_code=status.HTTP_201_CREATED)
 def create_reinspection(public_id: str, principal: Principal = Depends(write),
                         db: Session = Depends(tenant_db)):
-    out = service.create_reinspection(db, tenant_id=principal.tenant_id, public_id=public_id)
+    out = service.reopen_failed(db, tenant_id=principal.tenant_id, public_id=public_id, mode="inspection")
     if out is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Inspection not found")
     if out.get("error") == "not_failed":
         raise HTTPException(status.HTTP_409_CONFLICT, "Only a failed inspection can be re-inspected.")
     ins = out["inspection"]
     return {"public_id": str(ins.public_id), "inspection_no": ins.inspection_no}
+
+
+@router.post("/inspections/{public_id}/reopen", status_code=status.HTTP_201_CREATED)
+def reopen_failed(public_id: str, payload: ReopenIn, principal: Principal = Depends(write),
+                  db: Session = Depends(tenant_db)):
+    if payload.mode == "production":
+        require_module("production", "write")(principal)
+    out = service.reopen_failed(db, tenant_id=principal.tenant_id, public_id=public_id, mode=payload.mode,
+        notes=payload.notes, assigned_to=payload.assignedTo, due_date=payload.dueDate)
+    ins, work = out["inspection"], out["production"]
+    return {"publicId": str(ins.public_id), "inspectionNo": ins.inspection_no,
+            "productionId": str(work.public_id) if work else None}
 
 
 @router.get("/insights")

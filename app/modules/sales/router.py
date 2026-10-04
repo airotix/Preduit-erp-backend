@@ -7,7 +7,7 @@ from app.core.security import Principal, require_module
 from app.modules.sales import service
 from app.modules.sales.dto import (
     CustomerCreate, CustomerUpdate, InvoiceCreate, InvoiceSettleIn, OrderCreate,
-    ReturnCreate, StatusUpdate,
+    ReturnCreate, StatusUpdate, ShortagePOCreate,
 )
 
 router = APIRouter(prefix="/sales", tags=["sales"])
@@ -70,7 +70,31 @@ def create_order(
         "public_id": str(o.public_id), "order_no": o.order_no,
         "total": res["total"], "customer": res["customer"],
         "invoice_public_id": res["invoice_public_id"], "invoice_no": res["invoice_no"],
+        "status": o.status,
     }
+
+
+@router.get("/shortage-suppliers")
+def shortage_suppliers(principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from sqlalchemy import select
+    from app.models.procurement import Supplier
+    from uuid import UUID
+    suppliers = db.scalars(select(Supplier).where(Supplier.tenant_id == UUID(str(principal.tenant_id)),
+        Supplier.is_deleted.is_(False)).order_by(Supplier.name)).all()
+    return [{"publicId": str(s.public_id), "name": s.name} for s in suppliers]
+
+
+@router.post("/orders/{public_id}/create-po", status_code=status.HTTP_201_CREATED)
+def create_shortage_po(public_id: str, payload: ShortagePOCreate,
+                       principal: Principal = Depends(write),
+                       _: Principal = Depends(require_module("procurement", "write")),
+                       db: Session = Depends(tenant_db)):
+    from app.modules.sales import fulfillment
+    po = fulfillment.create_shortage_po(db, tenant_id=principal.tenant_id,
+        public_id=public_id, supplier_id=payload.supplierId)
+    if po is None:
+        return {"publicId": None, "poNo": None, "shipmentReady": True}
+    return {"publicId": str(po.public_id), "poNo": po.po_no}
 
 
 @router.post("/invoices/{public_id}/settle")

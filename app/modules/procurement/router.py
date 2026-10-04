@@ -144,6 +144,11 @@ def invoices_list(limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
     return service.list_invoices(db, limit=limit, offset=offset)
 
 
+@router.post("/invoices/generate-missing")
+def generate_missing_invoices(principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    return service.generate_missing_invoices(db, tenant_id=principal.tenant_id)
+
+
 @router.post("/invoices", status_code=status.HTTP_201_CREATED)
 def invoice_create(payload: dict, principal: Principal = Depends(write),
                    db: Session = Depends(tenant_db)):
