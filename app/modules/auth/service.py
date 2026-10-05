@@ -539,10 +539,13 @@ def get_company_profile(tenant_id: str) -> dict:
 def save_company_profile(tenant_id: str, p: dict) -> dict:
     # Validate contact/web formats server-side (mirrors the frontend checks).
     from app.core.validation import clean_email, clean_phone, clean_url
+    from app.core.locations import clean_location
+    p = dict(p)
     try:
         clean_email(p.get("businessEmail"))
-        clean_phone(p.get("phone"))
-        clean_phone(p.get("supportLine"))
+        p.update(clean_location(p.get("country"), p.get("state"), p.get("city")))
+        p["phone"] = clean_phone(p.get("phone"), p.get("country"))
+        p["supportLine"] = clean_phone(p.get("supportLine"), p.get("country"))
         clean_url(p.get("website"))
     except ValueError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e))

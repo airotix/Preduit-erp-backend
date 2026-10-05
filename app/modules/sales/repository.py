@@ -30,11 +30,13 @@ def list_customers(session: Session, *, limit: int, offset: int) -> tuple[list[d
 
 def _apply_customer_fields(c: Customer, *, name, email, kind, region, phone, address,
                            code=None, terms=None, currency=None, tax_id=None,
-                           bank_name=None, bank_account=None, contact_title=None) -> None:
+                           bank_name=None, bank_account=None, contact_title=None,
+                           country_code=None, state=None, city=None) -> None:
     c.name = name
     c.email = email
     c.kind = kind
     c.region = region
+    c.country_code, c.state, c.city = country_code, state, city
     c.phone = phone
     c.address = address
     c.code = code

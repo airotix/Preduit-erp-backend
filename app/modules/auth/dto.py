@@ -1,5 +1,15 @@
 """Auth request bodies."""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+from app.core.validation import clean_phone, PHONE_ERROR
+from app.core.locations import clean_location
+
+
+class LocationRequest(BaseModel):
+    @model_validator(mode="after")
+    def validate_location(self):
+        cleaned = clean_location(self.country, city=self.city)
+        self.country, self.city = cleaned["country"], cleaned["city"]
+        return self
 
 
 class LoginRequest(BaseModel):
@@ -79,8 +89,16 @@ class WorkspaceRequestForm(BaseModel):
     businessName: str = Field(min_length=1, max_length=200)
     businessDescription: str = Field(default="", max_length=2000)
 
+    @field_validator("contactNumber")
+    @classmethod
+    def _v_contact_number(cls, v):
+        cleaned = clean_phone(v)
+        if cleaned is None:
+            raise ValueError(PHONE_ERROR)
+        return cleaned
 
-class CreateWorkspaceRequest(BaseModel):
+
+class CreateWorkspaceRequest(LocationRequest):
     """Super Admin provisioning: owner account + the full setup stepper payload
     (business, modules, team) in one call."""
     ownerName: str = Field(min_length=1, max_length=200)
@@ -96,7 +114,7 @@ class CreateWorkspaceRequest(BaseModel):
     invites: list[SetupInvite] = Field(default_factory=list)
 
 
-class CompanySetupRequest(BaseModel):
+class CompanySetupRequest(LocationRequest):
     """Payload for the post-signup company setup wizard (Outlets/Modules/Team)."""
     companyName: str = Field(min_length=1, max_length=200)
     country: str | None = Field(default=None, max_length=80)

@@ -17,6 +17,7 @@ from app.modules.documents.router import router as documents_router
 from app.modules.finance.router import router as finance_router
 from app.modules.inventory.router import router as inventory_router
 from app.modules.meta.router import router as meta_router
+from app.modules.meta.locations_router import router as locations_router
 from app.modules.onboarding.router import router as onboarding_router
 from app.modules.order_history.router import router as order_history_router
 from app.modules.procurement.router import router as procurement_router
@@ -89,6 +90,7 @@ app.add_middleware(
 API_V1 = "/api/v1"
 app.include_router(auth_router, prefix=API_V1)
 app.include_router(meta_router, prefix=API_V1)
+app.include_router(locations_router, prefix=API_V1)
 app.include_router(onboarding_router, prefix=API_V1)
 app.include_router(catalog_router, prefix=API_V1)
 app.include_router(sales_router, prefix=API_V1)

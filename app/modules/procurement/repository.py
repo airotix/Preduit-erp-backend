@@ -53,10 +53,11 @@ def create_supplier(session: Session, *, tenant_id: UUID, name: str, region: str
                     vat_number: str | None = None, contact_person: str | None = None,
                     bank_details: str | None = None, bank_name: str | None = None,
                     bank_account_title: str | None = None, bank_account_number: str | None = None,
-                    bank_swift: str | None = None, bank_iban: str | None = None) -> Supplier:
+                    bank_swift: str | None = None, bank_iban: str | None = None,
+                    country_code=None, state=None, city=None) -> Supplier:
     sup = Supplier(tenant_id=tenant_id, name=name, region=region,
                    lead_time=lead_time, category=category, status="New",
-                   email=email, phone=phone, address=address,
+                   email=email, phone=phone, address=address, country_code=country_code, state=state, city=city,
                    vat_number=vat_number, contact_person=contact_person,
                    bank_details=bank_details, bank_name=bank_name,
                    bank_account_title=bank_account_title, bank_account_number=bank_account_number,
@@ -73,7 +74,8 @@ def update_supplier(session: Session, *, public_id: str, name: str, region: str 
                     vat_number: str | None = None, contact_person: str | None = None,
                     bank_details: str | None = None, bank_name: str | None = None,
                     bank_account_title: str | None = None, bank_account_number: str | None = None,
-                    bank_swift: str | None = None, bank_iban: str | None = None) -> Supplier | None:
+                    bank_swift: str | None = None, bank_iban: str | None = None,
+                    country_code=None, state=None, city=None) -> Supplier | None:
     sup = session.execute(
         select(Supplier).where(Supplier.public_id == public_id,
                                Supplier.is_deleted == False)  # noqa: E712
@@ -82,6 +84,7 @@ def update_supplier(session: Session, *, public_id: str, name: str, region: str 
         return None
     sup.name = name
     sup.region = region
+    sup.country_code, sup.state, sup.city = country_code, state, city
     sup.lead_time = lead_time
     sup.category = category
     sup.email = email

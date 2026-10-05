@@ -1,6 +1,7 @@
 """Finance business logic → frontend ScreenConfig."""
 import datetime
 import uuid
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import select
@@ -129,14 +130,122 @@ def _post_lines(session, tid, *, entry_on, memo, lines: list[dict], doc):
                                   entry_on=entry_on, entry_display=(entry_on.strftime("%d %b") if entry_on else ""),
                                   memo=memo, lines=lines)
     doc.gl_journal_id = je.id
+    je.source_note = f"{doc.__tablename__}:{doc.public_id}"
     doc.posted = True
     return je
+
+
+def _ledger_clearing_account(session, tid):
+    """Keep unclassified movements out of revenue, expenses and supplier debt."""
+    account = repo.find_account(session, name_like="Ledger clearing")
+    if account:
+        return account
+    code, suffix = "1099", 0
+    while repo.find_account_by_code(session, code=code):
+        suffix += 1
+        code = f"1099-{suffix}"
+    return repo.get_or_create_account(session, tenant_id=tid, code=code,
+        name="Ledger clearing", acct_type="Asset", normal_side="D")
+
+
+def _ensure_initial_chart(session, tid):
+    """Bootstrap an empty workspace without changing a configured chart."""
+    from app.models.finance import Account
+    existing = select(Account.id).where(Account.tenant_id == tid,
+        Account.is_deleted.is_(False)).limit(1)
+    if session.scalar(existing) is not None:
+        return
+    if session.get_bind().dialect.name == "postgresql":
+        from sqlalchemy import text
+        session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                        {"key": f"initial-chart:{tid}"})
+    if session.scalar(existing) is not None:
+        return
+    currency = repo.base_currency(session) or "EUR"
+    used_codes = set(session.scalars(select(Account.code).where(Account.tenant_id == tid)).all())
+    for code, name, kind, side in [
+        ("1000", "Cash", "Asset", "D"), ("1100", "Bank", "Asset", "D"),
+        ("1200", "Accounts receivable", "Asset", "D"), ("1300", "Inventory", "Asset", "D"),
+        ("2000", "Accounts payable", "Liability", "C"), ("4000", "Revenue", "Income", "C"),
+        ("5000", "Cost of goods sold", "Expense", "D"),
+    ]:
+        suffix, available = 0, code
+        while available in used_codes:
+            suffix += 1
+            available = f"{code}-{suffix}"
+        session.add(Account(tenant_id=tid, code=available, name=name, acct_type=kind,
+            normal_side=side, currency_code=currency, opening_balance=0, balance=0))
+        used_codes.add(available)
+    session.flush()
+
+
+def _sync_manual_ledger_entries(session, tid):
+    """Post manual movements once and reverse/repost when their channel changes.
+
+    Bank/cash display credits are inflows; the corresponding asset GL line is
+    a debit. Party ledger columns retain their receivable/payable meaning.
+    Existing journal source notes provide the link without rewriting old rows.
+    """
+    _ensure_initial_chart(session, tid)
+    from app.models.finance import LedgerEntry, JournalEntry, JournalLine
+    entries = session.scalars(select(LedgerEntry).where(LedgerEntry.tenant_id == tid).with_for_update()).all()
+    count = 0
+    for entry in entries:
+        source = f"ledger-entry:{entry.public_id}"
+        originals = session.scalars(select(JournalEntry).where(
+            JournalEntry.tenant_id == tid, JournalEntry.source_note == source,
+            JournalEntry.is_deleted.is_(False), JournalEntry.status == "Posted")).all()
+        reversed_ids = set(session.scalars(select(JournalEntry.reversed_of_id).where(
+            JournalEntry.tenant_id == tid, JournalEntry.is_deleted.is_(False),
+            JournalEntry.status == "Posted", JournalEntry.reversed_of_id.isnot(None))).all())
+        active = [journal for journal in originals if journal.id not in reversed_ids]
+        debit, credit = Decimal(entry.debit or 0), Decimal(entry.credit or 0)
+        lines = []
+        if not entry.is_deleted and debit != credit:
+            party_account = (repo.find_account(session, name_like="%receivable%") if entry.customer_id
+                             else repo.find_account(session, name_like="%payable%") if entry.supplier_id else None)
+            money_account = repo.find_account(session, acct_type="Asset",
+                name_like=f"%{entry.payment_type}%") if entry.payment_type in ("bank", "cash") else None
+            if entry.payment_type and money_account is None:
+                from fastapi import HTTPException
+                raise HTTPException(409, f"Create an asset account for {entry.payment_type} before recording a movement.")
+            if (entry.customer_id or entry.supplier_id) and party_account is None:
+                from fastapi import HTTPException
+                raise HTTPException(409, "Create the receivable/payable account before recording a party entry.")
+            if party_account:
+                first, second = party_account, money_account or _ledger_clearing_account(session, tid)
+                net = debit - credit
+            elif money_account:
+                first, second = money_account, _ledger_clearing_account(session, tid)
+                net = credit - debit
+            else:
+                first = second = None
+                net = Decimal(0)
+            if first:
+                lines = [dict(account=_label(first), debit=max(net, 0), credit=max(-net, 0)),
+                         dict(account=_label(second), debit=max(-net, 0), credit=max(net, 0))]
+        wanted = sorted((line["account"], Decimal(line["debit"]), Decimal(line["credit"])) for line in lines)
+        if len(active) == 1:
+            current = session.scalars(select(JournalLine).where(JournalLine.entry_id == active[0].id)).all()
+            if sorted((line.account, line.debit, line.credit) for line in current) == wanted:
+                continue
+        for journal in active:
+            repo.reverse_journal(session, public_id=journal.public_id)
+        if lines:
+            journal = repo.create_full_journal(session, tenant_id=tid, reference=None,
+                entry_on=entry.entry_date, entry_display=_fmt_date(entry.entry_date),
+                memo=(entry.description or "Manual ledger entry")[:300], lines=lines)
+            journal.source_note = source
+            session.flush()
+            count += 1
+    return count
 
 
 def post_unposted(session: Session, *, tenant_id) -> int:
     """Post every not-yet-posted invoice, bill, payment and credit note into the
     GL as a balanced journal. Idempotent (skips already-posted docs)."""
     tid = tenant_id if isinstance(tenant_id, uuid.UUID) else uuid.UUID(str(tenant_id))
+    _ensure_initial_chart(session, tid)
     # Repair older Pending/Failed payments that were posted before clearing.
     from app.models.finance import Payment, JournalEntry
     for stale in session.scalars(select(Payment).where(Payment.tenant_id == tid,
@@ -149,7 +258,6 @@ def post_unposted(session: Session, *, tenant_id) -> int:
     ar = repo.find_account(session, name_like="%receivable%")
     ap = repo.find_account(session, name_like="%payable%")
     revenue = repo.find_account(session, acct_type="Income") or repo.find_account(session, name_like="%revenue%")
-    cash = repo.find_account(session, name_like="%cash%") or repo.find_account(session, name_like="%bank%")
     dr_bill = (repo.find_account(session, name_like="%inventory%")
                or repo.find_account(session, name_like="%cost of goods%")
                or repo.find_account(session, acct_type="Expense"))
@@ -177,22 +285,28 @@ def post_unposted(session: Session, *, tenant_id) -> int:
                                {"account": _label(ap), "debit": 0, "credit": amt}], doc=b)
             count += 1
 
-    if cash and ar and ap:
-        for p in repo.unposted_payments(session):
-            amt = float(p.amount or 0)
-            if amt <= 0:
-                continue
-            eon = repo._parse_dm(p.pay_date)
-            payment_account = repo.find_account(session, name_like="%cash%" if p.payment_type == "cash" else "%bank%") or cash
-            if p.pay_type == "Receipt":
-                lines = [{"account": _label(payment_account), "debit": amt, "credit": 0},
-                         {"account": _label(ar), "debit": 0, "credit": amt}]
-            else:
-                lines = [{"account": _label(ap), "debit": amt, "credit": 0},
-                         {"account": _label(payment_account), "debit": 0, "credit": amt}]
-            _post_lines(session, tid, entry_on=eon,
-                        memo=f"Payment {p.payment_no or ''}".strip(), lines=lines, doc=p)
-            count += 1
+    for p in repo.unposted_payments(session):
+        amt = float(p.amount or 0)
+        if amt <= 0:
+            continue
+        eon = repo._parse_dm(p.pay_date)
+        channel = p.payment_type or ("cash" if (p.method or "").strip().lower() == "cash" else "bank")
+        payment_account = repo.find_account(session, acct_type="Asset", name_like=f"%{channel}%")
+        if payment_account is None:
+            from fastapi import HTTPException
+            raise HTTPException(409, "Create the selected Cash or Bank asset account before recording a payment.")
+        counterpart = (ar if p.pay_type == "Receipt" and p.party_type == "customer"
+                       else ap if p.pay_type != "Receipt" and p.party_type == "supplier" else None)
+        counterpart = counterpart or _ledger_clearing_account(session, tid)
+        if p.pay_type == "Receipt":
+            lines = [{"account": _label(payment_account), "debit": amt, "credit": 0},
+                     {"account": _label(counterpart), "debit": 0, "credit": amt}]
+        else:
+            lines = [{"account": _label(counterpart), "debit": amt, "credit": 0},
+                     {"account": _label(payment_account), "debit": 0, "credit": amt}]
+        _post_lines(session, tid, entry_on=eon,
+                    memo=f"Payment {p.payment_no or ''}".strip(), lines=lines, doc=p)
+        count += 1
 
     if ar and revenue:
         for cn in repo.unposted_credit_notes(session):
@@ -205,6 +319,7 @@ def post_unposted(session: Session, *, tenant_id) -> int:
                                {"account": _label(ar), "debit": 0, "credit": amt}], doc=cn)
             count += 1
 
+    count += _sync_manual_ledger_entries(session, tid)
     session.flush()
     return count
 
@@ -353,49 +468,6 @@ def supplier_ledger_screen(session: Session) -> dict:
              "balanceTone": "accent" if p["balance"] < 0 else "green"}
             for p in repo.supplier_parties(session)
         ],
-    }
-
-
-def _build_statement(data: dict, *, kind: str) -> dict:
-    party, opening, entries = data["party"], data["opening"], data["entries"]
-    bal = opening
-    debit_total = credit_total = 0.0
-    rows = []
-    for e in entries:
-        if kind == "customer":
-            bal += e["debit"] - e["credit"]
-        else:
-            bal += e["credit"] - e["debit"]
-        debit_total += e["debit"]
-        credit_total += e["credit"]
-        settleable = (kind == "customer" and e.get("kind") == "invoice" and not e.get("paid"))
-        rows.append({
-            "date": _fmt_date(e["date"]), "ref": e["ref"], "desc": e["desc"],
-            "debit": e["debit"] or None, "credit": e["credit"] or None, "balance": bal,
-            # Handle for the per-row "Record payment" action (unpaid customer
-            # invoices only). base_amount is intentionally NOT a money key, so it
-            # is not currency-scaled — the settle endpoint records in base currency.
-            "invoicePublicId": e.get("public_id") if settleable else None,
-            "baseAmount": e.get("base_amount") if settleable else None,
-        })
-
-    if kind == "customer":
-        balance_label, balance_tone = "Receivable", "orange"
-        if data.get("overdue"):
-            standing_label, standing_tone = "Payment due", "amber"
-        else:
-            standing_label, standing_tone = "In good standing", "green"
-    else:
-        balance_label, balance_tone = "Payable", "accent"
-        standing_label, standing_tone = ("Payment due", "accent") if bal > 0 else ("Current", "green")
-
-    return {
-        "name": party.name, "code": party.code or "—", "terms": party.terms or "—",
-        "email": getattr(party, "email", "") or "", "initials": initials(party.name),
-        "standingLabel": standing_label, "standingTone": standing_tone,
-        "opening": opening, "totalDebit": debit_total, "totalCredit": credit_total,
-        "closing": bal, "balanceLabel": balance_label, "balanceTone": balance_tone,
-        "rows": rows,
     }
 
 
@@ -585,10 +657,17 @@ def bank_account_detail(session: Session, *, public_id: str) -> dict | None:
         return None
     txns = repo.list_bank_transactions(session, bank_account_id=a.id)
     matched = reconciled = unmatched = 0
-    stmt_bal = 0.0
+    gl_account = repo.find_account_by_code(session, code=a.gl_code) if a.gl_code else None
+    opening = Decimal(gl_account.opening_balance or gl_account.balance or 0) if gl_account else Decimal(0)
+    stmt_bal = opening
+    total_debit = total_credit = Decimal(0)
     rows = []
     for t in txns:
-        stmt_bal += float(t.amount or 0)
+        amount = Decimal(t.amount or 0)
+        debit, credit = max(-amount, 0), max(amount, 0)
+        stmt_bal += amount
+        total_debit += debit
+        total_credit += credit
         if t.status == "Matched":
             matched += 1
         elif t.status == "Reconciled":
@@ -599,10 +678,12 @@ def bank_account_detail(session: Session, *, public_id: str) -> dict | None:
             "public_id": str(t.public_id),
             "date": t.txn_date.strftime("%d %b") if t.txn_date else "—",
             "description": t.description or "—", "amount": float(t.amount or 0),
+            "debit": float(debit), "credit": float(credit), "balance": float(round(stmt_bal, 2)),
             "status": t.status, "matchedRef": repo.payment_no_by_id(session, t.matched_payment_id),
         })
     return {"name": a.name, "account_no": a.account_no or "—", "currency": a.currency_code,
-            "statementBalance": stmt_bal, "matched": matched, "reconciled": reconciled,
+            "opening": float(opening), "totalDebit": float(total_debit), "totalCredit": float(total_credit),
+            "statementBalance": float(round(stmt_bal, 2)), "matched": matched, "reconciled": reconciled,
             "unmatched": unmatched, "rows": rows}
 
 
@@ -637,9 +718,9 @@ def reconcile_bank(session: Session, *, public_id):
 
 
 def _build_customer_statement(data: dict) -> dict:
-    """Running-balance customer statement. Invoice rows show their debit plus the
-    payments allocated to them (credit accumulates on the same line); manual
-    entries and unallocated receipts / credit notes are their own lines. Every
+    """Running-balance customer statement. Invoices show debits and every
+    payment shows a separate credit; manual entries and credit notes also have
+    their own lines. Every
     row carries an editType/editId so its description is inline-editable."""
     party, opening = data["party"], data["opening"]
     items = [{**r, "kind": "invoice"} for r in data["invoices"]]
@@ -688,21 +769,38 @@ def customer_statement(session: Session, *, public_id: str) -> dict | None:
 
 def create_ledger_entry(session: Session, *, tenant_id, customer_public_id: str,
                         description: str, debit, credit, payment_type: str | None = None):
+    from fastapi import HTTPException
+    _validate_manual_amounts(debit, credit)
     c = repo.customer_by_public(session, public_id=customer_public_id)
-    return repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id),
-                                    customer_id=c.id if c else None,
+    if c is None or c.tenant_id != _uuid(tenant_id):
+        raise HTTPException(404, "Customer not found")
+    entry = repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id),
+                                    customer_id=c.id,
                                     description=description, debit=debit, credit=credit,
                                     payment_type=payment_type)
+    _sync_manual_ledger_entries(session, _uuid(tenant_id))
+    return entry
+
+
+def _validate_manual_amounts(debit, credit):
+    from fastapi import HTTPException
+    debit, credit = Decimal(str(debit or 0)), Decimal(str(credit or 0))
+    if (not debit.is_finite() or not credit.is_finite() or debit < 0 or credit < 0
+            or (debit > 0) == (credit > 0)):
+        raise HTTPException(422, "Enter a positive amount in either Debit or Credit, not both.")
 
 
 def create_cash_bank_entry(session: Session, *, tenant_id, kind: str,
                            description: str, debit, credit):
     """A manual line straight onto the Cash or Bank ledger — no customer/supplier
     party — tagged with the ledger's payment type so it shows in that ledger."""
-    return repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id),
+    _validate_manual_amounts(debit, credit)
+    entry = repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id),
                                     customer_id=None, supplier_id=None,
                                     description=description, debit=debit, credit=credit,
                                     payment_type=kind)
+    _sync_manual_ledger_entries(session, _uuid(tenant_id))
+    return entry
 
 
 def update_ledger_description(session: Session, *, edit_type: str, public_id: str,
@@ -713,6 +811,15 @@ def update_ledger_description(session: Session, *, edit_type: str, public_id: st
 
 def update_ledger_payment_type(session: Session, *, edit_type: str, public_id: str,
                                payment_type: str | None) -> bool:
+    if edit_type == "payment" and payment_type is None:
+        from fastapi import HTTPException
+        raise HTTPException(422, "Select Cash or Bank for a recorded payment.")
+    if edit_type == "manual" and payment_type is None:
+        from app.models.finance import LedgerEntry
+        from fastapi import HTTPException
+        entry = session.scalar(select(LedgerEntry).where(LedgerEntry.public_id == UUID(str(public_id))))
+        if entry and not entry.customer_id and not entry.supplier_id:
+            raise HTTPException(422, "Select Cash or Bank for a money movement.")
     if edit_type == "payment":
         from app.models.finance import Payment
         payment = session.scalar(select(Payment).where(Payment.public_id == UUID(str(public_id)),
@@ -725,8 +832,13 @@ def update_ledger_payment_type(session: Session, *, edit_type: str, public_id: s
             allocatedTo=payment.allocated_to, date=payment.pay_date or "",
             status=payment.status, reference=payment.reference, notes=payment.notes))
         return True
-    return repo.update_ledger_payment_type(session, edit_type=edit_type,
-                                           public_id=public_id, payment_type=payment_type)
+    updated = repo.update_ledger_payment_type(session, edit_type=edit_type,
+                                             public_id=public_id, payment_type=payment_type)
+    if updated and edit_type == "manual":
+        from app.models.finance import LedgerEntry
+        entry = session.scalar(select(LedgerEntry).where(LedgerEntry.public_id == UUID(str(public_id))))
+        _sync_manual_ledger_entries(session, entry.tenant_id)
+    return updated
 
 
 def _build_cash_bank_ledger(rows: list[dict], *, kind: str, opening: float = 0) -> dict:
@@ -734,11 +846,11 @@ def _build_cash_bank_ledger(rows: list[dict], *, kind: str, opening: float = 0) 
     same shape/behaviour as the customer/supplier ledger tables (inline-editable
     description and payment type), just filtered to one payment type."""
     out_rows = []
-    running = opening
-    total_debit = total_credit = 0.0
+    running = Decimal(str(opening))
+    total_debit = total_credit = Decimal(0)
     for r in rows:
-        debit = float(r.get("debit") or 0)
-        credit = float(r.get("credit") or 0)
+        debit = Decimal(str(r.get("debit") or 0))
+        credit = Decimal(str(r.get("credit") or 0))
         running += credit - debit
         total_debit += debit
         total_credit += credit
@@ -746,23 +858,23 @@ def _build_cash_bank_ledger(rows: list[dict], *, kind: str, opening: float = 0) 
             "date": _fmt_date(r.get("date")), "ref": r["ref"],
             "party": r.get("party") or "—", "partyType": r.get("partyType"),
             "source": r.get("source"), "desc": r["desc"],
-            "debit": debit or None, "credit": credit or None, "balance": round(running, 2),
+            "debit": float(debit) if debit else None, "credit": float(credit) if credit else None, "balance": float(round(running, 2)),
             "editType": r.get("editType"), "editId": r.get("editId"),
             "paymentType": kind,
         })
     return {
         "kind": kind, "label": "Cash ledger" if kind == "cash" else "Bank ledger",
-        "opening": opening, "totalDebit": total_debit, "totalCredit": total_credit,
-        "closing": round(running, 2), "rows": out_rows,
+        "opening": opening, "totalDebit": float(round(total_debit, 2)), "totalCredit": float(round(total_credit, 2)),
+        "closing": float(round(running, 2)), "rows": out_rows,
     }
 
 
 def cash_bank_ledger(session: Session, *, kind: str) -> dict:
     rows = repo.cash_bank_ledger(session, payment_type=kind)
     from app.models.finance import Account
-    from sqlalchemy import func
-    opening = session.scalar(select(func.coalesce(func.sum(Account.opening_balance), 0)).where(
-        Account.is_deleted.is_(False), Account.acct_type == "Asset", func.lower(Account.name).like(f"%{kind}%")))
+    accounts = session.scalars(select(Account).where(Account.is_deleted.is_(False),
+        Account.acct_type == "Asset", Account.name.ilike(f"%{kind}%"))).all()
+    opening = sum((Decimal(account.opening_balance or account.balance or 0) for account in accounts), Decimal(0))
     return _build_cash_bank_ledger(rows, kind=kind, opening=float(opening or 0))
 
 
@@ -815,11 +927,17 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
 
 def create_supplier_ledger_entry(session: Session, *, tenant_id, supplier_public_id: str,
                                  description: str, debit, credit, payment_type: str | None = None):
+    from fastapi import HTTPException
+    _validate_manual_amounts(debit, credit)
     s = repo.supplier_by_public(session, public_id=supplier_public_id)
-    return repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id), customer_id=None,
-                                    supplier_id=s.id if s else None,
+    if s is None or s.tenant_id != _uuid(tenant_id):
+        raise HTTPException(404, "Supplier not found")
+    entry = repo.create_ledger_entry(session, tenant_id=_uuid(tenant_id), customer_id=None,
+                                    supplier_id=s.id,
                                     description=description, debit=debit, credit=credit,
                                     payment_type=payment_type)
+    _sync_manual_ledger_entries(session, _uuid(tenant_id))
+    return entry
 
 
 def record_bill_payment(session: Session, *, tenant_id, public_id: str, amount_paid, paid: bool):
@@ -843,7 +961,7 @@ def record_bill_payment(session: Session, *, tenant_id, public_id: str, amount_p
         today = datetime.date.today()
         repo.create_payment(
             session, tenant_id=tid, party=bill.supplier_name, amount=amt,
-            pay_type="Disbursement", method="Bank", reference=bill.bill_no,
+            pay_type="Disbursement", method="Cash" if bill.payment_type == "cash" else "Bank", reference=bill.bill_no,
             allocated_to=bill.bill_no, pay_date=today.isoformat(),
             status="Cleared", notes=f"Payment for {bill.po_ref or bill.bill_no or 'bill'}")
         if already + amt >= bill_amt and bill_amt > 0:
@@ -1089,7 +1207,7 @@ def create_payment(session, *, tenant_id, payload: PaymentCreate):
 
 
 def update_payment(session, *, public_id: str, payload: PaymentUpdate):
-    from app.models.finance import Payment, JournalEntry
+    from app.models.finance import Payment, JournalEntry, BankTransaction
     p = session.scalar(select(Payment).where(Payment.public_id == UUID(str(public_id)),
         Payment.is_deleted.is_(False)).with_for_update())
     if p is None:
@@ -1102,6 +1220,11 @@ def update_payment(session, *, public_id: str, payload: PaymentUpdate):
     _validate_allocation(session, doc, payload, exclude_id=p.id)
     changed = any([p.amount != payload.amount, p.party != payload.party, p.pay_type != payload.type,
         p.method != payload.method, p.status != payload.status, p.pay_date != payload.date])
+    if changed:
+        for transaction in session.scalars(select(BankTransaction).where(
+                BankTransaction.tenant_id == p.tenant_id, BankTransaction.matched_payment_id == p.id,
+                BankTransaction.is_deleted.is_(False))).all():
+            transaction.matched_payment_id, transaction.status = None, "Unmatched"
     if changed and p.posted and p.gl_journal_id:
         old_journal = session.get(JournalEntry, p.gl_journal_id)
         if old_journal:

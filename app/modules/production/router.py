@@ -1,5 +1,5 @@
 """Production HTTP routes."""
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.deps import tenant_db
@@ -14,6 +14,22 @@ router = APIRouter(prefix="/production", tags=["production"])
 
 read = require_module("production", "read")
 write = require_module("production", "write")
+
+
+@router.get("/lines/{public_id}/tech-pack")
+def line_tech_pack(public_id: str, principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    from app.modules import techpacks
+    return techpacks.line_pack(db, techpacks.line_by_public(db, public_id, principal.tenant_id))
+
+
+@router.post("/lines/{public_id}/tech-pack", status_code=status.HTTP_201_CREATED)
+def upload_tech_pack(public_id: str, file: UploadFile = File(...),
+                     principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules import techpacks
+    from app.modules.documents.router import _read_capped, settings
+    return techpacks.upload_line(db, tenant_id=principal.tenant_id, public_id=public_id,
+        filename=file.filename or "file", content_type=file.content_type,
+        data=_read_capped(file, settings.upload_max_bytes))
 
 
 @router.get("/porders/screen")

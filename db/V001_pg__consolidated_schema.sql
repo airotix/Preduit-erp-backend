@@ -870,7 +870,7 @@ CREATE TABLE IF NOT EXISTS production_orders (
     style          VARCHAR(200) NOT NULL,
     factory        VARCHAR(120),
     qty            INT          NOT NULL DEFAULT 0,
-    stage          VARCHAR(20)  NOT NULL DEFAULT 'Trims',
+    stage          VARCHAR(20)  NOT NULL DEFAULT 'Tech Pack',
     progress       INT          NOT NULL DEFAULT 0,
     sales_order_id BIGINT,
     is_deleted     BOOLEAN      NOT NULL DEFAULT FALSE
@@ -1299,5 +1299,23 @@ ALTER TABLE purchase_order_lines
     ADD COLUMN IF NOT EXISTS production_line_id BIGINT REFERENCES production_order_lines(id);
 CREATE INDEX IF NOT EXISTS ix_purchase_production_line
     ON purchase_order_lines (tenant_id, production_line_id);
+
+-- Tech-pack file storage for installations without S3 (V066).
+CREATE TABLE IF NOT EXISTS document_contents (
+    document_id BIGINT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    data BYTEA NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_document_contents_tenant ON document_contents (tenant_id);
+ALTER TABLE document_contents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_contents FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON document_contents;
+CREATE POLICY tenant_isolation ON document_contents
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR current_setting('app.rls_bypass', true) = 'true')
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+                OR current_setting('app.rls_bypass', true) = 'true');
+GRANT SELECT, INSERT, UPDATE, DELETE ON document_contents TO erp_app;
+GRANT ALL ON document_contents TO erp_system;
 
 COMMIT;

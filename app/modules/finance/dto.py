@@ -1,15 +1,21 @@
 """Finance API contracts — match the frontend forms."""
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class LedgerEntryIn(BaseModel):
     """Manual customer-ledger entry from the 'New entry' button."""
     description: str = Field(min_length=1, max_length=400)
-    debit: Decimal = Field(default=0, ge=0)
-    credit: Decimal = Field(default=0, ge=0)
+    debit: Decimal = Field(default=0, ge=0, decimal_places=2)
+    credit: Decimal = Field(default=0, ge=0, decimal_places=2)
     paymentType: str | None = Field(default=None, pattern="^(cash|bank)$")
+
+    @model_validator(mode="after")
+    def one_direction(self):
+        if (self.debit > 0) == (self.credit > 0):
+            raise ValueError("Enter an amount in either Debit or Credit, not both.")
+        return self
 
 
 class LedgerDescriptionIn(BaseModel):
@@ -138,3 +144,9 @@ class BankTxnCreate(BaseModel):
     txn_date: str | None = None
     description: str = Field(min_length=1, max_length=200)
     amount: Decimal  # + deposit, - withdrawal
+
+    @model_validator(mode="after")
+    def nonzero_movement(self):
+        if self.amount == 0:
+            raise ValueError("A bank statement movement must have a nonzero amount.")
+        return self

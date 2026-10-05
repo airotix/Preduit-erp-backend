@@ -2,7 +2,7 @@
 import datetime
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, DateTime, String, Uuid, text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, LargeBinary, String, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -24,3 +24,11 @@ class Document(Base):
     uploaded_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class DocumentContent(Base):
+    """Database-backed file bytes when a tech-pack upload is not using S3."""
+    __tablename__ = "document_contents"
+    document_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("documents.id"), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    data: Mapped[bytes] = mapped_column(LargeBinary)

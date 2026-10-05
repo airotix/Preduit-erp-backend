@@ -153,7 +153,7 @@ class ProcurementProductionTests(unittest.TestCase):
                                                   order_id=work.id, name="Old style", qty=4)
         production.start_production(self.db, tenant_id=self.tid, public_id=work.public_id,
                                     stages=[{"name": "Sewing", "days": 2}], line_id=str(item.public_id))
-        stage = self.db.scalar(select(ProductionStage))
+        stage = self.db.scalar(select(ProductionStage).where(ProductionStage.name == "Sewing"))
         self.create_po()
         detail = production.porder_detail(self.db, public_id=work.public_id)
         self.assertIsNone(work.purchase_order_id)
@@ -162,7 +162,7 @@ class ProcurementProductionTests(unittest.TestCase):
         self.assertEqual(detail["orderTotal"], "€40.00")
         self.assertTrue(detail["started"])
         self.assertEqual(stage.status, "In Progress")
-        self.assertEqual(self.count(ProductionStage), 1)
+        self.assertEqual(self.count(ProductionStage), 2)
 
     def test_source_summaries_and_links(self):
         po = self.create_po()
@@ -184,8 +184,11 @@ class ProcurementProductionTests(unittest.TestCase):
         item = self.db.scalar(select(ProductionOrderLine).order_by(ProductionOrderLine.id))
         production.start_production(self.db, tenant_id=self.tid, public_id=work.public_id,
                                     stages=[{"name": "Packed", "days": 1}], line_id=str(item.public_id))
-        stage = self.db.scalar(select(ProductionStage))
+        stage = self.db.scalar(select(ProductionStage).where(ProductionStage.name == "Packed"))
         self.assertEqual(stage.status, "In Progress")
+        with patch("app.modules.documents.service.write_audit"):
+            production.techpacks.upload_line(self.db, tenant_id=self.tid, public_id=item.public_id,
+                filename="tech-pack.pdf", content_type="application/pdf", data=b"%PDF-1.4 test")
         production.stage_action(self.db, action="complete", public_id=stage.public_id)
         inspection = self.db.scalar(select(Inspection))
         self.assertEqual(inspection.order_ref, work.order_no)

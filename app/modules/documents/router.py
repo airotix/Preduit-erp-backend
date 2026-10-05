@@ -4,6 +4,7 @@ import io
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from app.core import storage
 from app.core.config import get_settings
@@ -65,7 +66,14 @@ def download(public_id: str, db: Session = Depends(tenant_db)):
     doc = repo.get_document(db, public_id=public_id)
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
-    data = storage.read_file(doc.storage_path)
+    if doc.storage_path.startswith("db://"):
+        from app.models.document import DocumentContent
+        data = db.scalar(select(DocumentContent.data).where(DocumentContent.document_id == doc.id,
+                                                            DocumentContent.tenant_id == doc.tenant_id))
+        if data is None:
+            raise HTTPException(404, "Document file not found")
+    else:
+        data = storage.read_file(doc.storage_path)
     return StreamingResponse(
         io.BytesIO(data),
         media_type=doc.content_type or "application/octet-stream",

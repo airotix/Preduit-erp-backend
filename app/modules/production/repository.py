@@ -17,13 +17,14 @@ def list_porders(session, *, limit, offset):
     stage_count = (
         select(func.count()).select_from(ProductionStage)
         .where(ProductionStage.order_id == ProductionOrder.id,
-               ProductionStage.is_deleted == False)  # noqa: E712
+               ProductionStage.is_deleted == False, ProductionStage.name != "Tech Pack")  # noqa: E712
         .correlate(ProductionOrder).scalar_subquery()
     )
     done_count = (
         select(func.count()).select_from(ProductionStage)
         .where(ProductionStage.order_id == ProductionOrder.id,
-               ProductionStage.is_deleted == False, ProductionStage.status == "Completed")  # noqa: E712
+               ProductionStage.is_deleted == False, ProductionStage.name != "Tech Pack",
+               ProductionStage.status.in_(("Completed", "Received")))  # noqa: E712
         .correlate(ProductionOrder).scalar_subquery()
     )
     shipped_count = (
@@ -63,7 +64,7 @@ def list_porders(session, *, limit, offset):
     for r in rows:
         total = r.get("stage_count") or 0
         r["started"] = total > 0
-        r["shippable"] = total > 0 and (r.get("done_count") or 0) == total
+        r["shippable"] = total > 0 and (r.get("done_count") or 0) == total and (r.get("progress") or 0) == 100
         r["shipped"] = (r.get("shipped_count") or 0) > 0
     total = session.execute(
         select(func.count()).select_from(ProductionOrder).where(ProductionOrder.is_deleted == False)  # noqa: E712
@@ -73,7 +74,7 @@ def list_porders(session, *, limit, offset):
 
 def list_porders_all(session):
     return [dict(r._mapping) for r in session.execute(
-        select(ProductionOrder.order_no, ProductionOrder.style, ProductionOrder.factory,
+        select(ProductionOrder.id, ProductionOrder.public_id, ProductionOrder.order_no, ProductionOrder.style, ProductionOrder.factory,
                ProductionOrder.qty, ProductionOrder.stage, ProductionOrder.progress)
         .where(ProductionOrder.is_deleted == False)  # noqa: E712
         .order_by(ProductionOrder.id.desc())
@@ -84,7 +85,7 @@ def create_porder(session: Session, *, tenant_id: UUID, style, factory, qty,
                   sales_order_id: int | None = None,
                   purchase_order_id: int | None = None) -> ProductionOrder:
     po = ProductionOrder(tenant_id=tenant_id, style=style, factory=factory, qty=qty,
-                         stage="Trims", progress=0, sales_order_id=sales_order_id,
+                         stage="Tech Pack", progress=0, sales_order_id=sales_order_id,
                          purchase_order_id=purchase_order_id)
     session.add(po)
     session.flush()
@@ -223,9 +224,9 @@ def _recompute_order(session: Session, order_id: int) -> None:
     if not stages:
         return
     po = session.get(ProductionOrder, order_id)
-    completed = sum(1 for s in stages if s.status == "Completed")
+    completed = sum(1 for s in stages if s.status in ("Completed", "Received"))
     po.progress = round(completed / len(stages) * 100)
-    current = next((s for s in stages if s.status != "Completed"), None)
+    current = next((s for s in stages if s.status not in ("Completed", "Received")), None)
     po.stage = current.name if current else stages[-1].name
 
 
@@ -252,6 +253,9 @@ def start_production(session: Session, *, order_public_id: str, stages: list[dic
     po = order_by_public(session, order_public_id)
     if po is None:
         return None
+    from app.modules.techpacks import line_pack
+    tech_pack_days = next((int(stage.get("days") or 0) for stage in stages if stage["name"] == "Tech Pack"), 0)
+    stages = [{"name": "Tech Pack", "days": tech_pack_days}] + [stage for stage in stages if stage["name"] != "Tech Pack"]
     all_lines = list_lines(session, po.id)
     if not all_lines:
         # Manual order with no lines → mirror the order as a single line.
@@ -270,14 +274,15 @@ def start_production(session: Session, *, order_public_id: str, stages: list[dic
     session.flush()
     for line in target:
         cursor = datetime.date.today()
+        received = line_pack(session, line)["status"] == "Received"
         for i, st in enumerate(stages):
             days = int(st.get("days") or 0)
             start = cursor
             end = start + datetime.timedelta(days=days)
             session.add(ProductionStage(
-                tenant_id=po.tenant_id, order_id=po.id, line_id=line.id, seq=i + 1,
+                tenant_id=po.tenant_id, order_id=po.id, line_id=line.id, seq=i,
                 name=st["name"], duration_days=days,
-                status="In Progress" if i == 0 else "Pending",
+                status=("Received" if received else "Pending") if i == 0 else ("In Progress" if i == 1 else "Pending"),
                 start_on=start, end_on=end,
             ))
             cursor = end

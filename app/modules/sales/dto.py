@@ -2,9 +2,9 @@
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.core.validation import clean_email, clean_phone
+from app.core.validation import clean_email, clean_contact
 
 
 class CustomerCreate(BaseModel):
@@ -15,16 +15,18 @@ class CustomerCreate(BaseModel):
     type: str | None = Field(default="Retail", max_length=20)
     region: str | None = None
     phone: str | None = None
+    country: str | None = Field(default=None, max_length=80)
+    state: str | None = Field(default=None, max_length=120)
+    city: str | None = Field(default=None, max_length=120)
 
     @field_validator("email")
     @classmethod
     def _v_email(cls, v):
         return clean_email(v)
 
-    @field_validator("phone")
-    @classmethod
-    def _v_phone(cls, v):
-        return clean_phone(v)
+    @model_validator(mode="after")
+    def _v_contact(self):
+        return clean_contact(self)
     address: str | None = None
     code: str | None = Field(default=None, max_length=20)
     terms: str | None = Field(default=None, max_length=20)

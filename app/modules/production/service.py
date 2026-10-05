@@ -6,15 +6,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.modules.production import repository as repo
+from app.modules import techpacks
 from app.models.production import ProductionOrder, ProductionOrderLine
 from app.models.procurement import PurchaseOrder, PurchaseOrderLine
 from app.modules.production.dto import BomCreate, BomUpdate
 from app.presenters.screen import board_config, initials, list_config, text_cell
 
-STAGES = ["Trims", "Lining", "Cutting", "Sewing", "Finishing", "Packed"]
+STAGES = ["Tech Pack", "Trims", "Lining", "Cutting", "Sewing", "Finishing", "Packed"]
 _STAGE_TONE = {"Trims": "neutral", "Lining": "neutral", "Cutting": "navy",
                "Sewing": "amber", "Finishing": "green", "Packed": "green", "Completed": "green"}
 _BOARD = [
+    ("Tech Pack", "Tech Pack", "#2563EB", "navy", "file-text"),
     ("Trims", "Trims", "#9499A6", "neutral", "activity"),
     ("Lining", "Lining", "#9499A6", "neutral", "activity"),
     ("Cutting", "Cutting", "#3A4256", "navy", "activity"),
@@ -29,6 +31,8 @@ def _tid(t: str | UUID) -> UUID:
 
 
 def porders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
+    from app.modules.techpacks import sync_orders
+    sync_orders(session)
     rows, total = repo.list_porders(session, limit=limit, offset=offset)
     grid = [
         [
@@ -78,7 +82,7 @@ def ship_order(session, *, tenant_id, public_id, carrier, eta, destination):
 
 def _line_is_complete(session, line_id: int) -> bool:
     stages = repo.list_line_stages(session, line_id)
-    return bool(stages) and all(s.status == "Completed" for s in stages)
+    return bool(stages) and all(s.status in ("Completed", "Received") for s in stages)
 
 
 def _open_line_inspection(session, *, tenant_id, order_ref, line: ProductionOrderLine) -> None:
@@ -165,6 +169,8 @@ def set_stage(session, *, public_id, status):
 
 
 def board_screen(session: Session) -> dict:
+    from app.modules import techpacks
+    techpacks.sync_orders(session)
     rows = repo.list_porders_all(session)
     columns = []
     for stage, title, accent, tone, meta_icon in _BOARD:
@@ -173,6 +179,8 @@ def board_screen(session: Session) -> dict:
             if r["stage"] != stage:
                 continue
             cards.append({
+                "public_id": str(r["public_id"]),
+                "href": f"/production/porders/{r['public_id']}",
                 "ref": r["order_no"] or "—",
                 "title": r["style"],
                 "sub": f"{r['qty']:,} units · {r['factory'] or '—'}",
@@ -180,6 +188,9 @@ def board_screen(session: Session) -> dict:
                 "metaIcon": meta_icon,
                 "av": initials(r["style"]),
                 "tone": tone,
+                "techPacks": [{"lineId": str(line.public_id), "name": line.name,
+                               **techpacks.line_pack(session, line)}
+                              for line in repo.list_lines(session, r["id"])] if stage == "Tech Pack" else [],
             })
         columns.append({"title": title, "accent": accent, "count": len(cards), "cards": cards})
     return board_config(columns)
@@ -237,7 +248,7 @@ def _stage_rows(stages, today) -> list[dict]:
         {
             "public_id": str(s.public_id), "seq": s.seq, "name": s.name,
             "duration_days": s.duration_days, "status": s.status,
-            "overdue": s.status != "Completed" and s.end_on is not None and s.end_on < today,
+            "overdue": s.status not in ("Completed", "Received") and s.end_on is not None and s.end_on < today,
             "start": _fmt(s.start_on), "end": _fmt(s.end_on),
             "worker": s.worker or "Unassigned", "notes": s.notes or "",
         }
@@ -250,9 +261,11 @@ def _timeline_alert(stages, today, *, started: bool, all_done: bool):
         return {"type": "done", "message": "All stages completed — production is finished."}
     if not started:
         return None
-    active = next((s for s in stages if s.status != "Completed"), None)
+    active = next((s for s in stages if s.status not in ("Completed", "Received")), None)
     if active is None:
         return None
+    if active.name == "Tech Pack":
+        return {"type": "waiting", "message": "Upload the article’s tech pack to mark this stage Received."}
     if active.status == "In Progress":
         if active.end_on and active.end_on < today:
             return {"type": "overdue",
@@ -266,8 +279,8 @@ def _timeline_alert(stages, today, *, started: bool, all_done: bool):
 
 
 def _timeline(stages, today) -> dict:
-    started = len(stages) > 0
-    completed = sum(1 for s in stages if s.status == "Completed")
+    started = any(s.name != "Tech Pack" for s in stages)
+    completed = sum(1 for s in stages if s.status in ("Completed", "Received"))
     progress = round(completed / len(stages) * 100) if stages else 0
     all_done = started and completed == len(stages)
     status_label = "Completed" if all_done else ("In Progress" if started else "Planned")
@@ -281,6 +294,10 @@ def _timeline(stages, today) -> dict:
 
 def porder_detail(session: Session, *, public_id: str) -> dict | None:
     import datetime
+    from app.modules import techpacks
+    order = repo.order_by_public(session, public_id)
+    if order is not None:
+        techpacks.sync_order(session, order)
     data = repo.get_porder_detail(session, public_id=public_id)
     if data is None:
         return None
@@ -315,7 +332,8 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
     # One timeline per production line (style) → tabs on the detail page.
     lines_out = [
         {"publicId": str(ld["line"].public_id), "name": ld["line"].name,
-         "qty": int(ld["line"].qty or 0), **_timeline(ld["stages"], today)}
+         "qty": int(ld["line"].qty or 0), "techPack": techpacks.line_pack(session, ld["line"]),
+         **_timeline(ld["stages"], today)}
         for ld in (data.get("lines") or [])
     ]
 
@@ -366,6 +384,11 @@ def start_production(session, *, tenant_id, public_id, stages, line_id=None):
 
 
 def stage_action(session, *, action, public_id, days=None, worker=None, notes=None):
+    from fastapi import HTTPException
+    stage = repo.get_stage(session, public_id=public_id)
+    if stage is not None and stage.name == "Tech Pack":
+        if action in ("start", "complete", "resolve"):
+            raise HTTPException(409, "Upload a tech pack to mark this stage Received.")
     if action == "start":
         return repo.start_stage(session, public_id=public_id)
     if action == "complete":

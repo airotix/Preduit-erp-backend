@@ -38,7 +38,8 @@ def validate_upload(*, filename: str, content_type: str | None, size_bytes: int)
 
 def store_document(session: Session, *, tenant_id: str | UUID, module: str,
                    entity_type: str | None, entity_ref: str | None,
-                   filename: str, content_type: str | None, data: bytes) -> dict:
+                   filename: str, content_type: str | None, data: bytes,
+                   database_storage: bool = False) -> dict:
     tid = _tid(tenant_id)
     # Create the row first to get a doc_id, then persist the file under it.
     doc = repo.create_document(
@@ -46,9 +47,14 @@ def store_document(session: Session, *, tenant_id: str | UUID, module: str,
         entity_ref=entity_ref, filename=filename, content_type=content_type,
         size_bytes=len(data), storage_path="",
     )
-    doc.storage_path = storage.save_file(
-        tenant_id=tid, doc_id=doc.doc_id, filename=filename, data=data,
-    )
+    if database_storage:
+        from app.models.document import DocumentContent
+        session.add(DocumentContent(document_id=doc.id, tenant_id=tid, data=data))
+        doc.storage_path = f"db://{doc.public_id}"
+    else:
+        doc.storage_path = storage.save_file(
+            tenant_id=tid, doc_id=doc.doc_id, filename=filename, data=data,
+        )
     session.flush()
     write_audit(session, tenant_id=tid, action="UPLOAD", entity_type="document",
                 entity_id=doc.doc_id, detail=f"Uploaded {filename} ({doc.doc_id})")

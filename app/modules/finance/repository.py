@@ -712,7 +712,7 @@ def cash_bank_ledger(session: Session, *, payment_type: str) -> list[dict]:
         is_receipt = p.pay_type == "Receipt"
         rows.append({"date": _parse_dm(p.pay_date),
                      "ref": p.payment_no or ("RCPT" if is_receipt else "PAY"),
-                     "party": p.party, "partyType": p.party_type or ("customer" if is_receipt else "supplier"),
+                     "party": p.party, "partyType": p.party_type or "other",
                      "source": "Receipt" if is_receipt else "Disbursement",
                      "desc": p.notes or ("Payment received" if is_receipt else "Payment"),
                      "debit": 0.0 if is_receipt else float(p.amount or 0),
@@ -745,6 +745,36 @@ def cash_bank_ledger(session: Session, *, payment_type: str) -> list[dict]:
                      "desc": le.description or "Ledger entry",
                      "debit": float(le.debit or 0), "credit": float(le.credit or 0),
                      "editType": "manual", "editId": str(le.public_id)})
+
+    # Include bank/cash adjustments entered through the journal editor. Payments
+    # and manual ledger rows already appear above; exclude their journals and
+    # reversals so corrections never count the same money twice.
+    journals = session.scalars(select(JournalEntry).where(
+        JournalEntry.status == "Posted", JournalEntry.is_deleted.is_(False))).all()
+    payment_docs = session.scalars(select(Payment)).all()
+    excluded = {payment.gl_journal_id for payment in payment_docs if payment.gl_journal_id}
+    legacy_payment_memos = {f"Payment {payment.payment_no}".strip() for payment in payment_docs if payment.payment_no}
+    excluded.update(journal.id for journal in journals
+        if (journal.source_note or "").startswith("ledger-entry:")
+        or (journal.source_note or "").startswith("payments:")
+        or journal.memo in legacy_payment_memos)
+    while True:
+        reversals = {journal.id for journal in journals if journal.reversed_of_id in excluded}
+        if reversals.issubset(excluded):
+            break
+        excluded.update(reversals)
+    journal_by_id = {journal.id: journal for journal in journals if journal.id not in excluded}
+    if journal_by_id:
+        lines = session.execute(select(JournalLine, Account).join(Account, Account.id == JournalLine.account_id)
+            .where(JournalLine.entry_id.in_(journal_by_id), Account.is_deleted.is_(False),
+                   Account.acct_type == "Asset", Account.name.ilike(f"%{payment_type}%"))).all()
+        for line, account in lines:
+            journal = journal_by_id[line.entry_id]
+            rows.append({"date": journal.entry_on, "ref": journal.entry_no,
+                         "party": "—", "partyType": None, "source": "Journal",
+                         "desc": line.description or journal.memo or "Journal adjustment",
+                         "debit": float(line.credit or 0), "credit": float(line.debit or 0),
+                         "editType": None, "editId": None})
 
     def _sort_key(r):
         d = r.get("date")
@@ -1152,25 +1182,40 @@ def auto_match(session: Session, *, bank_account_id: int) -> int:
         )
     ).scalars().all()
     used = {t.matched_payment_id for t in session.execute(
-        select(BankTransaction).where(BankTransaction.matched_payment_id.isnot(None))
+        select(BankTransaction).where(BankTransaction.matched_payment_id.isnot(None),
+                                      BankTransaction.is_deleted.is_(False))
     ).scalars().all()}
     payments = session.execute(
-        select(Payment).where(Payment.is_deleted == False)  # noqa: E712
+        select(Payment).where(Payment.is_deleted == False, Payment.status == "Cleared",  # noqa: E712
+                              or_(Payment.payment_type == "bank",
+                                  and_(Payment.payment_type.is_(None),
+                                       func.lower(func.coalesce(Payment.method, "Bank")) != "cash")))
     ).scalars().all()
     matched = 0
+    bank = session.get(BankAccount, bank_account_id)
     for t in txns:
-        want_type = "Receipt" if float(t.amount) >= 0 else "Disbursement"
-        target = round(abs(float(t.amount)), 2)
+        want_type = "Receipt" if t.amount > 0 else "Disbursement"
+        target = abs(t.amount)
+        candidates = []
         for p in payments:
-            if p.id in used:
+            if p.id in used or p.tenant_id != t.tenant_id:
                 continue
             p_type = "Receipt" if p.pay_type == "Receipt" else "Disbursement"
-            if p_type == want_type and round(float(p.amount or 0), 2) == target:
-                t.matched_payment_id = p.id
-                t.status = "Matched"
-                used.add(p.id)
-                matched += 1
-                break
+            if p_type != want_type or p.amount != target:
+                continue
+            if bank and bank.gl_code:
+                account = find_account_by_code(session, code=bank.gl_code)
+                if account is None or not session.scalar(select(JournalLine.id).where(
+                        JournalLine.entry_id == p.gl_journal_id, JournalLine.account_id == account.id).limit(1)):
+                    continue
+            candidates.append(p)
+        dated = [p for p in candidates if t.txn_date and _parse_dm(p.pay_date) == t.txn_date]
+        candidates = dated or candidates
+        if len(candidates) == 1:
+            p = candidates[0]
+            t.matched_payment_id, t.status = p.id, "Matched"
+            used.add(p.id)
+            matched += 1
     session.flush()
     return matched
 
@@ -1183,10 +1228,19 @@ def reconcile_matched(session: Session, *, bank_account_id: int) -> int:
             BankTransaction.status == "Matched",
         )
     ).scalars().all()
+    count = 0
     for t in txns:
+        payment = session.get(Payment, t.matched_payment_id) if t.matched_payment_id else None
+        channel = (payment.payment_type or ("cash" if (payment.method or "").strip().lower() == "cash" else "bank")) if payment else None
+        signed_amount = (payment.amount if payment.pay_type == "Receipt" else -payment.amount) if payment else None
+        if (payment is None or payment.is_deleted or payment.status != "Cleared" or channel != "bank"
+                or payment.tenant_id != t.tenant_id or signed_amount != t.amount):
+            t.status, t.matched_payment_id = "Unmatched", None
+            continue
         t.status = "Reconciled"
+        count += 1
     session.flush()
-    return len(txns)
+    return count
 
 
 def payment_no_by_id(session: Session, pid: int | None) -> str | None:

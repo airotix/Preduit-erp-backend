@@ -48,6 +48,6 @@ def list_documents(session: Session, *, module: str | None, entity_ref: str | No
 
 def get_document(session: Session, *, public_id: str) -> Document | None:
     return session.execute(
-        select(Document).where(Document.public_id == public_id,
+        select(Document).where(Document.public_id == UUID(str(public_id)),
                                Document.is_deleted == False)  # noqa: E712
     ).scalar_one_or_none()

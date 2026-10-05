@@ -23,6 +23,9 @@ class Customer(Base):
     # 'type' is mapped to a differently-named attribute to avoid shadowing.
     kind: Mapped[str] = mapped_column("type", String(20), default="Retail")
     region: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    country_code: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(120), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
     address: Mapped[str | None] = mapped_column(String(300), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="Active")

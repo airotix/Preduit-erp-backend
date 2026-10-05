@@ -124,9 +124,8 @@ class CreditNote(Base):
 
 
 class LedgerEntry(Base):
-    """Manual customer-ledger entry (a debit and/or credit with a description),
-    created from the customer ledger 'New entry' button. Ledger-only — affects
-    the customer's running balance but is not posted to the GL."""
+    """Manual party or cash/bank movement, linked to posted GL journals through
+    their source_note. Unclassified movements use the ledger clearing account."""
     __tablename__ = "ledger_entries"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))

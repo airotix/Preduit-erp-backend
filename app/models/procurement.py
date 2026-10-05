@@ -18,6 +18,8 @@ class Supplier(Base):
     region: Mapped[str | None] = mapped_column(String(80), nullable=True)
     category: Mapped[str | None] = mapped_column(String(120), nullable=True)
     country_code: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(120), nullable=True)
     lead_time: Mapped[str | None] = mapped_column(String(40), nullable=True)
     on_time_pct: Mapped[int] = mapped_column(Integer, default=0)
     defect_rate: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)

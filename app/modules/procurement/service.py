@@ -1,4 +1,5 @@
 """Procurement business logic → frontend ScreenConfig."""
+from app.core.locations import country_name
 import datetime
 import json
 import uuid
@@ -412,9 +413,11 @@ def search_suppliers(session: Session, *, q: str, limit: int = 10) -> list[dict]
 
 
 def create_supplier(session: Session, *, tenant_id: str | UUID, payload: SupplierCreate):
+    from app.core.locations import country_code
     return repo.create_supplier(
         session, tenant_id=_tid(tenant_id), name=payload.name, region=payload.region,
         lead_time=payload.leadTime, category=payload.category,
+        country_code=country_code(payload.country), state=payload.state, city=payload.city,
         email=payload.email, phone=payload.phone, address=payload.address,
         vat_number=payload.vatNumber, contact_person=payload.contactPerson,
         bank_details=payload.bankDetails, bank_name=payload.bankName,
@@ -424,9 +427,11 @@ def create_supplier(session: Session, *, tenant_id: str | UUID, payload: Supplie
 
 
 def update_supplier(session: Session, *, public_id: str, payload: SupplierUpdate):
+    from app.core.locations import country_code
     return repo.update_supplier(
         session, public_id=public_id, name=payload.name, region=payload.region,
         lead_time=payload.leadTime, category=payload.category,
+        country_code=country_code(payload.country), state=payload.state, city=payload.city,
         email=payload.email, phone=payload.phone, address=payload.address,
         vat_number=payload.vatNumber, contact_person=payload.contactPerson,
         bank_details=payload.bankDetails, bank_name=payload.bankName,
@@ -517,6 +522,7 @@ def supplier_detail(session: Session, *, public_id: str) -> dict | None:
             },
             # Raw values to prefill the in-place "Edit details" form.
             "supplierForm": {
+                "country": country_name(s.country_code), "state": s.state or "", "city": s.city or "",
                 "name": s.name, "region": s.region or "", "leadTime": s.lead_time or "",
                 "category": s.category or "", "email": s.email or "", "phone": s.phone or "",
                 "address": s.address or "", "contactPerson": s.contact_person or "",
@@ -642,7 +648,8 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
     return {
         "invoiceNo": invoice_no, "invoiceDate": today, "poNo": po.po_no or "",
         "orderDate": today, "deliveryDate": po.expected or "",
-        "contact": (supplier.phone if supplier else "") or "",
+        "contact": (supplier.contact_person if supplier else "") or "",
+        "contactPhone": (supplier.phone if supplier else "") or "",
         "incoterms": "FOB Karachi", "origin": company.get("country") or "Pakistan",
         "currency": currency,
         "terms": "T/T · L/C", "portLoading": company.get("city") or "Karachi", "portDischarge": "",
@@ -653,7 +660,7 @@ def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
             "name": supplier_name,
             "vat": (supplier.vat_number if supplier else "") or "",
             "contact": (supplier.contact_person if supplier else "") or "",
-            "country": (supplier.country_code if supplier else "") or "",
+            "country": country_name(supplier.country_code) if supplier else "",
             "tel": (supplier.phone if supplier else "") or "",
             "email": (supplier.email if supplier else "") or "",
         },
@@ -742,6 +749,8 @@ def ensure_invoice_payable(session, invoice):
 
 
 def create_invoice(session: Session, *, tenant_id, data: dict) -> dict:
+    from app.core.validation import validate_invoice_phones
+    validate_invoice_phones(data)
     f = _persist_fields(data)
     inv = repo.create_po_invoice(session, tenant_id=_tid(tenant_id), data=json.dumps(data), **f)
     ensure_invoice_payable(session, inv)
@@ -763,6 +772,8 @@ def get_invoice(session: Session, *, public_id: str) -> dict | None:
 
 
 def update_invoice(session: Session, *, public_id: str, data: dict) -> dict | None:
+    from app.core.validation import validate_invoice_phones
+    validate_invoice_phones(data)
     inv = repo.get_po_invoice(session, public_id=public_id)
     if inv is None:
         return None

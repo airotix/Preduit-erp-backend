@@ -1,4 +1,5 @@
 """Sales business logic → frontend ScreenConfig."""
+from app.core.locations import country_name
 import datetime
 import json
 import uuid
@@ -63,7 +64,9 @@ def customers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
 
 
 def _customer_fields(p) -> dict:
+    from app.core.locations import country_code
     return {"name": p.name, "email": p.email or "", "kind": p.type or "Retail",
+            "country_code": country_code(p.country), "state": p.state, "city": p.city,
             "region": p.region, "phone": p.phone, "address": p.address,
             "code": p.code, "terms": p.terms, "currency": p.currency,
             "tax_id": p.taxId, "bank_name": p.bankName, "bank_account": p.bankAccount,
@@ -281,7 +284,7 @@ def record_invoice_payment(session: Session, *, tenant_id: str | UUID, public_id
         today = datetime.date.today()
         fin_repo.create_payment(
             session, tenant_id=tid, party=inv.customer_name, amount=amt,
-            pay_type="Receipt", method="Cash", reference=inv.invoice_no,
+            pay_type="Receipt", method="Bank" if inv.payment_type == "bank" else "Cash", reference=inv.invoice_no,
             allocated_to=inv.invoice_no, pay_date=today.isoformat(),
             status="Cleared", notes=f"Payment for {inv.order_no or inv.invoice_no or 'order'}",
         )
@@ -531,6 +534,7 @@ def customer_detail(session: Session, *, public_id: str) -> dict | None:
                 "taxId": c.tax_id or "", "bank": c.bank_name or "", "account": c.bank_account or "",
             },
             "customerForm": {
+                "country": country_name(c.country_code), "state": c.state or "", "city": c.city or "",
                 "name": c.name, "type": c.kind or "Retail", "region": c.region or "",
                 "email": c.email or "", "phone": c.phone or "", "address": c.address or "",
                 "code": c.code or "", "terms": c.terms or "", "currency": c.currency or "",
@@ -614,7 +618,7 @@ def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: 
         # Prefer the customer's Tax ID/VAT; fall back to their customer code.
         "taxId": ((customer.tax_id or customer.code) if customer else "") or "",
         "address": (customer.address if customer else "") or "",
-        "country": (customer.region if customer else "") or "",
+        "country": country_name(customer.country_code) if customer else "",
     }
     # Payment terms come from the customer profile when set.
     cust_terms = (customer.terms if customer else "") or "Net 30"
@@ -752,6 +756,8 @@ def list_sales_invoice_docs(session: Session, *, limit: int = 50, offset: int = 
 
 
 def create_sales_invoice_doc(session: Session, *, tenant_id, data: dict) -> dict:
+    from app.core.validation import validate_invoice_phones
+    validate_invoice_phones(data)
     f = _sinv_persist_fields(data)
     inv = repo.create_sales_invoice(session, tenant_id=_tid(tenant_id), data=json.dumps(data), **f)
     return {"publicId": str(inv.public_id), "invoiceNo": inv.invoice_no}
@@ -768,6 +774,8 @@ def get_sales_invoice_doc(session: Session, *, public_id: str) -> dict | None:
 
 
 def update_sales_invoice_doc(session: Session, *, public_id: str, data: dict) -> dict | None:
+    from app.core.validation import validate_invoice_phones
+    validate_invoice_phones(data)
     inv = repo.get_sales_invoice(session, public_id=public_id)
     if inv is None:
         return None

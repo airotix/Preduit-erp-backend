@@ -20,7 +20,7 @@ class ProductionOrder(Base):
     style: Mapped[str] = mapped_column(String(200))
     factory: Mapped[str | None] = mapped_column(String(120), nullable=True)
     qty: Mapped[int] = mapped_column(Integer, default=0)          # total qty across all lines
-    stage: Mapped[str] = mapped_column(String(20), default="Trims")
+    stage: Mapped[str] = mapped_column(String(20), default="Tech Pack")
     progress: Mapped[int] = mapped_column(Integer, default=0)
     sales_order_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     purchase_order_id: Mapped[int | None] = mapped_column(

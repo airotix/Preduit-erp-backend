@@ -1,9 +1,9 @@
 """Procurement API contracts — match the frontend forms."""
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.core.validation import clean_email, clean_phone
+from app.core.validation import clean_email, clean_contact
 
 
 class POLineIn(BaseModel):
@@ -37,6 +37,9 @@ class SupplierCreate(BaseModel):
     category: str | None = Field(default=None, max_length=120)
     email: str | None = Field(default=None, max_length=256)
     phone: str | None = Field(default=None, max_length=40)
+    country: str | None = Field(default=None, max_length=80)
+    state: str | None = Field(default=None, max_length=120)
+    city: str | None = Field(default=None, max_length=120)
     address: str | None = Field(default=None, max_length=300)
     vatNumber: str | None = Field(default=None, max_length=40)
     contactPerson: str | None = Field(default=None, max_length=120)
@@ -53,10 +56,9 @@ class SupplierCreate(BaseModel):
     def _v_email(cls, v):
         return clean_email(v)
 
-    @field_validator("phone")
-    @classmethod
-    def _v_phone(cls, v):
-        return clean_phone(v)
+    @model_validator(mode="after")
+    def _v_contact(self):
+        return clean_contact(self)
 
 
 class SupplierUpdate(SupplierCreate):

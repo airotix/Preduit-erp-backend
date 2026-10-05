@@ -11,3 +11,4 @@ redis==5.0.7
 azure-identity==1.17.1
 azure-keyvault-secrets==4.8.0
 boto3==1.38.0
+phonenumbers==9.0.40
