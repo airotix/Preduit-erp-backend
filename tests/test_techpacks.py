@@ -76,6 +76,13 @@ class TechPackTests(unittest.TestCase):
         self.assertEqual(techpacks.product_pack(self.db, self.article)["document"]["filename"], "pack.pdf")
         self.assertEqual(self.count(DocumentContent), 2)
 
+    def test_line_status_only_uses_direct_product_link_and_real_line_upload(self):
+        self.line.name = "Article"
+        self.line.sku = None
+        self.db.flush()
+        self.upload()
+        self.assertEqual(techpacks.line_pack(self.db, self.line)["status"], "Pending")
+
     def test_unlinked_upload_stays_on_line_and_tenant_isolation(self):
         self.line.name = "Unknown"
         self.line.sku = "UNKNOWN"

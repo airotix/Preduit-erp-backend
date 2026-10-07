@@ -53,10 +53,9 @@ def product_for_line(session, line):
     if variant:
         return session.scalar(select(Product).where(Product.id == variant.product_id,
             Product.tenant_id == line.tenant_id, Product.is_deleted.is_(False)))
-    # Legacy/manual items can link by an exact, unambiguous article title.
-    matches = session.scalars(select(Product).where(Product.tenant_id == line.tenant_id,
-        Product.title == line.name, Product.is_deleted.is_(False)).limit(2)).all()
-    return matches[0] if len(matches) == 1 else None
+    # Do not auto-attach a production line to a product by name alone. A title match can
+    # make a new line inherit a different article's tech-pack and incorrectly mark TNA as received.
+    return None
 
 
 def _document(session, tenant_id, module, ref):
@@ -78,8 +77,9 @@ def product_pack(session, product):
 
 def line_pack(session, line):
     product = product_for_line(session, line)
-    document = _document(session, product.tenant_id, "catalog", product.public_id) if product else None
-    document = document or _document(session, line.tenant_id, "production", line.public_id)
+    document = _document(session, line.tenant_id, "production", line.public_id)
+    if document is None and product is not None:
+        document = _document(session, product.tenant_id, "catalog", product.public_id)
     return _payload(document, product)
 
 
