@@ -13,6 +13,7 @@ from app.models.procurement import PurchaseOrder, PurchaseOrderLine, Supplier
 from app.models.production import ProductionOrder, ProductionOrderLine
 from app.models.quality import Inspection
 from app.models.shipments import Shipment, ShipmentLine
+from app.models.batches import ProductionBatch
 
 
 def lock_order(session, *, tenant_id, public_id=None, order_id=None):
@@ -86,18 +87,23 @@ def holds_for(session, order):
 
 
 def stock_summary(session, order):
+    from app.modules.batches.service import managed_sales, dispatched_sales
+    sent = dispatched_sales(session, order.tenant_id, order.id) if managed_sales(session, order) else {}
     totals = {}
     for hold in holds_for(session, order):
         totals[hold.order_line_id] = totals.get(hold.order_line_id, 0) + hold.qty
     return [{"lineId": line.id, "name": line.name, "color": line.color, "size": line.size,
              "sku": line.sku, "ordered": line.qty, "reserved": totals.get(line.id, 0),
-             "missing": 0 if order.status in ("Shipped", "Cancelled") else max(0, line.qty - totals.get(line.id, 0))} for line in lines_for(session, order)]
+             "dispatched": sent.get(line.id, 0),
+             "missing": 0 if order.status in ("Shipped", "Cancelled") else max(0, line.qty - sent.get(line.id, 0) - totals.get(line.id, 0))} for line in lines_for(session, order)]
 
 
 def reserve_available(session, order):
     """Caller locks order; lock stock in a stable order to avoid overselling."""
     if not order.fulfillment_tracked or order.status in ("Cancelled", "Shipped"):
         return
+    from app.modules.batches.service import managed_sales, dispatched_sales
+    sent = dispatched_sales(session, order.tenant_id, order.id) if managed_sales(session, order) else {}
     lines = lines_for(session, order)
     variants = {line.id: variant_for(session, order, line) for line in lines}
     for line in lines:
@@ -111,7 +117,7 @@ def reserve_available(session, order):
     holds = holds_for(session, order)
     owned = {(h.order_line_id, h.stock_level_id): h for h in holds}
     for line in lines:
-        missing = line.qty - sum(h.qty for h in holds if h.order_line_id == line.id)
+        missing = line.qty - sent.get(line.id, 0) - sum(h.qty for h in holds if h.order_line_id == line.id)
         variant = variants[line.id]
         if variant is None or missing <= 0:
             continue
@@ -154,7 +160,25 @@ def release_holds(session, order, *, consume=False):
 
 def purchase_orders(session, order):
     return session.scalars(select(PurchaseOrder).where(PurchaseOrder.tenant_id == order.tenant_id,
-        PurchaseOrder.sales_order_id == order.id, PurchaseOrder.is_deleted.is_(False)).order_by(PurchaseOrder.id)).all()
+        PurchaseOrder.sales_order_id == order.id, PurchaseOrder.is_deleted.is_(False),
+        PurchaseOrder.status != "Rejected").order_by(PurchaseOrder.id)).all()
+
+
+def procurement_summary(session, order):
+    rows = stock_summary(session, order)
+    sources = {line.id: line for line in lines_for(session, order)}
+    outstanding = {}
+    for po in purchase_orders(session, order):
+        if po.inventory_received:
+            continue
+        for line in session.scalars(select(PurchaseOrderLine).where(
+                PurchaseOrderLine.po_id == po.id, PurchaseOrderLine.tenant_id == order.tenant_id)).all():
+            outstanding[line.sales_order_line_id] = outstanding.get(line.sales_order_line_id, 0) + line.qty
+    for row in rows:
+        row["toPurchase"] = max(0, row["missing"] - outstanding.get(row["lineId"], 0))
+        variant = variant_for(session, order, sources[row["lineId"]])
+        row["productId"] = variant.product_id if variant else None
+    return rows
 
 
 def qc_cleared(session, po):
@@ -178,6 +202,12 @@ def qc_cleared(session, po):
 
 
 def refresh_order(session, order):
+    from app.modules.batches.service import managed_sales, update_sales
+    if managed_sales(session, order):
+        if order.status != "Cancelled":
+            reserve_available(session, order)
+        update_sales(session, order.tenant_id, order.id)
+        return None
     if not order.fulfillment_tracked or order.status == "Cancelled":
         return None
     if order.status == "Shipped":
@@ -187,7 +217,7 @@ def refresh_order(session, order):
     missing = any(row["missing"] for row in stock_summary(session, order))
     pos = purchase_orders(session, order)
     if missing:
-        order.status = "Awaiting stock" if pos else "PO needed"
+        order.status = "PO needed" if any(r["toPurchase"] for r in procurement_summary(session, order)) else "Awaiting stock"
         session.flush()
         return None
     existing = session.scalar(select(Shipment).where(Shipment.tenant_id == order.tenant_id,
@@ -211,56 +241,79 @@ def refresh_order(session, order):
 def fulfillment_detail(session, order):
     if not order.fulfillment_tracked:
         return None
-    rows = stock_summary(session, order)
+    rows = procurement_summary(session, order)
     pos = purchase_orders(session, order)
     shipment = session.scalar(select(Shipment).where(Shipment.sales_order_id == order.id,
         Shipment.tenant_id == order.tenant_id, Shipment.is_deleted.is_(False)))
-    return {"lines": rows, "canCreatePO": order.status == "PO needed" and not pos and any(r["missing"] for r in rows),
+    return {"lines": rows, "canCreatePO": order.status not in ("Shipped", "Cancelled") and any(r["toPurchase"] for r in rows),
         "purchaseOrders": [{"publicId": str(po.public_id), "poNo": po.po_no} for po in pos],
         "shipment": {"publicId": str(shipment.public_id), "shipmentNo": shipment.shipment_no} if shipment else None}
 
 
 def create_shortage_po(session, *, tenant_id, public_id, supplier_id):
+    pos = create_shortage_pos(session, tenant_id=tenant_id, public_id=public_id, supplier_id=supplier_id)
+    return pos[0] if pos else None
+
+
+def create_shortage_pos(session, *, tenant_id, public_id, supplier_id=None, assignments=None):
     order = lock_order(session, tenant_id=tenant_id, public_id=public_id)
     if not order.fulfillment_tracked or order.status in ("Cancelled", "Shipped"):
         raise HTTPException(409, "This order cannot create a shortage PO.")
-    existing = purchase_orders(session, order)
-    if existing:
-        return existing[0]
-    supplier = session.scalar(select(Supplier).where(Supplier.public_id == UUID(str(supplier_id)),
-        Supplier.tenant_id == order.tenant_id, Supplier.is_deleted.is_(False)))
-    if supplier is None:
-        raise HTTPException(404, "Supplier not found")
     reserve_available(session, order)
     source_lines = {ln.id: ln for ln in lines_for(session, order)}
-    shortages = [r for r in stock_summary(session, order) if r["missing"]]
+    shortages = [r for r in procurement_summary(session, order) if r["toPurchase"]]
     if not shortages:
         refresh_order(session, order)
-        return None
-    lines = []
+        return purchase_orders(session, order)
+    chosen = {}
+    if assignments is not None:
+        for entry in assignments:
+            line_id, supplier = entry.lineId, entry.supplierId
+            if line_id in chosen or line_id not in source_lines:
+                raise HTTPException(400, "Invalid or duplicate sales order line.")
+            chosen[line_id] = supplier
+        if set(chosen) != {r["lineId"] for r in shortages}:
+            raise HTTPException(409, "Shortages changed. Reload and select a supplier for every remaining item.")
+    else:
+        chosen = {r["lineId"]: supplier_id for r in shortages}
+    groups = {}
     for row in shortages:
         variant = variant_for(session, order, source_lines[row["lineId"]])
         if variant is None or variant.supplier_price is None:
             raise HTTPException(409, f"Set a catalog variant and supplier purchase price for {row['name']} ({row['color'] or 'no color'}, {row['size'] or 'no size'}) before creating its PO.")
-        lines.append({"name": row["name"], "color": row["color"], "size": row["size"],
-            "sku": variant.sku, "qty": row["missing"], "price": variant.supplier_price})
+        group = groups.setdefault(variant.product_id, {"supplierId": chosen[row["lineId"]], "lines": [], "sources": []})
+        if group["supplierId"] != chosen[row["lineId"]]:
+            raise HTTPException(400, "Choose one supplier for all variants of an item.")
+        group["lines"].append({"name": row["name"], "color": row["color"], "size": row["size"],
+            "sku": variant.sku, "qty": row["toPurchase"], "price": variant.supplier_price})
+        group["sources"].append(row["lineId"])
     from app.modules.procurement.dto import PurchaseOrderCreate
     from app.modules.procurement import service as procurement
-    lead = re.search(r"\d+", supplier.lead_time or "")
-    days = int(lead.group()) if lead else 30
-    if lead and "week" in supplier.lead_time.lower():
-        days *= 7
-    days = min(days, 3650)
-    po = procurement.create_po(session, tenant_id=order.tenant_id, payload=PurchaseOrderCreate(
-        supplier=supplier.name, expected=(date.today() + timedelta(days=days)).strftime("%d %b %Y"), lines=lines))
-    po.sales_order_id = order.id
-    po_lines = session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.po_id == po.id,
-        PurchaseOrderLine.tenant_id == order.tenant_id).order_by(PurchaseOrderLine.id)).all()
-    for source, target in zip(shortages, po_lines):
-        target.sales_order_line_id = source["lineId"]
+    # Validate every supplier before creating any of the linked POs.
+    for group in groups.values():
+        group["supplier"] = session.scalar(select(Supplier).where(
+            Supplier.public_id == UUID(str(group["supplierId"])),
+            Supplier.tenant_id == order.tenant_id, Supplier.is_deleted.is_(False)))
+        if group["supplier"] is None:
+            raise HTTPException(404, "Supplier not found")
+    created = []
+    for group in groups.values():
+        supplier = group["supplier"]
+        lead = re.search(r"\d+", supplier.lead_time or "")
+        days = int(lead.group()) if lead else 30
+        if lead and "week" in supplier.lead_time.lower():
+            days *= 7
+        po = procurement.create_po(session, tenant_id=order.tenant_id, resolved_supplier=supplier, payload=PurchaseOrderCreate(
+            supplier=supplier.name, expected=(date.today() + timedelta(days=min(days, 3650))).strftime("%d %b %Y"), lines=group["lines"]))
+        po.sales_order_id = order.id
+        po_lines = session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.po_id == po.id,
+            PurchaseOrderLine.tenant_id == order.tenant_id).order_by(PurchaseOrderLine.id)).all()
+        for source_id, target in zip(group["sources"], po_lines):
+            target.sales_order_line_id = source_id
+        created.append(po)
     order.status = "Awaiting stock"
     session.flush()
-    return po
+    return created
 
 
 def complete_shipment(session, order):
@@ -285,6 +338,11 @@ def receive_inspected_production(session, *, tenant_id, order_ref):
         PurchaseOrder.is_deleted.is_(False)))
     if po is None:
         return None
+    from app.models.batches import ProductionBatch
+    if session.scalar(select(ProductionBatch.id).join(ProductionOrder,
+            ProductionOrder.id == ProductionBatch.order_id).where(ProductionBatch.tenant_id == tid,
+            ProductionOrder.purchase_order_id == po.id).limit(1)):
+        raise HTTPException(409, "Record QC quantities and receive approved stock on the production batch.")
     # Lock the source and other waiting orders before taking any stock locks.
     # Stable order prevents competing QC receipts from allocating the same units.
     orders = session.scalars(select(SalesOrder).where(SalesOrder.tenant_id == tid,

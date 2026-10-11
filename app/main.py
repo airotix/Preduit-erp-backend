@@ -25,6 +25,7 @@ from app.modules.production.router import router as production_router
 from app.modules.quality.router import router as quality_router
 from app.modules.sales.router import router as sales_router
 from app.modules.shipments.router import router as shipments_router
+from app.modules.batches.router import router as batches_router
 
 settings = get_settings()
 log = logging.getLogger("uvicorn.error")
@@ -102,6 +103,7 @@ app.include_router(dashboards_router, prefix=API_V1)
 app.include_router(production_router, prefix=API_V1)
 app.include_router(quality_router, prefix=API_V1)
 app.include_router(shipments_router, prefix=API_V1)
+app.include_router(batches_router, prefix=API_V1)
 app.include_router(admin_router, prefix=API_V1)
 app.include_router(ai_router, prefix=API_V1)
 app.include_router(order_history_router, prefix=API_V1)

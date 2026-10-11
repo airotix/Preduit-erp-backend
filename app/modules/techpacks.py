@@ -61,6 +61,7 @@ def product_for_line(session, line):
 def _document(session, tenant_id, module, ref):
     return session.scalar(select(Document).where(Document.tenant_id == tenant_id,
         Document.module == module, Document.entity_type == "tech-pack", Document.entity_ref == str(ref),
+        Document.filename.ilike("%.pdf"), Document.content_type == "application/pdf",
         Document.is_deleted.is_(False), Document.storage_path != "").order_by(Document.id.desc()).limit(1))
 
 
@@ -84,6 +85,10 @@ def line_pack(session, line):
 
 
 def sync_order(session, order):
+    from app.models.batches import ProductionBatch
+    if session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == order.id,
+            ProductionBatch.tenant_id == order.tenant_id).limit(1)):
+        return
     from app.modules.production import repository as production
     lines = production.list_lines(session, order.id)
     if not lines:

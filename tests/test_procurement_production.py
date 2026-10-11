@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.base import Base
+from app.models.core import Tenant, User  # Register profile tables before copying the test schema.
 from app.models.procurement import PurchaseOrder, PurchaseOrderLine, PoInvoice
 from app.models.production import ProductionOrder, ProductionOrderLine, ProductionStage
 from app.models.sales import SalesOrder
@@ -31,7 +32,7 @@ from app.modules.sales.dto import OrderCreate
 
 class ProcurementProductionTests(unittest.TestCase):
     def setUp(self):
-        self.engine = create_engine("sqlite://")
+        self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
         schema = MetaData()
         for table in Base.metadata.sorted_tables:
             copy = table.to_metadata(schema)
@@ -95,6 +96,33 @@ class ProcurementProductionTests(unittest.TestCase):
         self.assertEqual(self.count(ProductionOrder), 1)
         self.assertEqual(self.count(ProductionOrderLine), 2)
         self.assertEqual(self.count(PoInvoice), 1)
+
+    def test_rejected_po_removes_production_tna_and_inspections_from_active_work(self):
+        po = self.create_po()
+        work = self.db.scalar(select(ProductionOrder))
+        line = self.db.scalar(select(ProductionOrderLine))
+        stage = ProductionStage(tenant_id=self.tid, order_id=work.id, line_id=line.id,
+            seq=1, name="Packed", status="Pending")
+        inspection = Inspection(tenant_id=self.tid, order_ref=work.order_no, item=line.name,
+            stage="Final", result="Pending")
+        self.db.add_all([stage, inspection])
+        self.db.flush()
+        procurement.set_po_status(self.db, public_id=po.public_id, status="Rejected", tenant_id=self.tid)
+        self.assertTrue(work.is_deleted)
+        self.assertTrue(stage.is_deleted)
+        self.assertTrue(inspection.is_deleted)
+        self.assertTrue(all(l.is_deleted for l in self.db.scalars(select(ProductionOrderLine)).all()))
+        self.assertIsNone(production_repo.order_by_public(self.db, work.public_id))
+        with self.assertRaises(HTTPException):
+            procurement.set_po_status(self.db, public_id=po.public_id, status="Approved", tenant_id=self.tid)
+
+    def test_received_po_cannot_be_rejected(self):
+        po = self.create_po()
+        po.inventory_received = True
+        self.db.flush()
+        with self.assertRaises(HTTPException):
+            procurement.set_po_status(self.db, public_id=po.public_id, status="Rejected", tenant_id=self.tid)
+        self.assertFalse(self.db.scalar(select(ProductionOrder)).is_deleted)
 
     def test_database_rejects_duplicate_source_po(self):
         po = self.create_po()

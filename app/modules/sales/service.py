@@ -15,7 +15,7 @@ from app.presenters.screen import board_config, initials, list_config, text_cell
 
 _TYPE_TONE = {"Wholesale": "navy", "Retail": "neutral"}
 _CHANNEL_TONE = {"Wholesale": "navy", "Online": "green", "Marketplace": "amber", "Retail": "neutral"}
-_ORDER_STATUS_TONE = {"New": "gray", "PO needed": "amber", "Awaiting stock": "amber", "Packed": "navy", "Shipped": "green", "Cancelled": "red"}
+_ORDER_STATUS_TONE = {"New": "gray", "PO needed": "amber", "Awaiting stock": "amber", "Packed": "navy", "Partially shipped": "amber", "Shipped": "green", "Cancelled": "red"}
 _INV_STATUS_TONE = {"Open": "amber", "Paid": "green", "Overdue": "red"}
 _RET_STATUS_TONE = {"Inspecting": "amber", "Refunded": "green", "Rejected": "red"}
 
@@ -23,6 +23,7 @@ _RET_STATUS_TONE = {"Inspecting": "amber", "Refunded": "green", "Rejected": "red
 _BOARD_COLUMNS = [
     ("PO needed", "PO needed", "#D29A22", "amber", "package"),
     ("Awaiting stock", "Awaiting stock", "#D29A22", "amber", "package"),
+    ("Partially shipped", "Partially shipped", "#D29A22", "amber", "truck"),
     ("New", "New", "#9499A6", "neutral", "package"),
     ("Packed", "Packed", "#3A4256", "navy", "package"),
     ("Shipped", "Shipped", "#2E9E6B", "green", "truck"),
@@ -330,6 +331,11 @@ def set_order_status(session, *, public_id, status):
     order = session.scalar(select(SalesOrder).where(SalesOrder.public_id == UUID(str(public_id)),
         SalesOrder.is_deleted.is_(False)).with_for_update().execution_options(populate_existing=True))
     if order is not None and order.fulfillment_tracked:
+        from app.modules.batches.service import managed_sales
+        if managed_sales(session, order):
+            if status == order.status:
+                return order
+            raise HTTPException(409, "Batch order totals and status come from dispatch records. Reconcile batch work before cancelling an order.")
         if status not in ("New", "Packed", "Shipped", "Cancelled"):
             raise HTTPException(400, "Stock statuses are set automatically.")
         if order.status in ("Cancelled", "Shipped") and status != order.status:
@@ -571,7 +577,7 @@ def _exporter_from_company(c: dict) -> dict:
     """Build the invoice letterhead (our business) from the company profile."""
     addr = ", ".join(p for p in [c.get("street"), c.get("city"), c.get("state"), c.get("postal")] if p)
     return {
-        "name": c.get("name") or "",
+        "name": c.get("legal_name") or c.get("name") or "",
         "address": addr,
         "country": c.get("country") or "",
         "tel": c.get("phone") or c.get("support_line") or "",
@@ -592,7 +598,16 @@ def _channel_price(variant: dict | None, invoice_type: str, fallback) -> float:
     return round(float(fallback or 0), 4)
 
 
-def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: str) -> dict | None:
+def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: str, actor_id=None) -> dict | None:
+    data = _build_sales_invoice_draft(session, order_no=order_no, invoice_type=invoice_type)
+    if data is None:
+        return None
+    source = repo.order_by_no(session, order_no=order_no)
+    from app.modules.invoice_banking import profile_defaults
+    return profile_defaults(session, source.tenant_id, data, actor_id, sales=True)
+
+
+def _build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: str) -> dict | None:
     """Assemble a prefilled invoice document from a sales order. Colour/size and
     per-channel pricing are enriched by looking up each line's SKU in the catalog."""
     invoice_type = invoice_type if invoice_type in _INVOICE_TYPES else "Retail"
@@ -755,21 +770,26 @@ def list_sales_invoice_docs(session: Session, *, limit: int = 50, offset: int = 
     } for r in rows], "total": total}
 
 
-def create_sales_invoice_doc(session: Session, *, tenant_id, data: dict) -> dict:
+def create_sales_invoice_doc(session: Session, *, tenant_id, data: dict, actor_id=None) -> dict:
+    from app.modules.invoice_banking import profile_defaults
     from app.core.validation import validate_invoice_phones
+    validate_invoice_phones(data)
+    data = profile_defaults(session, tenant_id, data, actor_id, sales=True)
     validate_invoice_phones(data)
     f = _sinv_persist_fields(data)
     inv = repo.create_sales_invoice(session, tenant_id=_tid(tenant_id), data=json.dumps(data), **f)
     return {"publicId": str(inv.public_id), "invoiceNo": inv.invoice_no}
 
 
-def get_sales_invoice_doc(session: Session, *, public_id: str) -> dict | None:
+def get_sales_invoice_doc(session: Session, *, public_id: str, actor_id=None) -> dict | None:
     inv = repo.get_sales_invoice(session, public_id=public_id)
     if inv is None:
         return None
     from app.modules.invoice_banking import company_bank, fill_missing
     data = json.loads(inv.data)
     data["remit"] = fill_missing(data.get("remit"), company_bank(repo.company_info(session)))
+    from app.modules.invoice_banking import profile_defaults
+    data = profile_defaults(session, inv.tenant_id, data, actor_id, sales=True)
     return {**_sinv_summary(inv), "data": data}
 
 

@@ -9,6 +9,7 @@ from app.models.base import Base
 
 class Shipment(Base):
     __tablename__ = "shipments"
+    batch_managed: Mapped[bool] = mapped_column(Boolean, default=False)
     sales_order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_orders.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))

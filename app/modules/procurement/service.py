@@ -84,7 +84,7 @@ def _exporter_from_company(c: dict) -> dict:
     """Build the invoice letterhead (our business) from the company profile."""
     addr = ", ".join(p for p in [c.get("street"), c.get("city"), c.get("state"), c.get("postal")] if p)
     return {
-        "name": c.get("name") or "",
+        "name": c.get("legal_name") or c.get("name") or "",
         "address": addr,
         "country": c.get("country") or "",
         "tel": c.get("phone") or c.get("support_line") or "",
@@ -120,10 +120,12 @@ def pos_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
     )
 
 
-def create_po(session: Session, *, tenant_id: str | UUID, payload: PurchaseOrderCreate):
+def create_po(session: Session, *, tenant_id: str | UUID, payload: PurchaseOrderCreate, resolved_supplier=None):
     import datetime
     tid = _tid(tenant_id)
-    supplier = repo.find_supplier(session, name=payload.supplier)
+    supplier = resolved_supplier or repo.find_supplier(session, name=payload.supplier)
+    if supplier is not None and (supplier.tenant_id != tid or supplier.is_deleted):
+        raise HTTPException(404, "Supplier not found")
     if supplier is None:
         # Auto-register an unknown supplier so it appears in the Suppliers tab and
         # on the supplier ledger — mirrors how a new customer is created on order.
@@ -304,6 +306,11 @@ def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsRec
             PurchaseOrder.tenant_id == tid).with_for_update().execution_options(populate_existing=True))
         if po is None:
             raise HTTPException(404, "Purchase order not found")
+        from app.models.batches import ProductionBatch
+        from app.models.production import ProductionOrder
+        if session.scalar(select(ProductionBatch.id).join(ProductionOrder, ProductionOrder.id == ProductionBatch.order_id).where(
+                ProductionBatch.tenant_id == tid, ProductionOrder.purchase_order_id == po.id).limit(1)):
+            raise HTTPException(409, "Receive approved quantities from each production batch.")
         if po.inventory_received:
             return session.scalar(select(GoodsReceipt).where(GoodsReceipt.tenant_id == tid,
                 GoodsReceipt.po_ref == po.po_no).order_by(GoodsReceipt.id))
@@ -356,10 +363,38 @@ def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsRec
 
 def set_po_status(session, *, public_id, status, tenant_id=None):
     from fastapi import HTTPException
+    from app.models.procurement import PurchaseOrder
     data = repo.get_po_detail(session, public_id=public_id)
+    order = None
+    if data:
+        source = data["po"]
+        # Match receipt lock order: sales order, PO, then production/stock.
+        if source.sales_order_id:
+            from app.modules.sales import fulfillment
+            order = fulfillment.lock_order(session, tenant_id=source.tenant_id, order_id=source.sales_order_id)
+        source = session.scalar(select(PurchaseOrder).where(PurchaseOrder.id == source.id,
+            PurchaseOrder.tenant_id == source.tenant_id).with_for_update()
+            .execution_options(populate_existing=True))
+        if source.status == "Rejected" and status != "Rejected":
+            raise HTTPException(409, "Rejected POs cannot be reopened. Create a replacement PO.")
+        if status == "Rejected" and (source.inventory_received or source.status == "Received"):
+            raise HTTPException(409, "A received PO cannot be rejected.")
+        if status in ("Rejected", "Received"):
+            from app.models.batches import BatchLine, ProductionBatch
+            from app.models.production import ProductionOrder
+            if session.scalar(select(BatchLine.id).join(ProductionBatch, ProductionBatch.id == BatchLine.batch_id)
+                    .join(ProductionOrder, ProductionOrder.id == ProductionBatch.order_id).where(BatchLine.tenant_id == source.tenant_id,
+                        ProductionOrder.purchase_order_id == source.id, BatchLine.completed > 0).limit(1)):
+                raise HTTPException(409, "Reconcile batch production and receipts before changing this PO status.")
     if data and data["po"].sales_order_id and status == "Received" and not data["po"].inventory_received:
         raise HTTPException(409, "Use Receive against PO after final QC to receive this order's inventory.")
     po = repo.set_po_status(session, public_id=public_id, status=status)
+    if po is not None and status == "Rejected":
+        from app.modules.production.service import cancel_for_purchase_order
+        cancel_for_purchase_order(session, po)
+        if order is not None:
+            from app.modules.sales import fulfillment
+            fulfillment.refresh_order(session, order)
     # On approval, auto-generate the commercial invoice for the PO (once) so it
     # shows up in the Invoices list immediately.
     if po is not None and status == "Approved" and tenant_id is not None:
@@ -583,7 +618,16 @@ def receipt_detail(session: Session, *, public_id: str) -> dict | None:
 
 # ---------- Commercial invoice from a PO ----------
 
-def build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
+def build_invoice_draft(session: Session, *, po_no: str, actor_id=None) -> dict | None:
+    data = _build_invoice_draft(session, po_no=po_no)
+    if data is None:
+        return None
+    source = repo.po_by_no(session, po_no=po_no)
+    from app.modules.invoice_banking import profile_defaults
+    return profile_defaults(session, source.tenant_id, data, actor_id, sales=False)
+
+
+def _build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
     """Assemble a prefilled commercial-invoice document from a PO. Lines are
     grouped by ARTICLE (product/style); each article gets a colour×size matrix."""
     po = repo.po_by_no(session, po_no=po_no)
@@ -748,8 +792,11 @@ def ensure_invoice_payable(session, invoice):
     return bill
 
 
-def create_invoice(session: Session, *, tenant_id, data: dict) -> dict:
+def create_invoice(session: Session, *, tenant_id, data: dict, actor_id=None) -> dict:
+    from app.modules.invoice_banking import profile_defaults
     from app.core.validation import validate_invoice_phones
+    validate_invoice_phones(data)
+    data = profile_defaults(session, tenant_id, data, actor_id, sales=False)
     validate_invoice_phones(data)
     f = _persist_fields(data)
     inv = repo.create_po_invoice(session, tenant_id=_tid(tenant_id), data=json.dumps(data), **f)
@@ -757,7 +804,7 @@ def create_invoice(session: Session, *, tenant_id, data: dict) -> dict:
     return {"publicId": str(inv.public_id), "invoiceNo": inv.invoice_no}
 
 
-def get_invoice(session: Session, *, public_id: str) -> dict | None:
+def get_invoice(session: Session, *, public_id: str, actor_id=None) -> dict | None:
     inv = repo.get_po_invoice(session, public_id=public_id)
     if inv is None:
         return None
@@ -768,6 +815,8 @@ def get_invoice(session: Session, *, public_id: str) -> dict | None:
     if supplier is not None and supplier.tenant_id != inv.tenant_id:
         supplier = None
     data["bank"] = fill_missing(data.get("bank"), supplier_bank(supplier, inv.supplier_name))
+    from app.modules.invoice_banking import profile_defaults
+    data = profile_defaults(session, inv.tenant_id, data, actor_id, sales=False)
     return {**_invoice_summary(inv), "data": data}
 
 

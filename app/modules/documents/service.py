@@ -36,11 +36,23 @@ def validate_upload(*, filename: str, content_type: str | None, size_bytes: int)
                             f"Content type “{mime}” is not allowed.")
 
 
+def validate_tech_pack(*, filename, content_type, data):
+    validate_upload(filename=filename, content_type=content_type, size_bytes=len(data))
+    mime = (content_type or "").split(";")[0].strip().lower()
+    if os.path.splitext(filename)[1].lower() != ".pdf" or mime not in ("", "application/pdf", "application/octet-stream"):
+        raise HTTPException(415, "Tech packs must be PDF files.")
+    if not data.startswith(b"%PDF-"):
+        raise HTTPException(415, "The uploaded tech pack does not contain a PDF header.")
+
+
 def store_document(session: Session, *, tenant_id: str | UUID, module: str,
                    entity_type: str | None, entity_ref: str | None,
                    filename: str, content_type: str | None, data: bytes,
                    database_storage: bool = False) -> dict:
     tid = _tid(tenant_id)
+    if entity_type == "tech-pack":
+        validate_tech_pack(filename=filename, content_type=content_type, data=data)
+        content_type = "application/pdf"
     # Create the row first to get a doc_id, then persist the file under it.
     doc = repo.create_document(
         session, tenant_id=tid, module=module, entity_type=entity_type,

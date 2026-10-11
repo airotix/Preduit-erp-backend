@@ -131,8 +131,8 @@ def receipt_detail(public_id: str, _: Principal = Depends(read), db: Session = D
 
 # ---- Commercial invoices generated from a PO ----
 @router.get("/invoices/draft")
-def invoice_draft(po: str = Query(...), _: Principal = Depends(read), db: Session = Depends(tenant_db)):
-    d = service.build_invoice_draft(db, po_no=po)
+def invoice_draft(po: str = Query(...), principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    d = service.build_invoice_draft(db, po_no=po, actor_id=principal.user_id)
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"No purchase order found for '{po}'.")
     return d
@@ -152,12 +152,12 @@ def generate_missing_invoices(principal: Principal = Depends(write), db: Session
 @router.post("/invoices", status_code=status.HTTP_201_CREATED)
 def invoice_create(payload: dict, principal: Principal = Depends(write),
                    db: Session = Depends(tenant_db)):
-    return service.create_invoice(db, tenant_id=principal.tenant_id, data=payload)
+    return service.create_invoice(db, tenant_id=principal.tenant_id, data=payload, actor_id=principal.user_id)
 
 
 @router.get("/invoices/{public_id}")
-def invoice_get(public_id: str, _: Principal = Depends(read), db: Session = Depends(tenant_db)):
-    d = service.get_invoice(db, public_id=public_id)
+def invoice_get(public_id: str, principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    d = service.get_invoice(db, public_id=public_id, actor_id=principal.user_id)
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
     return d

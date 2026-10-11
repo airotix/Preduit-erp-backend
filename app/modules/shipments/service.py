@@ -4,6 +4,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from fastapi import HTTPException
 
 from app.models.production import ProductionOrder
 from app.models.sales import SalesOrder
@@ -129,6 +130,10 @@ def _validate_order_shipment(session, public_id, status):
 
 
 def set_status(session, *, public_id, status):
+    from app.modules.batches import service as batches
+    shipment = repo.get_shipment_detail(session, public_id=public_id)
+    if shipment and batches.is_batch_shipment(session, shipment["shipment"]):
+        raise HTTPException(409, "Use the batch shipment dispatch controls to record quantities and history.")
     _validate_order_shipment(session, public_id, status)
     s = repo.set_status(session, public_id=public_id, status=status)
     if s is not None and status == "Delivered":
@@ -137,6 +142,10 @@ def set_status(session, *, public_id, status):
 
 
 def update_shipment(session, *, public_id, payload):
+    from app.modules.batches import service as batches
+    shipment = repo.get_shipment_detail(session, public_id=public_id)
+    if shipment and batches.is_batch_shipment(session, shipment["shipment"]):
+        raise HTTPException(409, "Use the batch shipment controls; dispatched quantities cannot be changed by editing a status.")
     _validate_order_shipment(session, public_id, payload.status)
     s = repo.update_shipment(session, public_id=public_id, carrier=payload.carrier,
                              destination=payload.destination, eta=payload.eta, status=payload.status)

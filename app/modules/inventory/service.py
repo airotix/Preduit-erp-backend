@@ -4,6 +4,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from app.modules.inventory import repository as repo
 from app.modules.inventory.dto import (
@@ -154,25 +155,39 @@ def search_stock_products(session: Session, *, q: str, limit: int = 10) -> list[
     return repo.search_stock_products(session, q=(q or "").strip(), limit=limit)
 
 
+def _active_location(session, tenant_id, name):
+    from app.models.inventory import Location
+    rows = session.scalars(select(Location).where(Location.tenant_id == tenant_id,
+        Location.name == name.strip(), Location.is_deleted.is_(False)).limit(2)).all()
+    if len(rows) != 1:
+        raise HTTPException(400, f"Select a valid, unambiguous inventory location: {name}.")
+    return rows[0].id
+
+
 def create_stock_receipt(session: Session, *, tenant_id: str | UUID, payload: StockReceiptCreate):
     """Receive stock: for each article/colour/size line, add qty to on-hand at
     the location (creating the variant + stock row if needed)."""
     tid = _tid(tenant_id)
-    location_id = repo.find_location_id_by_name(session, name=payload.location)
-    if location_id is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No location named {payload.location}")
+    location_id = _active_location(session, tid, payload.location)
+    from app.models.catalog import Product
+    planned = []
+    for line in payload.lines:
+        if not (line.color or "").strip() or not (line.size or "").strip():
+            raise HTTPException(400, f"Select a color and size for {line.name}.")
+        products = session.scalars(select(Product).where(Product.tenant_id == tid,
+            Product.title == line.name.strip(), Product.is_deleted.is_(False)).limit(2)).all()
+        if len(products) != 1:
+            raise HTTPException(400, f"Select a valid, unambiguous catalog product: {line.name}.")
+        planned.append((line, products[0]))
     from app.modules.sales import fulfillment
     waiting_orders = fulfillment.lock_waiting_orders(session, tenant_id=tid)
     received = 0
-    for l in payload.lines:
-        product = repo.find_product_by_title(session, title=l.name)
-        if product is None or not (l.color or "").strip() or not (l.size or "").strip():
-            continue
+    for l, product in planned:
         price, currency = repo.variant_defaults(session, product_id=product.id)
-        color = (repo.find_attr_value(session, attr_type="Color", value=l.color)
-                 or repo.create_color(session, tenant_id=tid, value=l.color, hex=None))
-        size = (repo.find_attr_value(session, attr_type="Size", value=l.size)
-                or repo.create_size(session, tenant_id=tid, value=l.size))
+        color = (repo.find_attr_value(session, attr_type="Color", value=l.color.strip(), tenant_id=tid)
+                 or repo.create_color(session, tenant_id=tid, value=l.color.strip(), hex=None))
+        size = (repo.find_attr_value(session, attr_type="Size", value=l.size.strip(), tenant_id=tid)
+                or repo.create_size(session, tenant_id=tid, value=l.size.strip()))
         variant = repo.find_or_create_variant(
             session, tenant_id=tid, product_id=product.id, color_id=color.id,
             size_id=size.id, price=price, currency=currency)
@@ -260,24 +275,38 @@ def transfers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
 
 def create_transfer(session: Session, *, tenant_id: str | UUID, payload: TransferCreate):
     tid = _tid(tenant_id)
-    from_id = repo.find_location_id_by_name(session, name=payload.from_)
-    to_id = repo.find_location_id_by_name(session, name=payload.to)
+    from_id = _active_location(session, tid, payload.from_)
+    to_id = _active_location(session, tid, payload.to)
+    if from_id == to_id:
+        raise HTTPException(400, "Source and destination must be different locations.")
+    from types import SimpleNamespace
+    from app.modules.sales import fulfillment
+    from app.models.inventory import StockLevel
+    quantities = {}
+    for line in payload.lines:
+        if not (line.color or "").strip() or not (line.size or "").strip():
+            raise HTTPException(400, f"Select a color and size for {line.name}.")
+        variant = fulfillment.variant_for(session, SimpleNamespace(tenant_id=tid), line)
+        if variant is None or variant.status == "Archived":
+            raise HTTPException(400, f"No active catalog variant for {line.name} / {line.color} / {line.size}.")
+        quantities[variant.id] = quantities.get(variant.id, 0) + line.qty
+    # Lock both locations in a stable order, then validate the whole transfer.
+    levels = session.scalars(select(StockLevel).where(StockLevel.tenant_id == tid,
+        StockLevel.variant_id.in_(quantities), StockLevel.location_id.in_([from_id, to_id]))
+        .order_by(StockLevel.id).with_for_update().execution_options(populate_existing=True)).all()
+    source = {level.variant_id: level for level in levels if level.location_id == from_id}
+    for variant_id, qty in quantities.items():
+        level = source.get(variant_id)
+        if level is None or level.on_hand - level.reserved < qty:
+            raise HTTPException(409, "Transfer quantity exceeds available stock after sales reservations.")
     lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku, "qty": l.qty}
              for l in payload.lines]
     trf = repo.create_transfer(session, tenant_id=tid, from_id=from_id, to_id=to_id, lines=lines)
-    # Actually move the stock: out of the source location, into the destination.
-    for ln in lines:
-        vid = repo.resolve_variant_id(session, sku=ln.get("sku"), name=ln.get("name"),
-                                      color=ln.get("color"), size=ln.get("size"))
-        qty = int(ln.get("qty") or 0)
-        if vid is None or qty <= 0:
-            continue
-        if from_id is not None:
-            repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=from_id,
-                              on_hand_delta=-qty)
-        if to_id is not None:
-            repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=to_id,
-                              on_hand_delta=qty)
+    for vid, qty in quantities.items():
+        repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=from_id, on_hand_delta=-qty)
+        repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=to_id, on_hand_delta=qty)
+    trf.status = "Received"
+    session.flush()
     return trf
 
 
@@ -286,6 +315,11 @@ def location_options(session: Session) -> list[dict]:
 
 
 def set_transfer_status(session, *, public_id, status):
+    from app.models.inventory import StockTransfer
+    transfer = session.scalar(select(StockTransfer).where(StockTransfer.public_id == public_id,
+        StockTransfer.is_deleted.is_(False)).with_for_update())
+    if transfer and transfer.status == "Received" and status != "Received":
+        raise HTTPException(409, "Stock has already moved. Create a reverse transfer to move it back.")
     return repo.set_transfer_status(session, public_id=public_id, status=status)
 
 

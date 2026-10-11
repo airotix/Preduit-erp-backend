@@ -41,7 +41,7 @@ class TechPackTests(unittest.TestCase):
 
     def upload(self, **kwargs):
         return techpacks.upload_product(self.db, tenant_id=self.tid, public_id=self.article.public_id,
-                    filename="pack.pdf", content_type="application/pdf", data=b"%PDF test", **kwargs)
+                    filename="pack.pdf", content_type="application/pdf", data=b"%PDF-1.4 test", **kwargs)
 
     def start(self):
         service.start_production(self.db, tenant_id=self.tid, public_id=self.order.public_id,
@@ -56,7 +56,7 @@ class TechPackTests(unittest.TestCase):
         response = download(result["document"]["public_id"], db=self.db)
         async def body():
             return b"".join([chunk async for chunk in response.body_iterator])
-        self.assertEqual(asyncio.run(body()), b"%PDF test")
+        self.assertEqual(asyncio.run(body()), b"%PDF-1.4 test")
         self.assertEqual(self.count(DocumentContent), 1)
 
     def test_production_upload_is_shared_with_catalog_and_opens_final_qc(self):
@@ -67,7 +67,7 @@ class TechPackTests(unittest.TestCase):
         service.stage_action(self.db, action="complete", public_id=stages[1].public_id)
         self.assertEqual(self.count(Inspection), 0)
         result = techpacks.upload_line(self.db, tenant_id=self.tid, public_id=self.line.public_id,
-            filename="production.pdf", content_type="application/pdf", data=b"%PDF production")
+            filename="production.pdf", content_type="application/pdf", data=b"%PDF-1.4 production")
         self.assertEqual(stages[0].status, "Received")
         self.assertEqual(techpacks.product_pack(self.db, self.article)["document"], result["document"])
         self.assertEqual(self.count(Inspection), 1)
@@ -89,7 +89,7 @@ class TechPackTests(unittest.TestCase):
         self.db.flush()
         stages = self.start()
         techpacks.upload_line(self.db, tenant_id=self.tid, public_id=self.line.public_id,
-            filename="only-line.pdf", content_type="application/pdf", data=b"%PDF line")
+            filename="only-line.pdf", content_type="application/pdf", data=b"%PDF-1.4 line")
         self.assertEqual(stages[0].status, "Received")
         self.assertEqual(techpacks.product_pack(self.db, self.article)["status"], "Pending")
         with self.assertRaises(HTTPException) as caught:
@@ -104,6 +104,17 @@ class TechPackTests(unittest.TestCase):
                     filename=filename, content_type="application/pdf", data=data)
         self.assertEqual(stages[0].status, "Pending")
         self.assertEqual(self.count(Document), 0)
+
+    def test_non_pdf_and_disguised_uploads_are_rejected_without_storage(self):
+        for filename, mime, data in [("pack.docx", "application/octet-stream", b"%PDF-1.4"),
+                                     ("pack.pdf", "image/png", b"%PDF-1.4"),
+                                     ("pack.pdf", "application/pdf", b"not a pdf")]:
+            with self.subTest(filename=filename, mime=mime), self.assertRaises(HTTPException) as caught:
+                techpacks.upload_line(self.db, tenant_id=self.tid, public_id=self.line.public_id,
+                    filename=filename, content_type=mime, data=data)
+            self.assertEqual(caught.exception.status_code, 415)
+        self.assertEqual(self.count(Document), 0)
+        self.assertEqual(self.count(DocumentContent), 0)
 
     def test_s3_mode_reuses_existing_storage_without_database_bytes(self):
         with patch("app.modules.techpacks.get_settings", return_value=SimpleNamespace(s3_bucket="configured")), \

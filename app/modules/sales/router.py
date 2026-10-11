@@ -90,11 +90,12 @@ def create_shortage_po(public_id: str, payload: ShortagePOCreate,
                        _: Principal = Depends(require_module("procurement", "write")),
                        db: Session = Depends(tenant_db)):
     from app.modules.sales import fulfillment
-    po = fulfillment.create_shortage_po(db, tenant_id=principal.tenant_id,
-        public_id=public_id, supplier_id=payload.supplierId)
-    if po is None:
+    pos = fulfillment.create_shortage_pos(db, tenant_id=principal.tenant_id,
+        public_id=public_id, supplier_id=payload.supplierId, assignments=payload.assignments)
+    if not pos:
         return {"publicId": None, "poNo": None, "shipmentReady": True}
-    return {"publicId": str(po.public_id), "poNo": po.po_no}
+    return {"publicId": str(pos[0].public_id), "poNo": pos[0].po_no,
+            "purchaseOrders": [{"publicId": str(po.public_id), "poNo": po.po_no} for po in pos]}
 
 
 @router.post("/invoices/{public_id}/settle")
@@ -210,9 +211,9 @@ def create_return(
 def sales_invoice_draft(
     order: str = Query(...),
     type: str = Query("Retail"),
-    _: Principal = Depends(read), db: Session = Depends(tenant_db),
+    principal: Principal = Depends(read), db: Session = Depends(tenant_db),
 ):
-    d = service.build_sales_invoice_draft(db, order_no=order, invoice_type=type)
+    d = service.build_sales_invoice_draft(db, order_no=order, invoice_type=type, actor_id=principal.user_id)
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"No sales order found for '{order}'.")
     return d
@@ -232,12 +233,12 @@ def sales_invoice_create(
     principal: Principal = Depends(write),
     db: Session = Depends(tenant_db),
 ):
-    return service.create_sales_invoice_doc(db, tenant_id=principal.tenant_id, data=payload)
+    return service.create_sales_invoice_doc(db, tenant_id=principal.tenant_id, data=payload, actor_id=principal.user_id)
 
 
 @router.get("/invoice-docs/{public_id}")
-def sales_invoice_get(public_id: str, _: Principal = Depends(read), db: Session = Depends(tenant_db)):
-    d = service.get_sales_invoice_doc(db, public_id=public_id)
+def sales_invoice_get(public_id: str, principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    d = service.get_sales_invoice_doc(db, public_id=public_id, actor_id=principal.user_id)
     if d is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
     return d

@@ -4,6 +4,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from app.models.batches import ProductionBatch, BatchLine
 
 from app.modules.production import repository as repo
 from app.modules import techpacks
@@ -106,6 +107,9 @@ def send_for_inspection(session, *, tenant_id, public_id):
     po = repo.order_by_public(session, public_id)
     if po is None:
         return None
+    if session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == po.id, ProductionBatch.tenant_id == po.tenant_id).limit(1)):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Record QC on each production batch; whole-order approval is disabled.")
     lines = repo.list_lines(session, po.id)
     made_any = False
     for ln in lines:
@@ -122,6 +126,26 @@ def send_for_inspection(session, *, tenant_id, public_id):
     return po
 
 
+def cancel_for_purchase_order(session, purchase_order):
+    """Remove rejected procurement work from active TNA, retaining its history."""
+    from app.models.production import ProductionStage
+    from app.models.quality import Inspection
+    work = session.scalar(select(ProductionOrder).where(
+        ProductionOrder.purchase_order_id == purchase_order.id,
+        ProductionOrder.tenant_id == purchase_order.tenant_id).with_for_update())
+    if work is None:
+        return
+    work.is_deleted = True
+    work.stage = "Cancelled"
+    for model, condition in [(ProductionOrderLine, ProductionOrderLine.order_id == work.id),
+                             (ProductionStage, ProductionStage.order_id == work.id),
+                             (Inspection, Inspection.order_ref == work.order_no)]:
+        for row in session.scalars(select(model).where(condition,
+                model.tenant_id == work.tenant_id)).all():
+            row.is_deleted = True
+    session.flush()
+
+
 def create_for_purchase_order(session, *, tenant_id, purchase_order: PurchaseOrder):
     """One unstarted work order per procurement PO, one TNA item per style.
 
@@ -135,6 +159,9 @@ def create_for_purchase_order(session, *, tenant_id, purchase_order: PurchaseOrd
         PurchaseOrder.is_deleted == False).with_for_update()).scalar_one_or_none()
     if source is None:
         raise ValueError("Purchase order does not belong to this tenant")
+    if source.status == "Rejected":
+        from fastapi import HTTPException
+        raise HTTPException(409, "Rejected POs cannot create production work.")
     existing = session.execute(select(ProductionOrder).where(
         ProductionOrder.purchase_order_id == source.id,
         ProductionOrder.tenant_id == tid)).scalar_one_or_none()
@@ -165,6 +192,11 @@ def create_for_purchase_order(session, *, tenant_id, purchase_order: PurchaseOrd
 
 
 def set_stage(session, *, public_id, status):
+    work = repo.order_by_public(session, public_id)
+    if work and session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == work.id,
+            ProductionBatch.tenant_id == work.tenant_id).limit(1)):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Production status is calculated from batch work.")
     return repo.set_stage(session, public_id=public_id, stage=status)
 
 
@@ -328,6 +360,14 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
     from app.modules.quality import repository as qc_repo
     inspected = qc_repo.inspection_exists(session, order_ref=po.order_no)
     can_inspect = started and progress == 100 and not inspected
+    batch_managed = bool(session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == po.id,
+        ProductionBatch.tenant_id == po.tenant_id).limit(1)))
+    if batch_managed:
+        from app.modules.batches.service import view
+        batch_summary = view(session, po.tenant_id, po.public_id)["summary"]
+        progress = min(100, round(100 * (batch_summary["completed"]-batch_summary["rejected"]) / max(1, po.qty)))
+        status_label = "Production complete" if progress == 100 else "Batch production"
+        can_inspect = False
 
     # One timeline per production line (style) → tabs on the detail page.
     lines_out = [
@@ -363,6 +403,7 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         "sourcePurchaseOrder": {"publicId": str(purchase_order.public_id),
                                 "poNo": purchase_order.po_no} if purchase_order else None,
         "started": started,
+        "batchManaged": batch_managed,
         "progress": progress,
         "canInspect": can_inspect,
         "inspected": inspected,
@@ -379,6 +420,10 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
 
 
 def start_production(session, *, tenant_id, public_id, stages, line_id=None):
+    work = repo.order_by_public(session, public_id)
+    if work and session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == work.id, ProductionBatch.tenant_id == work.tenant_id).limit(1)):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Manage the production stages on each batch.")
     return repo.start_production(session, order_public_id=public_id, stages=stages,
                                  line_public_id=line_id)
 
@@ -386,6 +431,9 @@ def start_production(session, *, tenant_id, public_id, stages, line_id=None):
 def stage_action(session, *, action, public_id, days=None, worker=None, notes=None):
     from fastapi import HTTPException
     stage = repo.get_stage(session, public_id=public_id)
+    if stage is not None and session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == stage.order_id,
+            ProductionBatch.tenant_id == stage.tenant_id).limit(1)):
+        raise HTTPException(409, "Manage stages on the production batch.")
     if stage is not None and stage.name == "Tech Pack":
         if action in ("start", "complete", "resolve"):
             raise HTTPException(409, "Upload a tech pack to mark this stage Received.")

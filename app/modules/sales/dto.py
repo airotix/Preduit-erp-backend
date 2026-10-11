@@ -63,8 +63,22 @@ class OrderLineIn(BaseModel):
     price: Decimal = Field(ge=0)
 
 
-class ShortagePOCreate(BaseModel):
+class ShortageSupplier(BaseModel):
+    lineId: int = Field(gt=0)
     supplierId: UUID
+
+
+class ShortagePOCreate(BaseModel):
+    supplierId: UUID | None = None
+    assignments: list[ShortageSupplier] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_suppliers(self):
+        if self.supplierId is None and not self.assignments:
+            raise ValueError("Select a supplier for each shortage item.")
+        if self.supplierId is not None and self.assignments:
+            raise ValueError("Use per-item assignments or a single supplier, not both.")
+        return self
 
 
 class OrderCreate(BaseModel):

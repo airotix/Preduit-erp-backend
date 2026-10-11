@@ -91,8 +91,10 @@ def adjust_stock(session: Session, *, tenant_id: UUID, variant_id: int, location
     from app.models.inventory import OrderStockReservation
     owned = session.scalar(select(func.coalesce(func.sum(OrderStockReservation.qty), 0)).where(
         OrderStockReservation.stock_level_id == row.id, OrderStockReservation.tenant_id == tenant_id)) if row.id else 0
-    new_hand = max(0, (row.on_hand or 0) + on_hand_delta)
-    new_reserved = max(0, (row.reserved or 0) + reserved_delta)
+    new_hand = (row.on_hand or 0) + on_hand_delta
+    new_reserved = (row.reserved or 0) + reserved_delta
+    if new_hand < 0 or new_reserved < 0:
+        raise HTTPException(409, "Insufficient stock or reservations for this movement.")
     if new_hand < owned or new_reserved < owned or (on_hand_delta < 0 and reserved_delta == 0 and new_hand < new_reserved):
         raise HTTPException(409, "Stock is reserved for sales orders and cannot be moved or removed.")
     row.on_hand = new_hand
@@ -306,11 +308,12 @@ def variant_defaults(session: Session, *, product_id: int) -> tuple[Decimal, str
     return Decimal("0"), "USD"
 
 
-def find_attr_value(session: Session, *, attr_type: str, value: str) -> AttributeValue | None:
-    return session.execute(
-        select(AttributeValue).where(AttributeValue.attr_type == attr_type,
-                                     AttributeValue.value == value)
-    ).scalars().first()
+def find_attr_value(session: Session, *, attr_type: str, value: str, tenant_id=None) -> AttributeValue | None:
+    query = select(AttributeValue).where(AttributeValue.attr_type == attr_type,
+        AttributeValue.value == value)
+    if tenant_id is not None:
+        query = query.where(AttributeValue.tenant_id == tenant_id)
+    return session.scalars(query).first()
 
 
 def create_color(session: Session, *, tenant_id: UUID, value: str, hex: str | None) -> AttributeValue:
