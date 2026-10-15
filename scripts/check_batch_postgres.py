@@ -22,6 +22,7 @@ from app.models.catalog import Product, ProductVariant, AttributeValue
 from app.models.inventory import Location, StockLevel
 from app.models.procurement import Supplier
 from test_batch_execution import BatchExecutionTests
+from test_batch_handoffs import BatchHandoffTests
 
 
 def credentials():
@@ -40,7 +41,7 @@ with engine.begin() as conn:
     Base.metadata.create_all(conn.execution_options(schema_translate_map={None: schema}))
 
 
-class PostgreSQLBatchTests(BatchExecutionTests):
+class PostgreSQLBatchTests(BatchExecutionTests, BatchHandoffTests):
     def setUp(self):
         self.engine = engine
         self.connection = engine.connect()
@@ -69,7 +70,8 @@ class PostgreSQLBatchTests(BatchExecutionTests):
         from app.models.procurement import PurchaseOrderLine
         from sqlalchemy import select
         self.po = fulfillment.create_shortage_po(self.db, tenant_id=self.tid, public_id=self.so.public_id, supplier_id=self.supplier.public_id)
-        self.work = self.db.scalar(select(ProductionOrder)); self.source = self.db.scalar(select(PurchaseOrderLine))
+        self.work = self.db.scalar(select(ProductionOrder).where(ProductionOrder.tenant_id == self.tid))
+        self.source = self.db.scalar(select(PurchaseOrderLine).where(PurchaseOrderLine.tenant_id == self.tid))
 
     def tearDown(self):
         self.post.stop(); self.company.stop()
@@ -102,6 +104,31 @@ class PostgreSQLBatchTests(BatchExecutionTests):
         self.db.refresh(lot)
         self.assertEqual(lot.allocated, 150)
 
+    def test_z_inbound_shipments_cannot_allocate_the_same_approved_pieces(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        from fastapi import HTTPException
+        from app.modules.batches import workflow, dto
+        batch, line = self.plan(); self.produce(batch, line); self.qc(batch, line, 200)
+        tid, order_id, line_id, location_id = self.tid, self.work.public_id, line.id, self.location.id
+        self.db.commit(); self.connection.commit()
+        barrier = Barrier(2)
+        def allocate():
+            with Session(engine, autoflush=False) as db:
+                db.execute(text(f'SET search_path TO "{schema}", public'))
+                barrier.wait(timeout=10)
+                try:
+                    workflow.create_inbound(db, tid, "logistics", order_id, dto.CreateInbound(
+                        requestId=uuid.uuid4(), reason="Concurrent inbound allocation", carrier="Carrier",
+                        allocations=[dict(lineId=line_id, locationId=location_id, qty=150)]))
+                    db.commit(); return 201
+                except HTTPException as exc:
+                    db.rollback(); return exc.status_code
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: allocate(), range(2)))
+        self.assertEqual(sorted(results), [201, 409])
+        self.assertEqual(workflow.ready(self.db, tid, line), 50)
+
     def test_row_security_on_installed_batch_tables(self):
         from app.models.batches import ProductionBatch
         from app.models.production import ProductionOrder
@@ -121,11 +148,33 @@ class PostgreSQLBatchTests(BatchExecutionTests):
                 db.add(work); db.flush()
                 batch = ProductionBatch(tenant_id=tid, order_id=work.id, name="RLS check")
                 db.add(batch); db.flush(); ids.append(batch.id)
+            from app.models.batches import BatchLine, InboundAllocation
+            from app.models.procurement import PurchaseOrderLine
+            from app.models.shipments import Shipment, ShipmentLine
+            inbound_ids = []
+            for tid, batch_id in zip((own, foreign), ids):
+                batch = db.get(ProductionBatch, batch_id)
+                work = db.get(ProductionOrder, batch.order_id)
+                product = Product(tenant_id=tid, title="RLS inbound check")
+                location = Location(tenant_id=tid, name="RLS warehouse")
+                source = PurchaseOrderLine(tenant_id=tid, po_id=work.purchase_order_id, name="RLS inbound check", qty=1)
+                ship = Shipment(tenant_id=tid, batch_managed=True, direction="Inbound")
+                db.add_all([product, location, source, ship]); db.flush()
+                variant = ProductVariant(tenant_id=tid, product_id=product.id, sku="RLS-" + str(tid), price=1, currency_code="EUR")
+                db.add(variant); db.flush()
+                line = BatchLine(tenant_id=tid, batch_id=batch.id, po_line_id=source.id, variant_id=variant.id, planned=1)
+                ship_line = ShipmentLine(tenant_id=tid, shipment_id=ship.id, description="RLS inbound check", qty=1)
+                db.add_all([line, ship_line]); db.flush()
+                allocation = InboundAllocation(tenant_id=tid, shipment_id=ship.id, shipment_line_id=ship_line.id,
+                    line_id=line.id, location_id=location.id, qty=1)
+                db.add(allocation); db.flush(); inbound_ids.append(allocation.id)
             db.execute(text("SET LOCAL ROLE erp_app"))
             db.execute(text("SET LOCAL app.rls_bypass = 'false'"))
             db.execute(text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(own)})
             visible = db.scalars(select(ProductionBatch.id).where(ProductionBatch.id.in_(ids))).all()
             self.assertEqual(visible, ids[:1])
+            visible_inbound = db.scalars(select(InboundAllocation.id).where(InboundAllocation.id.in_(inbound_ids))).all()
+            self.assertEqual(visible_inbound, inbound_ids[:1])
             db.rollback()  # The real database retains no test tenants or orders.
 
 

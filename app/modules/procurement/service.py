@@ -4,6 +4,7 @@ import datetime
 import json
 import uuid
 from uuid import UUID
+from fastapi import HTTPException
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -60,8 +61,8 @@ def amount_in_words(amount: float, currency: str = "USD") -> str:
     return words + " only"
 
 
-_PO_TONE = {"Pending approval": "amber", "Approved": "green", "Rejected": "red", "Received": "green"}
-_GRN_TONE = {"Complete": "green", "Partial": "amber", "Expected": "neutral"}
+_PO_TONE = {"Pending approval": "amber", "Approved": "green", "Rejected": "red", "Received": "green", "Partially received": "amber", "Inactive": "gray"}
+_GRN_TONE = {"Complete": "green", "Received": "green", "Partial": "amber", "Expected": "neutral"}
 _SUP_TONE = {"Preferred": "green", "On watch": "amber", "New": "neutral", "Suspended": "red"}
 
 # Board columns: (po status, title, accent, tone)
@@ -123,6 +124,8 @@ def pos_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
 def create_po(session: Session, *, tenant_id: str | UUID, payload: PurchaseOrderCreate, resolved_supplier=None):
     import datetime
     tid = _tid(tenant_id)
+    from app.modules.catalog.lifecycle import ensure_new_lines_orderable
+    ensure_new_lines_orderable(session, tenant_id=tid, lines=payload.lines)
     supplier = resolved_supplier or repo.find_supplier(session, name=payload.supplier)
     if supplier is not None and (supplier.tenant_id != tid or supplier.is_deleted):
         raise HTTPException(404, "Supplier not found")
@@ -138,6 +141,19 @@ def create_po(session: Session, *, tenant_id: str | UUID, payload: PurchaseOrder
         expected=payload.expected, lines=lines,
     )
     # The PO and its production work are committed together by tenant_db.
+    from app.models.procurement import PurchaseOrderLine
+    from app.modules.sales.fulfillment import variant_for
+    from types import SimpleNamespace
+    for line in session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.tenant_id == tid,
+            PurchaseOrderLine.po_id == po.id)):
+        try:
+            variant = variant_for(session, SimpleNamespace(tenant_id=tid), line)
+            line.variant_id = variant.id if variant else None
+        except HTTPException:
+            # Existing custom PO lines remain supported; the warehouse must
+            # resolve those variants before receipt.
+            pass
+    session.flush()
     from app.modules.production import service as prod_service
     prod_service.create_for_purchase_order(session, tenant_id=tid, purchase_order=po)
     # Invoice generation creates/reuses and posts the payable atomically.
@@ -284,86 +300,30 @@ def receipts_screen(session: Session, *, limit: int = 50, offset: int = 0) -> di
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
         records=[{"status": r["status"]} for r in rows],
-        search="Search goods receipts…", action="Receive against PO",
+        search="Search goods receipts…", action="Receive in Inventory",
         filters=["Supplier", "Status"],
     )
 
 
-def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsReceiptCreate):
-    tid = _tid(tenant_id)
+def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsReceiptCreate, actor=None):
     from sqlalchemy import select
     from fastapi import HTTPException
-    from app.models.procurement import PurchaseOrder, PurchaseOrderLine, GoodsReceipt
-    from app.models.inventory import Location, StockLevel
-    from types import SimpleNamespace
-    from app.modules.sales import fulfillment
-    po = repo.po_by_no(session, po_no=payload.po) if payload.po else None
-    order = None
-    if po is not None:
-        if po.sales_order_id:
-            order = fulfillment.lock_order(session, tenant_id=tid, order_id=po.sales_order_id)
-        po = session.scalar(select(PurchaseOrder).where(PurchaseOrder.id == po.id,
-            PurchaseOrder.tenant_id == tid).with_for_update().execution_options(populate_existing=True))
-        if po is None:
-            raise HTTPException(404, "Purchase order not found")
-        from app.models.batches import ProductionBatch
-        from app.models.production import ProductionOrder
-        if session.scalar(select(ProductionBatch.id).join(ProductionOrder, ProductionOrder.id == ProductionBatch.order_id).where(
-                ProductionBatch.tenant_id == tid, ProductionOrder.purchase_order_id == po.id).limit(1)):
-            raise HTTPException(409, "Receive approved quantities from each production batch.")
-        if po.inventory_received:
-            return session.scalar(select(GoodsReceipt).where(GoodsReceipt.tenant_id == tid,
-                GoodsReceipt.po_ref == po.po_no).order_by(GoodsReceipt.id))
-        if order is not None and order.status == "Cancelled":
-            raise HTTPException(409, "This sales order has been cancelled.")
-        if not fulfillment.qc_cleared(session, po):
-            raise HTTPException(409, "Every production item must pass final QC before inventory receipt.")
-        location = session.scalar(select(Location).where(Location.tenant_id == tid,
-            Location.is_deleted.is_(False)).order_by(Location.id).limit(1))
-        if location is None:
-            raise HTTPException(409, "Create an inventory location before receiving this PO.")
-    supplier = repo.find_supplier(session, name=payload.supplier)
-    if supplier is None and (payload.supplier or "").strip():
-        # Auto-register an unknown supplier on receipt too, so it always appears
-        # in the Suppliers tab and on the supplier ledger.
-        supplier = repo.create_supplier(session, tenant_id=tid, name=payload.supplier.strip(),
-                                        region=None, lead_time=None, category=None)
-    grn = repo.create_receipt(
-        session, tenant_id=tid, po_ref=payload.po, supplier=supplier,
-        supplier_name=payload.supplier, lines=payload.lines,
-    )
-    # Receiving goods against a PO increments inventory for that PO's line items.
-    if po is not None:
-        for line in session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.po_id == po.id,
-            PurchaseOrderLine.tenant_id == tid).order_by(PurchaseOrderLine.id)).all():
-            variant = fulfillment.variant_for(session, order or SimpleNamespace(tenant_id=tid), line)
-            if variant is None:
-                raise HTTPException(409, f"Catalog variant missing for {line.name}; restore it before receipt.")
-            level = session.scalar(select(StockLevel).where(StockLevel.tenant_id == tid,
-                StockLevel.variant_id == variant.id, StockLevel.location_id == location.id).with_for_update().execution_options(populate_existing=True))
-            if level is None:
-                level = StockLevel(tenant_id=tid, variant_id=variant.id, location_id=location.id, on_hand=0, reserved=0)
-                session.add(level)
-            level.on_hand += line.qty
-            variant.status = "Active"
-            # Persist before resolving the next line: a PO may repeat a variant,
-            # and sessions disable autoflush while reading/locking stock rows.
-            session.flush()
-        po.inventory_received = True
-        po.status = "Received"
-        grn.status = "Received"
-        grn.received_count = grn.line_count
-        grn.received_date = datetime.date.today().strftime("%d %b %Y")
-        grn.location = location.name
-        session.flush()
-        if order is not None:
-            fulfillment.refresh_order(session, order)
-    return grn
+    from app.models.procurement import PurchaseOrder
+    from app.modules.inventory import receiving
+    po = session.scalar(select(PurchaseOrder).where(PurchaseOrder.tenant_id == _tid(tenant_id),
+        PurchaseOrder.po_no == payload.po, PurchaseOrder.is_deleted.is_(False)))
+    if po is None:
+        raise HTTPException(404, "Purchase order not found")
+    return receiving.post(session, tenant_id=tenant_id, public_id=po.public_id,
+        payload=payload, actor=actor)
 
 
-def set_po_status(session, *, public_id, status, tenant_id=None):
+def set_po_status(session, *, public_id, status, tenant_id=None, reason=None):
     from fastapi import HTTPException
     from app.models.procurement import PurchaseOrder
+    if status == "Inactive":
+        from app.modules.catalog.commitments import inactive_po
+        return inactive_po(session, public_id=public_id, reason=reason)
     data = repo.get_po_detail(session, public_id=public_id)
     order = None
     if data:
@@ -375,10 +335,14 @@ def set_po_status(session, *, public_id, status, tenant_id=None):
         source = session.scalar(select(PurchaseOrder).where(PurchaseOrder.id == source.id,
             PurchaseOrder.tenant_id == source.tenant_id).with_for_update()
             .execution_options(populate_existing=True))
+        if source.status == "Inactive":
+            raise HTTPException(409, "An inactive PO cannot be reopened.")
         if source.status == "Rejected" and status != "Rejected":
             raise HTTPException(409, "Rejected POs cannot be reopened. Create a replacement PO.")
-        if status == "Rejected" and (source.inventory_received or source.status == "Received"):
+        if status == "Rejected" and (source.inventory_received or source.status in ("Received", "Partially received")):
             raise HTTPException(409, "A received PO cannot be rejected.")
+        if source.status == "Partially received" and status != "Partially received":
+            raise HTTPException(409, "This PO has partial warehouse receipts. Receive the outstanding quantities in Inventory.")
         if status in ("Rejected", "Received"):
             from app.models.batches import BatchLine, ProductionBatch
             from app.models.production import ProductionOrder
@@ -386,8 +350,8 @@ def set_po_status(session, *, public_id, status, tenant_id=None):
                     .join(ProductionOrder, ProductionOrder.id == ProductionBatch.order_id).where(BatchLine.tenant_id == source.tenant_id,
                         ProductionOrder.purchase_order_id == source.id, BatchLine.completed > 0).limit(1)):
                 raise HTTPException(409, "Reconcile batch production and receipts before changing this PO status.")
-    if data and data["po"].sales_order_id and status == "Received" and not data["po"].inventory_received:
-        raise HTTPException(409, "Use Receive against PO after final QC to receive this order's inventory.")
+    if data and status == "Received" and not data["po"].inventory_received:
+        raise HTTPException(409, "Confirm physical receipt in Inventory after final QC to receive this PO.")
     po = repo.set_po_status(session, public_id=public_id, status=status)
     if po is not None and status == "Rejected":
         from app.modules.production.service import cancel_for_purchase_order
@@ -403,7 +367,13 @@ def set_po_status(session, *, public_id, status, tenant_id=None):
 
 
 def set_receipt_status(session, *, public_id, status):
-    return repo.set_receipt_status(session, public_id=public_id, status=status)
+    from fastapi import HTTPException
+    data = repo.get_receipt_detail(session, public_id=public_id)
+    if data is None:
+        return None
+    if data["grn"].status != status:
+        raise HTTPException(409, "Receipt status is recorded by warehouse receipt. A status edit cannot post or undo stock.")
+    return data["grn"]
 
 
 # ---------- Suppliers ----------
@@ -603,6 +573,8 @@ def receipt_detail(session: Session, *, public_id: str) -> dict | None:
             {"k": "Supplier", "v": g.supplier_name},
             {"k": "Received", "v": g.received_date or "—"},
             {"k": "Location", "v": g.location or "—"},
+            {"k": "Reference", "v": g.reference or "—"},
+            {"k": "Received by", "v": g.actor or "—"},
         ],
         "tabs": ["Lines", "Documents", "Activity"],
         "receipt": {
@@ -610,7 +582,7 @@ def receipt_detail(session: Session, *, public_id: str) -> dict | None:
             "note": (
                 f"Receiving against {g.po_ref or 'the PO'} posts received quantities into "
                 f"{g.location or 'inventory'}. The supplier invoice already created the payable. Outstanding units "
-                "stay open until fully received."
+                "shown here reflect this receipt's date; the warehouse receiving queue shows the current outstanding quantities."
             ),
         },
     }

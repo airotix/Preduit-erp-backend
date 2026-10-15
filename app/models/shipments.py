@@ -1,7 +1,8 @@
 """Shipments ORM models."""
 import uuid
+from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, String, Uuid, text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -9,7 +10,13 @@ from app.models.base import Base
 
 class Shipment(Base):
     __tablename__ = "shipments"
+    packed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    packed_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
     batch_managed: Mapped[bool] = mapped_column(Boolean, default=False)
+    direction: Mapped[str] = mapped_column(String(12), default="Outbound")
+    inventory_dispatched: Mapped[bool] = mapped_column(Boolean, default=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sales_order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_orders.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
@@ -38,6 +45,7 @@ class Carrier(Base):
 
 class ShipmentLine(Base):
     __tablename__ = "shipment_lines"
+    order_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_order_lines.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     shipment_id: Mapped[int] = mapped_column(BigInteger)

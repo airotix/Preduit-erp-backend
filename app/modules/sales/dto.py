@@ -43,6 +43,7 @@ class CustomerUpdate(CustomerCreate):
 
 class StatusUpdate(BaseModel):
     status: str = Field(min_length=1, max_length=24)
+    reason: str | None = Field(default=None, max_length=400)
 
 
 class CustomerOut(BaseModel):
@@ -60,7 +61,7 @@ class OrderLineIn(BaseModel):
     size: str | None = Field(default=None, max_length=60)
     sku: str | None = Field(default=None, max_length=64)
     qty: int = Field(gt=0)
-    price: Decimal = Field(ge=0)
+    price: Decimal | None = Field(default=None, ge=0)  # ignored; server captures the Catalog price
 
 
 class ShortageSupplier(BaseModel):
@@ -87,6 +88,7 @@ class OrderCreate(BaseModel):
     Order form's inline sub-form, present only when the typed customer didn't
     match an existing one."""
     customer: str = Field(min_length=1, max_length=200)
+    allowPartialShipments: bool = False
     channel: str = Field(pattern="^(Wholesale|Online|Marketplace|Retail)$")
     lines: list[OrderLineIn] = Field(min_length=1)
     newCustomer: CustomerCreate | None = None

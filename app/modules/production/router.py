@@ -32,6 +32,14 @@ def upload_tech_pack(public_id: str, file: UploadFile = File(...),
         data=_read_capped(file, settings.upload_max_bytes))
 
 
+@router.post("/lines/{public_id}/tech-pack/revisions/{revision_id}/approve")
+def approve_tech_pack(public_id: str, revision_id: str,
+                      principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules import techpacks
+    return techpacks.approve_line_revision(db, tenant_id=principal.tenant_id,
+        public_id=public_id, revision_id=revision_id, actor=principal.email)
+
+
 @router.get("/porders/screen")
 def porders_screen(limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
                    _: Principal = Depends(read), db: Session = Depends(tenant_db)):

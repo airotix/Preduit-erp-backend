@@ -68,6 +68,7 @@ class ProductVariant(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("products.id"))
     sku: Mapped[str] = mapped_column(String(64))
+    barcode: Mapped[str | None] = mapped_column(String(64), nullable=True)
     color_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     size_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     qty_on_hand: Mapped[int] = mapped_column(Integer, default=0)

@@ -16,6 +16,7 @@ from app.modules.dashboards.router import router as dashboards_router
 from app.modules.documents.router import router as documents_router
 from app.modules.finance.router import router as finance_router
 from app.modules.inventory.router import router as inventory_router
+from app.modules.inventory.operations_router import router as inventory_operations_router
 from app.modules.meta.router import router as meta_router
 from app.modules.meta.locations_router import router as locations_router
 from app.modules.onboarding.router import router as onboarding_router
@@ -56,6 +57,7 @@ app = FastAPI(
     openapi_url="/api/v1/openapi.json" if settings.env == "dev" else None,
     lifespan=lifespan,
 )
+app.include_router(inventory_operations_router, prefix="/api/v1")
 
 # Fail fast if the app-issued JWT secret was never overridden outside dev — a
 # default secret means anyone can forge tokens.

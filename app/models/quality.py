@@ -3,7 +3,7 @@ import datetime
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, Integer, Numeric, String, Uuid, text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -42,6 +42,10 @@ class Inspection(Base):
     due_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     parent_inspection_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     shipment_ref: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    batch_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("production_batch_lines.id"), index=True)
+    approved_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    held_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rejected_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 

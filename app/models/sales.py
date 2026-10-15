@@ -42,6 +42,7 @@ class Customer(Base):
 
 class SalesOrder(Base):
     __tablename__ = "sales_orders"
+    allow_partial_shipments: Mapped[bool] = mapped_column(Boolean, default=False)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, server_default=text("gen_random_uuid()")
@@ -133,6 +134,8 @@ class SalesInvoice(Base):
 
 class SalesReturn(Base):
     __tablename__ = "sales_returns"
+    sales_order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_orders.id"), nullable=True)
+    location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     public_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, server_default=text("gen_random_uuid()")

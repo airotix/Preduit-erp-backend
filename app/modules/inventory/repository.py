@@ -15,7 +15,8 @@ from app.models.inventory import (
 
 def find_variant_id_by_sku(session: Session, *, sku: str) -> int | None:
     return session.execute(
-        select(ProductVariant.id).where(ProductVariant.sku == sku)
+        select(ProductVariant.id).join(Product, Product.id == ProductVariant.product_id)
+        .where(ProductVariant.sku == sku, Product.is_deleted.is_(False))
     ).scalar_one_or_none()
 
 
@@ -76,6 +77,9 @@ def adjust_stock(session: Session, *, tenant_id: UUID, variant_id: int, location
     below zero. This is the single primitive for reserve/relieve/transfer."""
     if on_hand_delta > 0:
         variant = session.get(ProductVariant, variant_id)
+        if variant is not None and (product := session.get(Product, variant.product_id)) is not None and product.is_deleted:
+            from fastapi import HTTPException
+            raise HTTPException(409, "A retired article cannot receive stock.")
         if variant is not None and variant.tenant_id == tenant_id and variant.status == "Archived":
             variant.status = "Active"
     row = session.execute(
@@ -252,6 +256,9 @@ def add_stock(session: Session, *, tenant_id: UUID, variant_id: int, location_id
     """Receive stock: add qty to the on-hand at a location (create the row if new)."""
     if qty > 0:
         variant = session.get(ProductVariant, variant_id)
+        if variant is not None and (product := session.get(Product, variant.product_id)) is not None and product.is_deleted:
+            from fastapi import HTTPException
+            raise HTTPException(409, "A retired article cannot receive stock.")
         if variant is not None and variant.tenant_id == tenant_id and variant.status == "Archived":
             variant.status = "Active"
     existing = session.execute(
@@ -536,11 +543,11 @@ def create_transfer(session: Session, *, tenant_id: UUID, from_id: int | None,
 def location_options(session: Session) -> list[dict]:
     """Location names for the transfer From/To selects."""
     rows = session.execute(
-        select(Location.name, Location.kind)
+          select(Location.public_id, Location.name, Location.kind)
         .where(Location.is_deleted == False)  # noqa: E712
         .order_by(Location.name)
     ).all()
-    return [{"name": n, "kind": k or ""} for n, k in rows]
+    return [{"id": str(pid), "name": n, "kind": k or ""} for pid, n, k in rows]
 
 
 # ---------- Reorder alerts ----------

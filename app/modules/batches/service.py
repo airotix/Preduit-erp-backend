@@ -1,10 +1,11 @@
 """Transactional batch ledgers. Quantity changes are commands, never editable totals."""
 import json
-from uuid import UUID
+from datetime import date, timedelta
+from uuid import UUID, uuid5
 from sqlalchemy import select, func
 from fastapi import HTTPException
-from app.models.batches import ProductionBatch, BatchLine, BatchStage, BatchLot, BatchAllocation, BatchEvent, InventoryAllocation
-from app.models.production import ProductionOrder
+from app.models.batches import ProductionBatch, BatchLine, BatchStage, BatchLot, BatchAllocation, BatchEvent, InventoryAllocation, InboundAllocation
+from app.models.production import ProductionOrder, ProductionOrderLine, ProductionStage
 from app.models.procurement import PurchaseOrder, PurchaseOrderLine, GoodsReceipt, GoodsReceiptLine
 from app.models.sales import SalesOrder, SalesOrderLine
 from app.models.inventory import Location, StockLevel, OrderStockReservation
@@ -40,14 +41,14 @@ def parent(db, tid, public_id, kind="production", lock=False):
     if model is None:
         raise HTTPException(400, "Invalid order type")
     obj = one(db, model, tid, public_id)
-    if obj.is_deleted or getattr(obj, "status", None) in ("Cancelled", "Rejected"):
+    if obj.is_deleted or getattr(obj, "status", None) in ("Cancelled", "Rejected", "Inactive"):
         raise HTTPException(409, "This order is no longer active")
     if kind == "production":
         works = [obj]
     elif kind == "procurement":
         works = rows(db, ProductionOrder, tid, ProductionOrder.purchase_order_id == obj.id, ProductionOrder.is_deleted.is_(False))
     else:
-        pos = rows(db, PurchaseOrder, tid, PurchaseOrder.sales_order_id == obj.id, PurchaseOrder.is_deleted.is_(False), PurchaseOrder.status != "Rejected")
+        pos = rows(db, PurchaseOrder, tid, PurchaseOrder.sales_order_id == obj.id, PurchaseOrder.is_deleted.is_(False), PurchaseOrder.status.not_in(["Rejected", "Cancelled", "Inactive"]))
         works = rows(db, ProductionOrder, tid, ProductionOrder.purchase_order_id.in_([p.id for p in pos]), ProductionOrder.is_deleted.is_(False))
     pos = rows(db, PurchaseOrder, tid, PurchaseOrder.id.in_([w.purchase_order_id for w in works]))
     sales_ids = sorted({p.sales_order_id for p in pos if p.sales_order_id})
@@ -55,11 +56,11 @@ def parent(db, tid, public_id, kind="production", lock=False):
         sales_ids = [obj.id]
     if lock:
         sales = rows(db, SalesOrder, tid, SalesOrder.id.in_(sales_ids), lock=True)
-        if any(s.status == "Cancelled" for s in sales):
+        if any(s.status in ("Cancelled", "Inactive") for s in sales):
             raise HTTPException(409, "The sales order is cancelled")
         works = rows(db, ProductionOrder, tid, ProductionOrder.id.in_([w.id for w in works]), lock=True)
         pos = rows(db, PurchaseOrder, tid, PurchaseOrder.id.in_([p.id for p in pos]), lock=True)
-        if any(p.status == "Rejected" or w.is_deleted for p in pos for w in works):
+        if any(p.status in ("Rejected", "Cancelled", "Inactive") for p in pos) or any(w.is_deleted for w in works):
             raise HTTPException(409, "Production is no longer active")
     return obj, works, pos
 
@@ -102,12 +103,28 @@ def create_batch(db, tid, actor, order_id, command):
         return prior
     if not pos or pos[0].inventory_received:
         raise HTTPException(409, "Batch planning requires an unreceived source PO")
+    if rows(db, ProductionStage, tid, ProductionStage.order_id == obj.id,
+            ProductionStage.is_deleted.is_(False), ProductionStage.name != "Tech Pack"):
+        raise HTTPException(409, "This order already has a production timeline; reconcile its work before planning batches")
+    from app.models.quality import Inspection
+    if rows(db, Inspection, tid, Inspection.order_ref == obj.order_no,
+            Inspection.batch_line_id.is_(None), Inspection.is_deleted.is_(False)):
+        raise HTTPException(409, "This order already has whole-order inspections; reconcile them before planning batches")
     # Legacy completed orders cannot be relabelled as new lots without reconciliation.
     if pos[0].sales_order_id:
         legacy = rows(db, Shipment, tid, Shipment.sales_order_id == pos[0].sales_order_id, Shipment.is_deleted.is_(False))
         for ship in legacy:
             if not ship.batch_managed:
-                raise HTTPException(409, "An existing whole-order shipment must be reconciled before enabling batches")
+                if ship.inventory_dispatched:
+                    order = db.get(SalesOrder, pos[0].sales_order_id)
+                    if order.status == "Shipped" or db.scalar(select(ShipmentLine.id).where(
+                        ShipmentLine.tenant_id == uid(tid), ShipmentLine.shipment_id == ship.id,
+                        ShipmentLine.order_line_id.is_(None)).limit(1)):
+                        raise HTTPException(409, "Reconcile the completed legacy whole-order shipment before enabling batches")
+                elif ship.packed_at and ship.status != "Cancelled":
+                    raise HTTPException(409, "Dispatch the physically packed ordinary shipment before planning production batches")
+                else:
+                    ship.status = "Cancelled"
     sources = {s.id: s for s in rows(db, PurchaseOrderLine, tid, PurchaseOrderLine.po_id == pos[0].id)}
     active_batches = rows(db, ProductionBatch, tid, ProductionBatch.order_id == obj.id, ProductionBatch.status != "Cancelled")
     existing = rows(db, BatchLine, tid, BatchLine.po_line_id.in_(sources), BatchLine.batch_id.in_([b.id for b in active_batches]))
@@ -136,8 +153,25 @@ def create_batch(db, tid, actor, order_id, command):
     for line in command.lines:
         db.add(BatchLine(tenant_id=uid(tid), batch_id=batch.id, po_line_id=line.sourceId,
             variant_id=variants[line.sourceId].id, planned=line.qty))
-    for i, name in enumerate(stages):
-        db.add(BatchStage(tenant_id=uid(tid), batch_id=batch.id, seq=i+1, name=name))
+    start = command.startOn
+    style_ids = sorted({source.production_line_id for source in (sources[line.sourceId] for line in command.lines)
+                        if source.production_line_id is not None})
+    if len(style_ids) != len({source.name for source in (sources[line.sourceId] for line in command.lines)}):
+        raise HTTPException(409, "Link every purchase-order style to its production item before planning a batch")
+    for style_id in style_ids:
+        start = command.startOn
+        for i, name in enumerate(stages):
+            duration = command.durations[i] if command.durations else 1
+            finish = start + timedelta(days=max(1, duration)-1)
+            db.add(BatchStage(tenant_id=uid(tid), batch_id=batch.id, production_line_id=style_id,
+                seq=i+1, name=name, start_on=start, end_on=finish, duration_days=duration))
+            start = finish + timedelta(days=1)
+    if command.dueOn and command.dueOn < finish:
+        raise HTTPException(422, "The target completion date cannot precede the TNA schedule")
+    batch.due_on = (command.dueOn or finish).isoformat()
+    db.flush()
+    from app.modules import techpacks
+    techpacks.sync_order(db, obj)
     obj.stage = stages[0] if stages[0] in ("Cutting", "Sewing", "Finishing", "Packed") else "Cutting"
     return end(db, tid, actor, command, "Plan batch", payload, {"publicId": str(batch.public_id)}, batch.id)
 
@@ -162,7 +196,7 @@ def refresh(db, tid, work):
         elif all(l.completed == l.planned for l in lines): batch.status = "Awaiting QC"
         elif any(l.completed for l in lines): batch.status = "In progress"
     all_lines = rows(db, BatchLine, tid, BatchLine.batch_id.in_([b.id for b in batches]))
-    work.progress = min(100, round(100 * sum(l.completed-l.rejected for l in all_lines) / max(1, work.qty)))
+    work.progress = min(100, round(100 * sum(l.completed for l in all_lines) / max(1, work.qty)))
     stages = rows(db, BatchStage, tid, BatchStage.batch_id.in_([b.id for b in batches]))
     active = next((s.name for s in stages if s.status != "Completed"), None)
     work.stage = "Packed" if work.progress == 100 else active if active in ("Cutting", "Sewing", "Finishing") else "Sewing"
@@ -181,14 +215,114 @@ def stage(db, tid, actor, batch_id, stage_id, command):
     stages = rows(db, BatchStage, tid, BatchStage.batch_id == batch.id)
     found = next((s for s in stages if s.id == stage_id), None)
     if found is None: raise HTTPException(404, "Batch stage not found")
+    if found.name == "Tech Pack": raise HTTPException(409, "Upload the article's tech pack to receive this stage")
     if found.status == "Completed" and command.status != "Completed":
         raise HTTPException(409, "A completed stage cannot be reopened")
-    if any(s.seq < found.seq and s.status != "Completed" for s in stages):
+    if any(s.production_line_id == found.production_line_id and s.seq < found.seq
+           and s.status not in ("Completed", "Received") for s in stages):
         raise HTTPException(409, "Complete earlier production stages first")
+    if found.status in ("Completed", "Received"):
+        raise HTTPException(409, "This TNA stage is already complete")
+    if not found.start_on or not found.end_on:
+        raise HTTPException(409, "Plan this batch's TNA dates before recording progress")
+    found.actual_start_on = found.actual_start_on or date.today()
+    if command.status == "Completed": found.actual_end_on = date.today()
     found.status, found.worker, found.notes = command.status, command.worker.strip(), command.reason
     batch.status = "In progress"
     db.flush(); refresh(db, tid, work)
     return end(db, tid, actor, command, "Production stage", payload, {"status": found.status}, batch.id)
+
+
+def start_style(db, tid, actor, batch_id, command):
+    batch, work, lines = locked_batch(db, tid, batch_id)
+    prior, payload = begin(db, tid, command, "Start batch style", batch_id)
+    if prior is not None: return prior
+    if batch.status == "Cancelled": raise HTTPException(409, "This batch is cancelled")
+    source_lines = [db.get(PurchaseOrderLine, line.po_line_id) for line in lines]
+    if command.productionLineId not in {source.production_line_id for source in source_lines}:
+        raise HTTPException(404, "Style does not belong to this batch")
+    stages = sorted(rows(db, BatchStage, tid, BatchStage.batch_id == batch.id,
+        BatchStage.production_line_id == command.productionLineId), key=lambda item: item.seq)
+    if not stages: raise HTTPException(409, "This style has no production timeline")
+    if any(stage.status not in ("Pending", "Received") for stage in stages):
+        raise HTTPException(409, "This style has already started production")
+    requested = command.stages
+    if [item.get("name") for item in requested] != [stage.name for stage in stages]:
+        raise HTTPException(422, "Start the existing stages in their planned order")
+    if any(type(item.get("days")) is not int or item["days"] < (0 if item["name"] == "Tech Pack" else 1)
+           or item["days"] > 365 for item in requested):
+        raise HTTPException(422, "Enter a valid duration for each stage")
+    from app.modules import techpacks
+    production_line = db.get(ProductionOrderLine, command.productionLineId)
+    pack_received = techpacks.line_pack(db, production_line)["status"] == "Received" if production_line else False
+    cursor = date.today()
+    first_work = True
+    for current, wanted in zip(stages, requested):
+        current.duration_days = wanted["days"]
+        current.start_on = cursor
+        current.end_on = cursor + timedelta(days=max(1, wanted["days"])-1)
+        cursor = current.end_on + timedelta(days=1)
+        if current.name == "Tech Pack":
+            current.status = "Received" if pack_received else "Pending"
+        elif first_work:
+            current.status = "In progress"
+            current.actual_start_on = date.today()
+            first_work = False
+        else:
+            current.status = "Pending"
+    batch.status = "In progress"
+    db.flush(); refresh(db, tid, work)
+    return end(db, tid, actor, command, "Start batch style", payload,
+        {"productionLineId": command.productionLineId}, batch.id)
+
+
+def stage_action(db, tid, actor, batch_id, stage_id, action, command):
+    if action not in ("start", "complete", "assign", "notes", "extend", "resolve"):
+        raise HTTPException(404, "Unknown production stage action")
+    batch, work, _ = locked_batch(db, tid, batch_id)
+    prior, payload = begin(db, tid, command, "Batch stage " + action, stage_id)
+    if prior is not None: return prior
+    if batch.status == "Cancelled": raise HTTPException(409, "This batch is cancelled")
+    all_stages = rows(db, BatchStage, tid, BatchStage.batch_id == batch.id)
+    found = next((stage for stage in all_stages if stage.id == stage_id), None)
+    if found is None: raise HTTPException(404, "Batch stage not found")
+    if found.name == "Tech Pack":
+        raise HTTPException(409, "Upload the article's tech pack to receive this stage")
+    if found.status in ("Completed", "Received"):
+        raise HTTPException(409, "A completed stage cannot be changed")
+    stages = sorted((stage for stage in all_stages if stage.production_line_id == found.production_line_id), key=lambda stage: stage.seq)
+    following = [stage for stage in stages if stage.seq > found.seq and stage.status != "Completed"]
+    if action in ("start", "complete"):
+        if any(stage.seq < found.seq and stage.status not in ("Completed", "Received") for stage in stages):
+            raise HTTPException(409, "Complete earlier production stages first")
+        if action == "start":
+            found.status = "In progress"
+            found.actual_start_on = found.actual_start_on or date.today()
+        else:
+            found.status = "Completed"
+            found.actual_start_on = found.actual_start_on or date.today()
+            found.actual_end_on = date.today()
+    elif action == "assign":
+        if not command.worker.strip(): raise HTTPException(422, "Enter a worker")
+        found.worker = command.worker.strip()
+    elif action == "notes":
+        found.notes = command.notes.strip()
+    else:
+        if action == "extend":
+            if command.days < 1: raise HTTPException(422, "Enter extra days")
+            delta = command.days
+            found.duration_days += delta
+            found.end_on = (found.end_on or date.today()) + timedelta(days=delta)
+        else:
+            delta = (date.today() - (found.start_on or date.today())).days
+            found.start_on = date.today()
+            found.end_on = date.today() + timedelta(days=max(1, found.duration_days)-1)
+        for later in following:
+            if later.start_on: later.start_on += timedelta(days=delta)
+            if later.end_on: later.end_on += timedelta(days=delta)
+    db.flush(); refresh(db, tid, work)
+    return end(db, tid, actor, command, "Batch stage " + action, payload,
+        {"stageId": found.id, "status": found.status}, batch.id)
 
 
 def line_action(db, tid, actor, batch_id, line_id, command, action):
@@ -198,13 +332,18 @@ def line_action(db, tid, actor, batch_id, line_id, command, action):
     if batch.status == "Cancelled": raise HTTPException(409, "This batch is cancelled")
     line = next((l for l in lines if l.id == line_id), None)
     if line is None: raise HTTPException(404, "Batch variant not found")
+    active_article(db, line)
     if action == "Complete production":
-        if any(s.status != "Completed" for s in rows(db, BatchStage, tid, BatchStage.batch_id == batch.id)):
-            raise HTTPException(409, "Complete this batch's production stages first")
+        from app.modules.batches.workflow import style_complete
+        if not style_complete(db, tid, line):
+            raise HTTPException(409, "Complete this style's production stages first")
         if command.qty > line.planned - line.completed:
             raise HTTPException(409, "Completion exceeds planned quantity")
         line.completed += command.qty
     elif action == "QC":
+        from app.modules.batches.workflow import style_complete
+        if command.kind != "Inline" and not style_complete(db, tid, line):
+            raise HTTPException(409, "Complete this style's production stages before final QC or reinspection")
         limit = line.held if command.kind == "Reinspection" else line.completed - line.approved - line.held - line.rejected
         if command.kind == "Inline": limit = line.planned
         if command.assessed > limit: raise HTTPException(409, "Assessed quantity exceeds the eligible QC lot")
@@ -212,44 +351,45 @@ def line_action(db, tid, actor, batch_id, line_id, command, action):
             if command.kind == "Reinspection": line.held -= command.assessed
             line.approved += command.approved; line.held += command.held; line.rejected += command.rejected
     elif action == "Receive approved stock":
-        if command.qty > line.approved - line.received:
-            raise HTTPException(409, "Receipt exceeds approved, unreceived pieces")
-        location = rows(db, Location, tid, Location.id == command.locationId, Location.is_deleted.is_(False))
-        if not location: raise HTTPException(400, "Select an active warehouse location")
-        from app.modules.inventory.repository import add_stock
-        level = add_stock(db, tenant_id=uid(tid), variant_id=line.variant_id, location_id=location[0].id, qty=command.qty)
-        # All lot stock is earmarked for this production demand, including before shipment allocation.
-        level.reserved += command.qty
-        source = db.get(PurchaseOrderLine, line.po_line_id)
-        po = db.get(PurchaseOrder, work.purchase_order_id)
-        if po.sales_order_id and source.sales_order_line_id:
-            hold = rows(db, OrderStockReservation, tid, OrderStockReservation.order_line_id == source.sales_order_line_id,
-                OrderStockReservation.stock_level_id == level.id)
-            if hold: hold[0].qty += command.qty
-            else: db.add(OrderStockReservation(tenant_id=uid(tid), order_id=po.sales_order_id,
-                order_line_id=source.sales_order_line_id, stock_level_id=level.id, qty=command.qty))
-        lots = rows(db, BatchLot, tid, BatchLot.line_id == line.id, BatchLot.location_id == location[0].id)
-        if lots: lots[0].on_hand += command.qty
-        else: db.add(BatchLot(tenant_id=uid(tid), line_id=line.id, location_id=location[0].id, on_hand=command.qty))
-        line.received += command.qty
-        receipt = GoodsReceipt(tenant_id=uid(tid), po_ref=po.po_no, supplier_name=po.supplier_name,
-            line_count=1, received_count=command.qty, status="Received", location=location[0].name)
-        db.add(receipt); db.flush(); receipt.grn_no = f"GRN-{3000 + receipt.id}"
-        db.add(GoodsReceiptLine(tenant_id=uid(tid), grn_id=receipt.id, name=source.name,
-            sku=source.sku, ordered=source.qty, received=command.qty))
-        all_sources = rows(db, PurchaseOrderLine, tid, PurchaseOrderLine.po_id == po.id)
-        all_lines = rows(db, BatchLine, tid, BatchLine.po_line_id.in_([s.id for s in all_sources]))
-        if sum(l.received for l in all_lines) >= sum(s.qty for s in all_sources):
-            po.inventory_received = True
-            po.status = "Received"
+        raise HTTPException(409, "Confirm an inbound shipment delivery in Shipments to receive batch stock")
     else: raise HTTPException(400, "Unknown quantity operation")
     db.flush(); refresh(db, tid, work)
-    return end(db, tid, actor, command, action, payload, {"lineId": line.id}, batch.id)
+    result = {"lineId": line.id}
+    if action == "QC":
+        from datetime import datetime, timezone
+        from app.modules.quality import repository as quality_repo, aql as quality_aql
+        source = db.get(PurchaseOrderLine, line.po_line_id)
+        inspection = quality_repo.create_inspection(db, tenant_id=uid(tid),
+            order_ref=work.order_no, item=" / ".join(filter(None, [source.name, source.color, source.size])),
+            stage="In-line" if command.kind == "Inline" else "Final", aql="2.5",
+            sku=source.sku, product=source.name, batch_lot=batch.name[:60],
+            inspection_type=command.kind, prod_qty=command.assessed, inspector=actor)
+        inspection.batch_line_id = line.id
+        inspection.sample_size = command.sampleSize
+        inspection.max_defects = quality_aql.acceptance_for_sample(command.sampleSize, inspection.aql)
+        inspection.approved_qty = command.approved if command.kind != "Inline" else 0
+        inspection.held_qty = command.held if command.kind != "Inline" else 0
+        inspection.rejected_qty = command.rejected if command.kind != "Inline" else 0
+        inspection.disposition_notes = command.reason
+        inspection.result = "Pass" if command.kind == "Inline" or not (command.held or command.rejected) else "Fail"
+        inspection.finalized_at = datetime.now(timezone.utc)
+        db.flush()
+        result["inspectionId"] = str(inspection.public_id)
+        result["inspectionNo"] = inspection.inspection_no
+    return end(db, tid, actor, command, action, payload, result, batch.id)
+
+
+def active_article(db, line):
+    from app.models.catalog import Product, ProductVariant
+    variant = db.get(ProductVariant, line.variant_id)
+    if variant is None or db.get(Product, variant.product_id).is_deleted:
+        raise HTTPException(409, "A retired article cannot record production, QC or warehouse receipts.")
 
 
 def update_sales(db, tid, order_id):
     order = db.get(SalesOrder, order_id)
     if order is None or order.tenant_id != uid(tid): return
+    if order.status in ("Cancelled", "Inactive"): return
     dispatched = dispatched_sales(db, tid, order_id)
     total = sum(l.qty for l in fulfillment.lines_for(db, order))
     qty = sum(dispatched.values())
@@ -268,6 +408,11 @@ def dispatched_sales(db, tid, order_id):
             .join(Shipment, Shipment.id == InventoryAllocation.shipment_id).where(InventoryAllocation.tenant_id == uid(tid),
                 Shipment.sales_order_id == order_id, InventoryAllocation.status == "Dispatched").group_by(InventoryAllocation.order_line_id)):
         totals[line_id] = totals.get(line_id, 0) + qty
+    from app.modules.sales.ordinary_shipping import dispatched
+    order = db.get(SalesOrder, order_id)
+    if order and order.tenant_id == uid(tid):
+        for line_id, qty in dispatched(db, order).items():
+            totals[line_id] = totals.get(line_id, 0) + qty
     return totals
 
 
@@ -353,6 +498,10 @@ def create_shipment(db, tid, actor, order_id, kind, command):
     db.add(ship); db.flush(); ship.shipment_no = f"SHP-{9900 + ship.id}"
     grouped = {}
     for a in command.allocations:
+        from app.models.catalog import Product, ProductVariant
+        candidate = lines[lots[a.lotId].line_id]
+        if db.get(Product, db.get(ProductVariant, candidate.variant_id).product_id).is_deleted:
+            raise HTTPException(409, "A retired article cannot be allocated to a shipment.")
         lot = lots[a.lotId]; line = lines[lot.line_id]; src = db.get(PurchaseOrderLine, line.po_line_id)
         key = (line.variant_id, src.sales_order_line_id)
         if key not in grouped:
@@ -380,7 +529,7 @@ def is_batch_shipment(db, shipment):
     return shipment.batch_managed
 
 
-def shipment_status(db, tid, public_id, status):
+def shipment_status(db, tid, public_id, status, actor=None):
     ship = one(db, Shipment, tid, public_id)
     allocations = rows(db, BatchAllocation, tid, BatchAllocation.shipment_id == ship.id)
     stock_allocations = rows(db, InventoryAllocation, tid, InventoryAllocation.shipment_id == ship.id)
@@ -406,6 +555,15 @@ def shipment_status(db, tid, public_id, status):
                 raise HTTPException(409, "Reconcile batch quantities before recording the return")
             # Physically returned pieces are quarantined, not immediately saleable stock.
             line.approved -= a.qty; line.received -= a.qty; line.held += a.qty
+            from app.modules.inventory import ledger
+            from types import SimpleNamespace
+            levels = rows(db, StockLevel, tid, StockLevel.variant_id == line.variant_id, StockLevel.location_id == lot.location_id, lock=True)
+            level = levels[0] if levels else SimpleNamespace(tenant_id=uid(tid), variant_id=line.variant_id, location_id=lot.location_id, on_hand=0)
+            ledger.record(db, level=level, before=level.on_hand, kind="Return to QC", quantity=a.qty,
+                request_id=uuid5(ship.public_id, f"return-{a.id}"), reference=ship.shipment_no,
+                reason="Returned pieces held for QC; warehouse on-hand is unchanged", actor=actor,
+                source_module="shipments", source_type="shipment", source_id=ship.public_id,
+                batch_id=db.get(ProductionBatch, line.batch_id).public_id)
             a.status = "Returned"
             batch = db.get(ProductionBatch, line.batch_id)
             work = db.get(ProductionOrder, batch.order_id)
@@ -440,7 +598,13 @@ def shipment_status(db, tid, public_id, status):
             if hold[0].qty < a.qty: raise HTTPException(409, "Reconcile order reservations before dispatch")
             if hold[0].qty == a.qty: db.delete(hold[0])
             else: hold[0].qty -= a.qty
+        before = level[0].on_hand
         level[0].on_hand -= a.qty; level[0].reserved -= a.qty; lot.on_hand -= a.qty; a.status = "Dispatched"
+        from app.modules.inventory import ledger
+        ledger.record(db, level=level[0], before=before, kind="Dispatch",
+            request_id=uuid5(ship.public_id, f"dispatch-batch-{a.id}"), reference=ship.shipment_no,
+            reason="Batch stock dispatched", actor=actor, source_module="shipments", source_type="shipment",
+            source_id=ship.public_id, batch_id=db.get(ProductionBatch, line.batch_id).public_id)
     for a in stock_allocations:
         if a.status != "Reserved": continue
         if status == "Cancelled": a.status = "Cancelled"; continue
@@ -449,7 +613,12 @@ def shipment_status(db, tid, public_id, status):
             OrderStockReservation.stock_level_id == a.stock_level_id)
         if not hold or min(level.on_hand, level.reserved, hold[0].qty) < a.qty:
             raise HTTPException(409, "Reconcile existing inventory reservations before dispatch")
+        before = level.on_hand
         level.on_hand -= a.qty; level.reserved -= a.qty
+        from app.modules.inventory import ledger
+        ledger.record(db, level=level, before=before, kind="Dispatch",
+            request_id=uuid5(ship.public_id, f"dispatch-stock-{a.id}"), reference=ship.shipment_no,
+            reason="Existing stock dispatched", actor=actor, source_module="shipments", source_type="shipment", source_id=ship.public_id)
         if hold[0].qty == a.qty: db.delete(hold[0])
         else: hold[0].qty -= a.qty
         a.status = "Dispatched"
@@ -474,7 +643,15 @@ def transfer_lot(db, tid, actor, batch_id, lot_id, command):
     if level is None or min(level.on_hand, level.reserved) < command.qty: raise HTTPException(409, "Source inventory needs reconciliation")
     from app.modules.inventory.repository import add_stock
     dest = add_stock(db, tenant_id=uid(tid), variant_id=line.variant_id, location_id=command.locationId, qty=command.qty)
+    before = level.on_hand
     level.on_hand -= command.qty; level.reserved -= command.qty; dest.reserved += command.qty
+    from app.modules.inventory import ledger
+    ledger.record(db, level=level, before=before, kind="Transfer out", request_id=command.requestId,
+        reference=f"{batch.name} transfer", reason=f"Batch stock transfer to {destination[0].name}", actor=actor,
+        source_module="inventory", source_type="batch_transfer", source_id=batch.public_id, batch_id=batch.public_id)
+    ledger.record(db, level=dest, before=dest.on_hand-command.qty, kind="Transfer in", request_id=command.requestId,
+        reference=f"{batch.name} transfer", reason="Batch stock received from source location", actor=actor,
+        source_module="inventory", source_type="batch_transfer", source_id=batch.public_id, batch_id=batch.public_id)
     source.on_hand -= command.qty
     targets = rows(db, BatchLot, tid, BatchLot.line_id == line.id, BatchLot.location_id == command.locationId)
     if targets: targets[0].on_hand += command.qty
@@ -507,6 +684,7 @@ def cancel_batch(db, tid, actor, batch_id, command):
 
 
 def view(db, tid, order_id, kind="production"):
+    from app.modules.batches.workflow import ready, tna_complete, states
     obj, works, pos = parent(db, tid, order_id, kind)
     sources = rows(db, PurchaseOrderLine, tid, PurchaseOrderLine.po_id.in_([p.id for p in pos]))
     source_map = {s.id: s for s in sources}
@@ -514,7 +692,9 @@ def view(db, tid, order_id, kind="production"):
     lines = rows(db, BatchLine, tid, BatchLine.batch_id.in_([b.id for b in batches]))
     lots = rows(db, BatchLot, tid, BatchLot.line_id.in_([l.id for l in lines]))
     allocations = rows(db, BatchAllocation, tid, BatchAllocation.lot_id.in_([l.id for l in lots]))
+    inbound = rows(db, InboundAllocation, tid, InboundAllocation.line_id.in_([l.id for l in lines]))
     shipments = {s.id: s for s in rows(db, Shipment, tid, Shipment.id.in_([a.shipment_id for a in allocations]))}
+    shipments.update({s.id: s for s in rows(db, Shipment, tid, Shipment.id.in_([a.shipment_id for a in inbound]))})
     inventory = inventory_sources(db, tid, obj.id) if kind == "sales" else []
     if kind == "sales":
         for s in rows(db, Shipment, tid, Shipment.sales_order_id == obj.id, Shipment.batch_managed.is_(True), Shipment.is_deleted.is_(False)):
@@ -524,7 +704,7 @@ def view(db, tid, order_id, kind="production"):
     location_map = {l.id: l.name for l in locations}
     stages = rows(db, BatchStage, tid, BatchStage.batch_id.in_([b.id for b in batches]))
     events = rows(db, BatchEvent, tid, BatchEvent.batch_id.in_([b.id for b in batches]))
-    shipment_events = rows(db, BatchEvent, tid, BatchEvent.kind.in_(["Allocate shipment", "Shipment status"]))
+    shipment_events = rows(db, BatchEvent, tid, BatchEvent.kind.in_(["Allocate shipment", "Plan inbound shipment", "Shipment status"]))
     def totals(items):
         ids = {l.id for l in items}; lot_ids = {l.id for l in lots if l.line_id in ids}
         return {**{k: sum(getattr(l, k) for l in items) for k in ("planned", "completed", "approved", "held", "rejected", "received")},
@@ -532,10 +712,19 @@ def view(db, tid, order_id, kind="production"):
             "allocated": sum(a.qty for a in allocations if a.lot_id in lot_ids and a.status == "Reserved"),
             "dispatched": sum(a.qty for a in allocations if a.lot_id in lot_ids and a.status == "Dispatched"),
             "delivered": sum(a.qty for a in allocations if a.lot_id in lot_ids and a.status == "Dispatched" and shipments[a.shipment_id].status == "Delivered"),
-            "available": sum(l.on_hand-l.allocated for l in lots if l.line_id in ids)}
+            "available": sum(l.on_hand-l.allocated for l in lots if l.line_id in ids),
+            "readyToShip": sum(ready(db, tid, line) for line in items),
+            "inboundPending": sum(a.qty for a in inbound if a.line_id in ids and a.status == "Reserved"),
+            "inboundTransit": sum(a.qty for a in inbound if a.line_id in ids and a.status == "In transit"),
+            "inboundDelivered": sum(a.accepted for a in inbound if a.line_id in ids and a.status == "Delivered")}
     def line_view(line):
+        from app.modules.batches.workflow import style_complete
         src = source_map[line.po_line_id]
-        return {"id": line.id, "sourceId": src.id, "name": src.name, "color": src.color, "size": src.size,
+        production_line = db.get(ProductionOrderLine, src.production_line_id) if src.production_line_id else None
+        return {"id": line.id, "sourceId": src.id, "productionLineId": src.production_line_id,
+            "productionLinePublicId": str(production_line.public_id) if production_line else None,
+            "tnaComplete": style_complete(db, tid, line),
+            "name": src.name, "color": src.color, "size": src.size,
             "variantId": line.variant_id, "salesOrderLineId": src.sales_order_line_id,
             **totals([line]), "lots": [{"id": l.id, "location": location_map.get(l.location_id, "Inactive location"),
                 "onHand": l.on_hand, "allocated": l.allocated, "available": l.on_hand-l.allocated} for l in lots if l.line_id == line.id]}
@@ -556,14 +745,25 @@ def view(db, tid, order_id, kind="production"):
         "locations": [{"id": l.id, "name": l.name} for l in locations],
         "batches": [{"publicId": str(b.public_id), "name": b.name, "factory": b.factory, "dueOn": b.due_on,
             "orderRef": next(w.order_no for w in works if w.id == b.order_id), "status": b.status,
+            **states(db, tid, b, [l for l in lines if l.batch_id == b.id]),
+            "poRef": next(p.po_no for p in pos if p.id == next(w.purchase_order_id for w in works if w.id == b.order_id)),
+            "tnaComplete": tna_complete(db, tid, b.id),
+            "tnaProgress": round(100 * sum(s.status in ("Completed", "Received") for s in stages if s.batch_id == b.id) / max(1, sum(s.batch_id == b.id for s in stages))),
             "summary": totals([l for l in lines if l.batch_id == b.id]),
             "lines": [line_view(l) for l in lines if l.batch_id == b.id],
-            "stages": [{"id": s.id, "name": s.name, "status": s.status, "worker": s.worker, "notes": s.notes} for s in stages if s.batch_id == b.id],
-            "history": [{"kind": e.kind, "actor": e.actor, "at": e.created_at.isoformat(), "details": json.loads(e.payload)} for e in events if e.batch_id == b.id]} for b in batches],
-        "shipments": [{"publicId": str(s.public_id), "ref": s.shipment_no, "status": s.status,
+            "stages": [{"id": s.id, "productionLineId": s.production_line_id,
+                "name": s.name, "status": s.status, "worker": s.worker, "notes": s.notes,
+                "startOn": s.start_on.isoformat() if s.start_on else None, "endOn": s.end_on.isoformat() if s.end_on else None,
+                "durationDays": s.duration_days, "actualStartOn": s.actual_start_on.isoformat() if s.actual_start_on else None,
+                "actualEndOn": s.actual_end_on.isoformat() if s.actual_end_on else None,
+                "overdue": bool(s.end_on and s.end_on < date.today() and s.status not in ("Completed", "Received"))}
+                for s in sorted(stages, key=lambda stage: stage.seq) if s.batch_id == b.id],
+            "history": [{"kind": e.kind, "actor": e.actor, "at": e.created_at.isoformat(), "details": json.loads(e.payload),
+                "inspectionId": json.loads(e.result).get("inspectionId")} for e in events if e.batch_id == b.id]} for b in batches],
+        "shipments": [{"publicId": s.public_id.__str__(), "ref": s.shipment_no, "status": s.status, "direction": s.direction,
             "history": [{"kind": e.kind, "actor": e.actor, "at": e.created_at.isoformat(), "reason": json.loads(e.payload).get("reason")}
                 for e in shipment_events if json.loads(e.result).get("publicId") == str(s.public_id) or json.loads(e.payload).get("scope") == str(s.public_id)],
-            "carrier": s.carrier, "destination": s.destination, "qty": sum(a.qty for a in allocations+stock_allocations if a.shipment_id == s.id),
+            "carrier": s.carrier, "destination": s.destination, "qty": sum(a.qty for a in allocations+stock_allocations+inbound if a.shipment_id == s.id),
             "sources": [{"allocationId": a.id, "batch": batch_map[line_map[lot_map[a.lot_id].line_id].batch_id].name,
                 "batchId": str(batch_map[line_map[lot_map[a.lot_id].line_id].batch_id].public_id),
                 "item": source_map[line_map[lot_map[a.lot_id].line_id].po_line_id].name,
@@ -574,19 +774,72 @@ def view(db, tid, order_id, kind="production"):
                     "batchId": None, "item": db.get(SalesOrderLine, a.order_line_id).name,
                     "color": db.get(SalesOrderLine, a.order_line_id).color, "size": db.get(SalesOrderLine, a.order_line_id).size,
                     "location": location_map.get(db.get(StockLevel, a.stock_level_id).location_id), "qty": a.qty, "status": a.status}
-                    for a in stock_allocations if a.shipment_id == s.id]} for s in shipments.values()]}
+                    for a in stock_allocations if a.shipment_id == s.id] + [{"allocationId": a.id,
+                        "batch": batch_map[line_map[a.line_id].batch_id].name,
+                        "batchId": str(batch_map[line_map[a.line_id].batch_id].public_id),
+                        "item": source_map[line_map[a.line_id].po_line_id].name,
+                        "color": source_map[line_map[a.line_id].po_line_id].color,
+                        "size": source_map[line_map[a.line_id].po_line_id].size,
+                        "location": location_map.get(a.location_id), "qty": a.qty, "accepted": a.accepted, "status": a.status}
+                        for a in inbound if a.shipment_id == s.id]} for s in shipments.values()]}
 
 
 def work_list(db, tid, kind):
+    from app.modules.batches.workflow import ready, tna_complete, states
     batches = rows(db, ProductionBatch, tid, ProductionBatch.status != "Cancelled")
     result = []
     for b in batches:
         work = db.get(ProductionOrder, b.order_id)
         if work is None or work.tenant_id != uid(tid) or work.is_deleted: continue
         lines = rows(db, BatchLine, tid, BatchLine.batch_id == b.id)
-        if kind == "quality" and not any(l.completed-l.approved-l.rejected for l in lines): continue
+        po = db.get(PurchaseOrder, work.purchase_order_id)
+        if not po or po.is_deleted or po.status in ("Cancelled", "Rejected", "Inactive"): continue
         result.append({"publicId": str(b.public_id), "name": b.name, "orderId": str(work.public_id),
+            **states(db, tid, b, lines),
             "orderRef": work.order_no, "status": b.status, "factory": b.factory, "dueOn": b.due_on,
+            "poRef": po.po_no, "tnaComplete": tna_complete(db, tid, b.id),
+            "readyToShip": sum(ready(db, tid, l) for l in lines), "received": sum(l.received for l in lines),
             "planned": sum(l.planned for l in lines), "completed": sum(l.completed for l in lines),
             "awaitingQC": sum(l.completed-l.approved-l.held-l.rejected for l in lines), "held": sum(l.held for l in lines)})
     return {"batches": result}
+
+
+def receive_stock(db, tid, work, line, qty, location_id, actor=None, request_id=None):
+    if qty > line.approved - line.received:
+        raise HTTPException(409, "Receipt exceeds approved, unreceived pieces")
+    location = rows(db, Location, tid, Location.id == location_id, Location.is_deleted.is_(False))
+    if not location: raise HTTPException(400, "Select an active warehouse location")
+    from app.modules.inventory.repository import add_stock
+    level = add_stock(db, tenant_id=uid(tid), variant_id=line.variant_id, location_id=location[0].id, qty=qty)
+    # All lot stock is earmarked for this production demand, including before shipment allocation.
+    level.reserved += qty
+    source = db.get(PurchaseOrderLine, line.po_line_id)
+    po = db.get(PurchaseOrder, work.purchase_order_id)
+    if po.sales_order_id and source.sales_order_line_id:
+        hold = rows(db, OrderStockReservation, tid, OrderStockReservation.order_line_id == source.sales_order_line_id,
+            OrderStockReservation.stock_level_id == level.id)
+        if hold: hold[0].qty += qty
+        else: db.add(OrderStockReservation(tenant_id=uid(tid), order_id=po.sales_order_id,
+            order_line_id=source.sales_order_line_id, stock_level_id=level.id, qty=qty))
+    lots = rows(db, BatchLot, tid, BatchLot.line_id == line.id, BatchLot.location_id == location[0].id)
+    if lots: lots[0].on_hand += qty
+    else: db.add(BatchLot(tenant_id=uid(tid), line_id=line.id, location_id=location[0].id, on_hand=qty))
+    line.received += qty
+    receipt = GoodsReceipt(tenant_id=uid(tid), po_ref=po.po_no, supplier_name=po.supplier_name,
+        line_count=1, received_count=qty, status="Received", location=location[0].name)
+    db.add(receipt); db.flush(); receipt.grn_no = f"GRN-{3000 + receipt.id}"
+    from app.modules.inventory import ledger
+    ledger.record(db, level=level, before=level.on_hand-qty, kind="Receipt",
+        request_id=request_id, reference=receipt.grn_no, reason="Approved production batch physically received",
+        actor=actor, source_module="procurement", source_type="receipt", source_id=receipt.public_id,
+        batch_id=db.get(ProductionBatch, line.batch_id).public_id)
+    db.add(GoodsReceiptLine(tenant_id=uid(tid), grn_id=receipt.id, name=source.name,
+        sku=source.sku, ordered=source.qty, received=qty))
+    all_sources = rows(db, PurchaseOrderLine, tid, PurchaseOrderLine.po_id == po.id)
+    all_lines = rows(db, BatchLine, tid, BatchLine.po_line_id.in_([s.id for s in all_sources]))
+    if sum(l.received for l in all_lines) >= sum(s.qty for s in all_sources):
+        po.inventory_received = True
+        po.status = "Received"
+    else:
+        po.status = "Partially received"
+    db.flush()

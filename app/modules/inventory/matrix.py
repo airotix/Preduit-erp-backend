@@ -5,14 +5,12 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.models.catalog import AttributeValue, Product, ProductVariant
-from app.models.inventory import Location, StockLevel
+from app.models.inventory import StockLevel
 from app.modules.inventory import repository as repo
 
 
 def save_matrix(session, *, tenant_id, public_id, payload):
     tid = UUID(str(tenant_id))
-    from app.modules.sales import fulfillment
-    waiting_orders = fulfillment.lock_waiting_orders(session, tenant_id=tid)
     product = session.execute(select(Product).where(
         Product.public_id == public_id, Product.tenant_id == tid,
         Product.is_deleted == False).with_for_update()).scalar_one_or_none()
@@ -56,6 +54,15 @@ def save_matrix(session, *, tenant_id, public_id, payload):
                 used_ids.add(variant.id)
             planned.append((row, cell, color, size, variant))
 
+    # A matrix describes which variants exist. Physical quantities are posted
+    # only through an Inventory receipt or count correction.
+    for _, cell, _, _, variant in planned:
+        current = 0 if variant is None else sum(level.on_hand for level in session.scalars(
+            select(StockLevel).where(StockLevel.tenant_id == tid,
+                StockLevel.variant_id == variant.id).with_for_update()).all())
+        if cell.qty is not None and cell.qty != current:
+            raise HTTPException(409, "Stock quantities require an Inventory receipt or count correction")
+
     # Keep historical variant/SKU references; remove only empty variants from
     # both current matrices. Stock and reservations must never disappear.
     removed = [v for v in variants if key(v) and v.status != "Archived" and v.id not in used_ids]
@@ -65,26 +72,8 @@ def save_matrix(session, *, tenant_id, public_id, payload):
         if any(level.on_hand or level.reserved for level in levels):
             raise HTTPException(409, f"Cannot remove {variant.sku}: clear its stock and reservations first.")
 
-    if payload.location:
-        location = session.scalar(select(Location.id).where(
-            Location.tenant_id == tid, Location.is_deleted == False,
-            Location.name == payload.location.strip()))
-        if location is None:
-            raise HTTPException(400, "Select an existing inventory location.")
-    else:
-        # Use the article's assigned location, not an arbitrary tenant warehouse.
-        location = session.scalar(select(StockLevel.location_id)
-            .join(ProductVariant, ProductVariant.id == StockLevel.variant_id)
-            .join(Location, Location.id == StockLevel.location_id)
-            .where(ProductVariant.product_id == product.id, ProductVariant.tenant_id == tid,
-                   ProductVariant.status != "Archived", Location.tenant_id == tid,
-                   Location.is_deleted == False)
-            .order_by(StockLevel.on_hand.desc(), StockLevel.location_id).limit(1))
-    if location is None and any(cell.qty > 0 for _, cell, _, _, _ in planned):
-        raise HTTPException(400, "Create an inventory location before adding stock.")
     price, currency = repo.variant_defaults(session, product_id=product.id)
     template = next((v for v in variants if v.status != "Archived"), None)
-    stock_increased = False
     for row, cell, color_name, size_name, variant in planned:
         color = next((a for a in attributes.values()
                       if a.attr_type == "Color" and a.value.casefold() == color_name.casefold()), None)
@@ -107,39 +96,10 @@ def save_matrix(session, *, tenant_id, public_id, payload):
                 variant.online_price = template.online_price
                 variant.supplier_price = template.supplier_price
         variant.color_id, variant.size_id, variant.status = color.id, size.id, "Active"
-        levels = session.scalars(select(StockLevel).where(
-            StockLevel.variant_id == variant.id, StockLevel.tenant_id == tid)
-            .order_by(StockLevel.location_id).with_for_update()).all()
-        reserved = sum(level.reserved or 0 for level in levels)
-        if cell.qty < reserved:
-            raise HTTPException(409, f"{variant.sku} has {reserved} reserved units; on-hand cannot be lower.")
-        current = sum(level.on_hand or 0 for level in levels)
-        delta = cell.qty - current
-        if delta > 0:
-            stock_increased = True
-            target = levels[0] if levels else None
-            if target is None:
-                if location is None:
-                    raise HTTPException(400, "Create an inventory location before adding stock.")
-                target = StockLevel(tenant_id=tid, variant_id=variant.id, location_id=location,
-                                    on_hand=0, reserved=0)
-                session.add(target)
-            target.on_hand += delta
-        elif delta < 0:
-            remaining = -delta
-            for level in levels:
-                take = min(remaining, max(0, (level.on_hand or 0) - (level.reserved or 0)))
-                level.on_hand -= take
-                remaining -= take
-            if remaining:
-                raise HTTPException(409, "Cannot reduce stock below reservations at its locations.")
-        elif not levels and location is not None:
-            repo.ensure_stock_row(session, tenant_id=tid, variant_id=variant.id, location_id=location)
-        variant.qty_on_hand = cell.qty  # legacy field kept aligned for older consumers
+        variant.qty_on_hand = sum(session.scalars(select(StockLevel.on_hand).where(
+            StockLevel.tenant_id == tid, StockLevel.variant_id == variant.id)).all())
     for variant in removed:
         variant.status = "Archived"
         variant.qty_on_hand = 0
     session.flush()
-    if stock_increased:
-        fulfillment.refresh_waiting_orders(session, waiting_orders)
     return product

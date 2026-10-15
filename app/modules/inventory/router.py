@@ -1,4 +1,6 @@
 """Inventory HTTP routes."""
+from uuid import UUID
+from datetime import datetime
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
@@ -9,13 +11,42 @@ from app.core.security import Principal, require_module
 from app.modules.inventory import service
 from app.modules.inventory.dto import (
     LocationCreate, LocationUpdate, MatrixUpdate, ReorderAlertCreate, StatusUpdate,
-    StockReceiptCreate, TransferCreate,
+    StockAdjustmentCreate, StockReceiptCreate, TransferCreate, WarehouseReceiptCreate,
 )
 
 router = APIRouter(prefix="/inventory", tags=["inventory"])
 
 read = require_module("inventory", "read")
 write = require_module("inventory", "write")
+
+
+@router.get("/movements")
+def movement_history(productId: UUID | None = None, requestId: UUID | None = None,
+                     variantId: UUID | None = None, locationId: UUID | None = None,
+                     kind: str | None = None, search: str = Query("", max_length=200),
+                     fromAt: datetime | None = None, toAt: datetime | None = None,
+                     limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0),
+                     principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    from app.modules.inventory import ledger
+    return ledger.history(db, tenant_id=principal.tenant_id, product_id=productId, request_id=requestId,
+        variant_id=variantId, location_id=locationId, kind=kind, search=search,
+        from_at=fromAt, to_at=toAt, limit=limit, offset=offset)
+
+
+@router.get("/receiving")
+def receiving_queue(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+                    principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    from app.modules.inventory import receiving
+    return receiving.queue(db, tenant_id=principal.tenant_id, limit=limit, offset=offset)
+
+
+@router.post("/receiving/{public_id}", status_code=status.HTTP_201_CREATED)
+def receive_purchase_order(public_id: UUID, payload: WarehouseReceiptCreate,
+                           principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules.inventory import receiving
+    grn = receiving.post(db, tenant_id=principal.tenant_id, public_id=public_id,
+        payload=payload, actor=principal.email)
+    return {"public_id": str(grn.public_id), "grn_no": grn.grn_no}
 
 
 @router.get("/stock/screen")
@@ -35,8 +66,26 @@ def stock_search(q: str = Query(""), _: Principal = Depends(read),
 def create_stock(payload: StockReceiptCreate,
                  principal: Principal = Depends(write),
                  db: Session = Depends(tenant_db)):
-    received = service.create_stock_receipt(db, tenant_id=principal.tenant_id, payload=payload)
-    return {"received": received}
+    return service.create_stock_receipt(db, tenant_id=principal.tenant_id, payload=payload,
+                                        actor=principal.email)
+
+
+@router.post("/stock/adjustments", status_code=status.HTTP_201_CREATED)
+def adjust_stock(payload: StockAdjustmentCreate,
+                 principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    raise HTTPException(409, "Create and submit a stocktake session; count corrections require review before posting")
+
+
+@router.get("/stock/{public_id}/balances")
+def stock_balances(public_id: str, principal: Principal = Depends(read),
+                   db: Session = Depends(tenant_db)):
+    return service.stock_balances(db, tenant_id=principal.tenant_id, public_id=public_id)
+
+
+@router.get("/stock/{public_id}/entries")
+def stock_entries(public_id: str, principal: Principal = Depends(read),
+                  db: Session = Depends(tenant_db)):
+    return service.stock_entries(db, tenant_id=principal.tenant_id, public_id=public_id)
 
 
 @router.get("/stock/{public_id}/detail")
@@ -98,7 +147,7 @@ def location_options(_: Principal = Depends(read), db: Session = Depends(tenant_
 def create_transfer(payload: TransferCreate,
                     principal: Principal = Depends(write),
                     db: Session = Depends(tenant_db)):
-    t = service.create_transfer(db, tenant_id=principal.tenant_id, payload=payload)
+    t = service.create_transfer(db, tenant_id=principal.tenant_id, payload=payload, actor=principal.email)
     return {"public_id": str(t.public_id), "transfer_no": t.transfer_no}
 
 
@@ -122,5 +171,4 @@ def alerts_screen(limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
 def create_alert(payload: ReorderAlertCreate,
                  principal: Principal = Depends(write),
                  db: Session = Depends(tenant_db)):
-    a = service.create_alert(db, tenant_id=principal.tenant_id, payload=payload)
-    return {"public_id": str(a.public_id), "sku": a.sku}
+    raise HTTPException(409, "Configure a warehouse replenishment rule; alerts are calculated from live stock")

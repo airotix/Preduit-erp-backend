@@ -159,7 +159,7 @@ def create_for_purchase_order(session, *, tenant_id, purchase_order: PurchaseOrd
         PurchaseOrder.is_deleted == False).with_for_update()).scalar_one_or_none()
     if source is None:
         raise ValueError("Purchase order does not belong to this tenant")
-    if source.status == "Rejected":
+    if source.status in ("Rejected", "Cancelled", "Inactive"):
         from fastapi import HTTPException
         raise HTTPException(409, "Rejected POs cannot create production work.")
     existing = session.execute(select(ProductionOrder).where(
@@ -272,7 +272,7 @@ def _fmt(d) -> str:
     return d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else "—"
 
 
-_LINE_TONE = {"Completed": "green", "In Progress": "accent", "Planned": "neutral"}
+_LINE_TONE = {"Completed": "green", "In Progress": "accent", "Planned": "neutral", "Cancelled": "neutral"}
 
 
 def _stage_rows(stages, today) -> list[dict]:
@@ -280,7 +280,7 @@ def _stage_rows(stages, today) -> list[dict]:
         {
             "public_id": str(s.public_id), "seq": s.seq, "name": s.name,
             "duration_days": s.duration_days, "status": s.status,
-            "overdue": s.status not in ("Completed", "Received") and s.end_on is not None and s.end_on < today,
+            "overdue": s.status not in ("Completed", "Received", "Cancelled") and s.end_on is not None and s.end_on < today,
             "start": _fmt(s.start_on), "end": _fmt(s.end_on),
             "worker": s.worker or "Unassigned", "notes": s.notes or "",
         }
@@ -293,7 +293,7 @@ def _timeline_alert(stages, today, *, started: bool, all_done: bool):
         return {"type": "done", "message": "All stages completed — production is finished."}
     if not started:
         return None
-    active = next((s for s in stages if s.status not in ("Completed", "Received")), None)
+    active = next((s for s in stages if s.status not in ("Completed", "Received", "Cancelled")), None)
     if active is None:
         return None
     if active.name == "Tech Pack":
@@ -315,12 +315,13 @@ def _timeline(stages, today) -> dict:
     completed = sum(1 for s in stages if s.status in ("Completed", "Received"))
     progress = round(completed / len(stages) * 100) if stages else 0
     all_done = started and completed == len(stages)
-    status_label = "Completed" if all_done else ("In Progress" if started else "Planned")
+    cancelled = bool(stages) and all(s.status in ("Completed", "Received", "Cancelled") for s in stages) and any(s.status == "Cancelled" for s in stages)
+    status_label = "Cancelled" if cancelled else ("Completed" if all_done else ("In Progress" if started else "Planned"))
     return {
         "started": started, "progress": progress, "statusLabel": status_label,
         "statusTone": _LINE_TONE.get(status_label, "neutral"),
         "stages": _stage_rows(stages, today),
-        "alert": _timeline_alert(stages, today, started=started, all_done=all_done),
+        "alert": None if cancelled else _timeline_alert(stages, today, started=started, all_done=all_done),
     }
 
 
@@ -365,7 +366,7 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
     if batch_managed:
         from app.modules.batches.service import view
         batch_summary = view(session, po.tenant_id, po.public_id)["summary"]
-        progress = min(100, round(100 * (batch_summary["completed"]-batch_summary["rejected"]) / max(1, po.qty)))
+        progress = min(100, round(100 * batch_summary["completed"] / max(1, po.qty)))
         status_label = "Production complete" if progress == 100 else "Batch production"
         can_inspect = False
 
@@ -420,6 +421,17 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
 
 
 def start_production(session, *, tenant_id, public_id, stages, line_id=None):
+    from fastapi import HTTPException
+    from app.models.catalog import Product, ProductVariant
+    order = repo.order_by_public(session, public_id)
+    if order is not None:
+        lines = repo.list_lines(session, order.id)
+        if line_id:
+            lines = [line for line in lines if str(line.public_id) == str(line_id)]
+        if session.scalar(select(Product.id).outerjoin(ProductVariant, ProductVariant.product_id == Product.id).where(
+                Product.tenant_id == _tid(tenant_id), Product.is_deleted.is_(True),
+                ProductVariant.sku.in_([line.sku for line in lines if line.sku])).limit(1)) is not None:
+            raise HTTPException(409, "Production cannot start for a retired article.")
     work = repo.order_by_public(session, public_id)
     if work and session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == work.id, ProductionBatch.tenant_id == work.tenant_id).limit(1)):
         from fastapi import HTTPException
@@ -431,6 +443,8 @@ def start_production(session, *, tenant_id, public_id, stages, line_id=None):
 def stage_action(session, *, action, public_id, days=None, worker=None, notes=None):
     from fastapi import HTTPException
     stage = repo.get_stage(session, public_id=public_id)
+    if stage is not None and stage.status == "Cancelled":
+        raise HTTPException(409, "This production stage has been stopped.")
     if stage is not None and session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == stage.order_id,
             ProductionBatch.tenant_id == stage.tenant_id).limit(1)):
         raise HTTPException(409, "Manage stages on the production batch.")
@@ -457,9 +471,6 @@ def stage_action(session, *, action, public_id, days=None, worker=None, notes=No
                     qc_repo.create_inspection(session, tenant_id=stage.tenant_id,
                                               order_ref=po.order_no, stage="Final", aql="2.5",
                                               product=po.style, prod_qty=po.qty)
-            if po is not None:
-                from app.modules.sales import fulfillment
-                fulfillment.receive_inspected_production(session, tenant_id=stage.tenant_id, order_ref=po.order_no)
         return stage
     if action == "extend":
         return repo.extend_stage(session, public_id=public_id, days=days or 0)

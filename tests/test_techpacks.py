@@ -1,4 +1,3 @@
-import asyncio
 import uuid
 import unittest
 from types import SimpleNamespace
@@ -13,7 +12,6 @@ from app.models.document import Document, DocumentContent
 from app.models.production import ProductionStage
 from app.models.quality import Inspection
 from app.modules import techpacks
-from app.modules.documents.router import download
 from app.modules.production import repository, service
 
 
@@ -48,16 +46,34 @@ class TechPackTests(unittest.TestCase):
             stages=[{"name": "Packed", "days": 1}], line_id=str(self.line.public_id))
         return repository.list_line_stages(self.db, self.line.id)
 
-    def test_catalog_upload_persists_bytes_and_auto_receives_first_stage(self):
+    def test_catalog_upload_needs_approval_before_first_stage_is_received(self):
         result = self.upload()
         stages = self.start()
+        self.assertEqual(result["status"], "Pending")
+        self.assertEqual(stages[0].status, "Pending")
+        result = techpacks.approve_product_revision(self.db, tenant_id=self.tid,
+            public_id=self.article.public_id, revision_id=result["pendingRevision"]["id"], actor="reviewer")
         self.assertEqual([(s.name, s.status) for s in stages], [("Tech Pack", "Received"), ("Packed", "In Progress")])
         self.assertEqual(techpacks.line_pack(self.db, self.line)["document"], result["document"])
-        response = download(result["document"]["public_id"], db=self.db)
-        async def body():
-            return b"".join([chunk async for chunk in response.body_iterator])
-        self.assertEqual(asyncio.run(body()), b"%PDF-1.4 test")
+        self.assertEqual(self.db.scalar(select(DocumentContent)).data, b"%PDF-1.4 test")
         self.assertEqual(self.count(DocumentContent), 1)
+
+    def test_new_upload_supersedes_old_draft_and_keeps_approved_revision(self):
+        first = self.upload()
+        stale_id = first["pendingRevision"]["id"]
+        second = self.upload()
+        self.assertEqual(second["pendingRevision"]["revision"], 2)
+        self.assertEqual(second["revisions"][1]["status"], "Superseded")
+        with self.assertRaises(HTTPException) as error:
+            techpacks.approve_product_revision(self.db, tenant_id=self.tid,
+                public_id=self.article.public_id, revision_id=stale_id)
+        self.assertEqual(error.exception.status_code, 409)
+        approved = techpacks.approve_product_revision(self.db, tenant_id=self.tid,
+            public_id=self.article.public_id, revision_id=second["pendingRevision"]["id"])
+        self.assertEqual(approved["approvedRevision"], 2)
+        third = self.upload()
+        self.assertEqual(third["approvedRevision"], 2)
+        self.assertEqual(third["pendingRevision"]["revision"], 3)
 
     def test_production_upload_is_shared_with_catalog_and_opens_final_qc(self):
         stages = self.start()
@@ -68,11 +84,17 @@ class TechPackTests(unittest.TestCase):
         self.assertEqual(self.count(Inspection), 0)
         result = techpacks.upload_line(self.db, tenant_id=self.tid, public_id=self.line.public_id,
             filename="production.pdf", content_type="application/pdf", data=b"%PDF-1.4 production")
+        self.assertEqual(stages[0].status, "Pending")
+        result = techpacks.approve_product_revision(self.db, tenant_id=self.tid,
+            public_id=self.article.public_id, revision_id=result["pendingRevision"]["id"])
         self.assertEqual(stages[0].status, "Received")
         self.assertEqual(techpacks.product_pack(self.db, self.article)["document"], result["document"])
         self.assertEqual(self.count(Inspection), 1)
-        self.upload()
+        next_pack = self.upload()
         self.assertEqual(self.count(Inspection), 1)
+        self.assertEqual(techpacks.product_pack(self.db, self.article)["document"]["filename"], "production.pdf")
+        techpacks.approve_product_revision(self.db, tenant_id=self.tid,
+            public_id=self.article.public_id, revision_id=next_pack["pendingRevision"]["id"])
         self.assertEqual(techpacks.product_pack(self.db, self.article)["document"]["filename"], "pack.pdf")
         self.assertEqual(self.count(DocumentContent), 2)
 
@@ -90,6 +112,9 @@ class TechPackTests(unittest.TestCase):
         stages = self.start()
         techpacks.upload_line(self.db, tenant_id=self.tid, public_id=self.line.public_id,
             filename="only-line.pdf", content_type="application/pdf", data=b"%PDF-1.4 line")
+        pending = techpacks.line_pack(self.db, self.line)["pendingRevision"]
+        techpacks.approve_line_revision(self.db, tenant_id=self.tid,
+            public_id=self.line.public_id, revision_id=pending["id"])
         self.assertEqual(stages[0].status, "Received")
         self.assertEqual(techpacks.product_pack(self.db, self.article)["status"], "Pending")
         with self.assertRaises(HTTPException) as caught:

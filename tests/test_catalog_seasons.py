@@ -23,7 +23,7 @@ class CatalogSeasonTests(unittest.TestCase):
         self.assertEqual(service.list_seasons(self.db, tenant_id=self.tid), ["Core", "Summer 2027"])
 
     def test_new_season_accepts_custom_names_with_storage_length_validation(self):
-        product = ProductCreate(title="Article", sku="SKU-001", season=" Summer 2027 ")
+        product = ProductCreate(title="Article", sku="SKU-000001", season=" Summer 2027 ")
         self.assertEqual(product.season, "Summer 2027")
         with self.assertRaises(ValidationError):
-            ProductCreate(title="Article", sku="SKU-001", season="S" * 41)
+            ProductCreate(title="Article", sku="SKU-000001", season="S" * 41)

@@ -13,13 +13,14 @@ from app.modules.shipments import repository as repo
 from app.modules.shipments.dto import CarrierCreate, CarrierUpdate, ShipmentCreate
 from app.presenters.screen import list_config, text_cell
 
-_SHIP_TONE = {"Pending": "neutral", "Label created": "neutral", "In transit": "amber",
+_SHIP_TONE = {"Pending": "neutral", "Label created": "neutral", "Dispatched": "amber", "In transit": "amber",
               "Customs": "navy", "Out for delivery": "amber", "Delivered": "green"}
 _CARRIER_TONE = {"Active": "green", "Paused": "amber", "Inactive": "red"}
 
 # Tracking sequence used to build the timeline.
 _TRACK = [
     ("Label created", "package"),
+    ("Dispatched", "truck"),
     ("In transit", "truck"),
     ("Customs", "building-2"),
     ("Out for delivery", "map-pin"),
@@ -59,6 +60,8 @@ def create_shipment(session, *, tenant_id, payload: ShipmentCreate):
     from fastapi import HTTPException
     order = session.scalar(select(SalesOrder).where(SalesOrder.order_no == payload.order,
         SalesOrder.tenant_id == _tid(tenant_id), SalesOrder.is_deleted.is_(False)).with_for_update())
+    if order and order.status in ("Cancelled", "Inactive"):
+        raise HTTPException(409, "A cancelled or inactive order cannot create shipments.")
     if order and order.fulfillment_tracked:
         shipment = fulfillment.refresh_order(session, order)
         if shipment is None:
@@ -70,88 +73,85 @@ def create_shipment(session, *, tenant_id, payload: ShipmentCreate):
                                 carrier=payload.carrier, destination=payload.destination)
 
 
-def _mark_sales_order_shipped(session: Session, order_ref: str | None) -> None:
-    """When a shipment is Delivered, flip its sales order to 'Shipped'. The
-    shipment's order_ref may be the sales order number directly, or a production
-    order number that links back to a sales order."""
-    if not order_ref:
-        return
-    so = session.execute(
-        select(SalesOrder).where(SalesOrder.order_no == order_ref,
-                                 SalesOrder.is_deleted == False)  # noqa: E712
-    ).scalar_one_or_none()
-    if so is None:
-        # Resolve via the production order (order_ref → production → sales order).
-        po = session.execute(
-            select(ProductionOrder).where(ProductionOrder.order_no == order_ref,
-                                          ProductionOrder.is_deleted == False)  # noqa: E712
-        ).scalar_one_or_none()
-        if po is not None and po.sales_order_id:
-            so = session.get(SalesOrder, po.sales_order_id)
-    if so is not None and so.fulfillment_tracked:
-        from app.modules.sales import fulfillment
-        so = fulfillment.lock_order(session, tenant_id=so.tenant_id, order_id=so.id)
-        fulfillment.complete_shipment(session, so)
-        return
-    if so is not None and so.status != "Shipped":
-        so.status = "Shipped"
-        session.flush()
-        # Relieve inventory: reduce on-hand and release the reservation for each
-        # order line now that the goods have shipped.
-        from app.models.sales import SalesOrderLine
-        from app.modules.inventory import service as inv_service
-        line_rows = session.execute(
-            select(SalesOrderLine).where(SalesOrderLine.order_id == so.id)
-        ).scalars().all()
-        lines = [{"sku": ln.sku, "name": ln.name, "color": ln.color,
-                  "size": ln.size, "qty": ln.qty} for ln in line_rows]
-        inv_service.relieve_order_stock(session, tenant_id=so.tenant_id, lines=lines)
+def _shipment_order(session, shipment):
+    query = select(SalesOrder).where(SalesOrder.tenant_id == shipment.tenant_id,
+        SalesOrder.is_deleted.is_(False))
+    if shipment.sales_order_id:
+        return session.scalar(query.where(SalesOrder.id == shipment.sales_order_id))
+    order = session.scalar(query.where(SalesOrder.order_no == shipment.order_ref))
+    if order is None:
+        work = session.scalar(select(ProductionOrder).where(ProductionOrder.tenant_id == shipment.tenant_id,
+            ProductionOrder.order_no == shipment.order_ref, ProductionOrder.is_deleted.is_(False)))
+        if work and work.sales_order_id:
+            order = session.scalar(query.where(SalesOrder.id == work.sales_order_id))
+    return order
 
 
 def search_carriers(session, *, q, limit: int = 50):
     return repo.search_carriers(session, q=q or "", limit=limit)
 
 
-def _validate_order_shipment(session, public_id, status):
-    from fastapi import HTTPException
+def _transition(session, *, public_id, status, actor=None):
+    from datetime import datetime, timezone
+    from app.core.audit import write_audit
+    from app.modules.batches import service as batches
     from app.modules.sales import fulfillment
+    allowed = {"Pending", "Label created", "Dispatched", "In transit", "Customs", "Out for delivery", "Delivered"}
+    if status not in allowed:
+        raise HTTPException(422, "Choose a valid shipment status. Cancel through the source order before dispatch.")
     shipment = session.scalar(select(Shipment).where(Shipment.public_id == UUID(str(public_id)),
         Shipment.is_deleted.is_(False)))
-    if shipment is None or not shipment.sales_order_id:
-        return
-    order = fulfillment.lock_order(session, tenant_id=shipment.tenant_id, order_id=shipment.sales_order_id)
-    session.refresh(shipment)
-    if order.status == "Cancelled":
-        raise HTTPException(409, "This sales order has been cancelled.")
-    if shipment.status == "Delivered" and status != "Delivered":
-        raise HTTPException(409, "A completed shipment cannot be reopened.")
-    if shipment.status != "Delivered" and any(r["reserved"] < r["ordered"] for r in fulfillment.stock_summary(session, order)):
-        raise HTTPException(409, "The full order must be ready before its shipment can progress.")
-
-
-def set_status(session, *, public_id, status):
-    from app.modules.batches import service as batches
-    shipment = repo.get_shipment_detail(session, public_id=public_id)
-    if shipment and batches.is_batch_shipment(session, shipment["shipment"]):
+    if shipment is None:
+        return None
+    if batches.is_batch_shipment(session, shipment):
         raise HTTPException(409, "Use the batch shipment dispatch controls to record quantities and history.")
-    _validate_order_shipment(session, public_id, status)
-    s = repo.set_status(session, public_id=public_id, status=status)
-    if s is not None and status == "Delivered":
-        _mark_sales_order_shipped(session, s.order_ref)
-    return s
+    # Order locks precede shipment and stock locks, matching sales cancellation.
+    source = _shipment_order(session, shipment)
+    order = fulfillment.lock_order(session, tenant_id=shipment.tenant_id, order_id=source.id) if source else None
+    shipment = session.scalar(select(Shipment).where(Shipment.id == shipment.id,
+        Shipment.tenant_id == shipment.tenant_id).with_for_update().execution_options(populate_existing=True))
+    if shipment.status == "Cancelled" or (order and order.status in ("Cancelled", "Inactive")):
+        raise HTTPException(409, "A cancelled or inactive order cannot ship.")
+    if shipment.inventory_dispatched and status == "Dispatched":
+        return shipment  # A delayed dispatch retry must not reset tracking.
+    if shipment.status == "Delivered" and status != "Delivered":
+        raise HTTPException(409, "A delivered shipment cannot be reopened.")
+    if shipment.inventory_dispatched and status in ("Pending", "Label created"):
+        raise HTTPException(409, "These goods have left the warehouse. Dispatch cannot be undone by changing status.")
+    if status in ("In transit", "Customs", "Out for delivery", "Delivered") and not shipment.inventory_dispatched:
+        raise HTTPException(409, "Confirm Dispatched first to record that the goods physically left the warehouse.")
+    if status == "Dispatched" and not shipment.inventory_dispatched:
+        if order is None or not order.fulfillment_tracked:
+            raise HTTPException(409, "Link this shipment to a sales order with reconciled stock reservations before dispatch.")
+        if batches.managed_sales(session, order):
+            raise HTTPException(409, "Use this order's batch shipment controls to preserve its batch stock records.")
+        if not fulfillment.holds_for(session, order):
+            raise HTTPException(409, "No warehouse stock is reserved for this shipment. Reconcile the order before dispatch.")
+        fulfillment.complete_shipment(session, order, shipment=shipment, actor=actor)
+        shipment.sales_order_id = order.id
+        shipment.inventory_dispatched = True
+        shipment.dispatched_at = datetime.now(timezone.utc)
+        write_audit(session, tenant_id=shipment.tenant_id, action="DISPATCH", entity_type="shipment",
+            entity_id=str(shipment.public_id), detail=f"{shipment.shipment_no}: warehouse stock dispatched for {order.order_no}; {actor or 'user'}")
+    if status == "Delivered" and shipment.delivered_at is None:
+        shipment.delivered_at = datetime.now(timezone.utc)
+    shipment.status = status
+    session.flush()
+    return shipment
 
 
-def update_shipment(session, *, public_id, payload):
-    from app.modules.batches import service as batches
-    shipment = repo.get_shipment_detail(session, public_id=public_id)
-    if shipment and batches.is_batch_shipment(session, shipment["shipment"]):
-        raise HTTPException(409, "Use the batch shipment controls; dispatched quantities cannot be changed by editing a status.")
-    _validate_order_shipment(session, public_id, payload.status)
-    s = repo.update_shipment(session, public_id=public_id, carrier=payload.carrier,
-                             destination=payload.destination, eta=payload.eta, status=payload.status)
-    if s is not None and payload.status == "Delivered":
-        _mark_sales_order_shipped(session, s.order_ref)
-    return s
+def set_status(session, *, public_id, status, actor=None):
+    with session.begin_nested():
+        return _transition(session, public_id=public_id, status=status, actor=actor)
+
+
+def update_shipment(session, *, public_id, payload, actor=None):
+    with session.begin_nested():
+        shipment = _transition(session, public_id=public_id, status=payload.status, actor=actor)
+        if shipment:
+            shipment.carrier, shipment.destination, shipment.eta = payload.carrier, payload.destination, payload.eta
+            session.flush()
+        return shipment
 
 
 def shipment_detail(session: Session, *, public_id: str) -> dict | None:
@@ -159,6 +159,8 @@ def shipment_detail(session: Session, *, public_id: str) -> dict | None:
     if data is None:
         return None
     s, lines = data["shipment"], data["lines"]
+    from app.modules.batches.service import managed_sales
+    source = _shipment_order(session, s)
     order = [name for name, _ in _TRACK]
     idx = order.index(s.status) if s.status in order else 0
     timeline = []
@@ -190,11 +192,17 @@ def shipment_detail(session: Session, *, public_id: str) -> dict | None:
         "tabs": ["Tracking", "Contents", "Documents"],
         "shipment": {
             "tracking": timeline,
+            "inventoryDispatched": s.inventory_dispatched,
+            "ordinaryPacking": bool(source and source.fulfillment_tracked and not s.batch_managed and not managed_sales(session, source)),
+            "packedAt": s.packed_at.isoformat() if s.packed_at else None,
+            "packedBy": s.packed_by,
+            "dispatchedAt": s.dispatched_at.isoformat() if s.dispatched_at else None,
+            "deliveredAt": s.delivered_at.isoformat() if s.delivered_at else None,
             "contents": [
                 {"name": ln["description"], "sku": ln["sku"] or "—", "qty": ln["qty"]}
                 for ln in lines
             ],
-            "form": {
+            "form": None if s.batch_managed else {
                 "carrier": s.carrier or "", "destination": s.destination or "",
                 "eta": s.eta or "", "status": s.status,
             },

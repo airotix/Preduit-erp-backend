@@ -28,7 +28,7 @@ class RequestedWorkflowTests(unittest.TestCase):
     count = fixtures.SalesFulfillmentTests.count
 
     def test_each_article_has_its_selected_supplier_and_retry_does_not_duplicate(self):
-        product = Product(tenant_id=self.tid, title="Jacket")
+        product = Product(tenant_id=self.tid, title="Jacket", status="Active")
         supplier = Supplier(tenant_id=self.tid, name="Second factory")
         self.db.add_all([product, supplier]); self.db.flush()
         variant = ProductVariant(tenant_id=self.tid, product_id=product.id, sku="J-B-S",
@@ -77,7 +77,8 @@ class RequestedWorkflowTests(unittest.TestCase):
 
     def receipt(self, lines, location="Warehouse"):
         return inventory.create_stock_receipt(self.db, tenant_id=self.tid,
-            payload=StockReceiptCreate(location=location, lines=lines))
+            payload=StockReceiptCreate(location=location, lines=lines,
+                reference="RC-TEST", reason="Goods received"))
 
     def test_invalid_receipt_line_does_not_partially_receive(self):
         with self.assertRaises(HTTPException):

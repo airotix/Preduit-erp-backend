@@ -1,7 +1,7 @@
 """Quantity ledgers for production, QC, warehouse lots and dispatch allocations."""
 import uuid
-from datetime import datetime, timezone
-from sqlalchemy import BigInteger, Integer, String, Text, DateTime, Uuid, ForeignKey, CheckConstraint, UniqueConstraint
+from datetime import date, datetime, timezone
+from sqlalchemy import BigInteger, Integer, String, Text, Date, DateTime, Uuid, ForeignKey, CheckConstraint, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base
 
@@ -40,13 +40,33 @@ class BatchLine(Identity, Base):
 
 class BatchStage(Identity, Base):
     __tablename__ = "production_batch_stages"
-    __table_args__ = (UniqueConstraint("batch_id", "seq"),)
+    __table_args__ = (UniqueConstraint("batch_id", "production_line_id", "seq"),)
     batch_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("production_batches.id"))
+    production_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("production_order_lines.id"), index=True)
     seq: Mapped[int] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(24), default="Pending")
     worker: Mapped[str | None] = mapped_column(String(120))
     notes: Mapped[str | None] = mapped_column(String(400))
+    start_on: Mapped[date | None] = mapped_column(Date)
+    end_on: Mapped[date | None] = mapped_column(Date)
+    duration_days: Mapped[int] = mapped_column(Integer, default=1)
+    actual_start_on: Mapped[date | None] = mapped_column(Date)
+    actual_end_on: Mapped[date | None] = mapped_column(Date)
+
+
+class InboundAllocation(Identity, Base):
+    """Approved factory pieces travelling to a warehouse, before stock exists."""
+    __tablename__ = "shipment_inbound_allocations"
+    __table_args__ = (UniqueConstraint("shipment_id", "line_id"),
+        CheckConstraint("qty > 0 AND accepted >= 0 AND accepted <= qty"))
+    shipment_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("shipments.id"), index=True)
+    shipment_line_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("shipment_lines.id"))
+    line_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("production_batch_lines.id"))
+    location_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("locations.id"))
+    qty: Mapped[int] = mapped_column(Integer)
+    accepted: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(24), default="Reserved")
 
 
 class BatchLot(Identity, Base):

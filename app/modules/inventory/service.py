@@ -4,12 +4,12 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.modules.inventory import repository as repo
 from app.modules.inventory.dto import (
     LocationCreate, LocationUpdate, MatrixUpdate, ReorderAlertCreate,
-    StockReceiptCreate, TransferCreate,
+    StockAdjustmentCreate, StockReceiptCreate, TransferCreate,
 )
 from app.presenters.screen import list_config, text_cell
 
@@ -29,12 +29,30 @@ def _variant_name(title: str | None, color: str | None, size: str | None, sku: s
 
 # ---------- Stock levels (one row per article) ----------
 
-def _stock_status_cell(available: int):
+def _stock_status_cell(available: int, rules=None):
     if available <= 0:
         return text_cell("Out of stock", badge="red")
-    if available < 40:
+    if not rules:
+        return text_cell("No reorder rule", badge="neutral")
+    if any(qty <= minimum for qty, minimum in rules):
         return text_cell("Low", badge="amber")
     return text_cell("Healthy", badge="green")
+
+
+def _article_rules(session, public_id):
+    from app.models.inventory_operations import ReplenishmentRule
+    from app.models.catalog import Product, ProductVariant
+    from app.models.inventory import StockLevel, Location
+    return [(hand - reserved, minimum) for hand, reserved, minimum in session.execute(
+        select(func.coalesce(StockLevel.on_hand, 0),
+               func.coalesce(StockLevel.reserved, 0), ReplenishmentRule.minimum)
+        .select_from(ReplenishmentRule).join(ProductVariant, ProductVariant.id == ReplenishmentRule.variant_id)
+        .join(Product, Product.id == ProductVariant.product_id)
+        .join(Location, Location.id == ReplenishmentRule.location_id)
+        .outerjoin(StockLevel, (StockLevel.variant_id == ProductVariant.id) &
+            (StockLevel.location_id == ReplenishmentRule.location_id) & (StockLevel.tenant_id == ReplenishmentRule.tenant_id))
+        .where(Product.public_id == public_id, ReplenishmentRule.active.is_(True), Location.is_deleted.is_(False),
+            ProductVariant.status != "Archived"))]
 
 
 def stock_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
@@ -57,7 +75,7 @@ def stock_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
             text_cell(_money(r["retail"]), align="right", mono=True),
             text_cell(_money(r["online"]), align="right", mono=True),
             text_cell(_money(r["wholesale"]), align="right", mono=True),
-            _stock_status_cell(available),
+            _stock_status_cell(available, _article_rules(session, r["public_id"])),
         ])
     return list_config(
         columns=[
@@ -130,15 +148,15 @@ def stock_article_detail(session: Session, *, public_id: str) -> dict | None:
         "variant": "stockarticle",
         "ref": (product.season or "Stock"),
         "title": product.title,
-        "statusLabel": _stock_status_cell(available)["t"],
-        "statusTone": _stock_status_cell(available)["badge"],
+        "statusLabel": _stock_status_cell(available, _article_rules(session, product.public_id))["t"],
+        "statusTone": _stock_status_cell(available, _article_rules(session, product.public_id))["badge"],
         "meta": [
             {"k": "On hand", "v": f"{on_hand:,}"},
             {"k": "Reserved", "v": f"{reserved:,}"},
             {"k": "Available", "v": f"{available:,}"},
             {"k": "Colors", "v": str(len(colors))},
         ],
-        "tabs": ["Colors & sizes", "By location"],
+        "tabs": ["Colors & sizes", "By location", "History"],
         "stock": {"sizes": sizes, "colors": colors, "locations": locations},
     }
 
@@ -164,39 +182,159 @@ def _active_location(session, tenant_id, name):
     return rows[0].id
 
 
-def create_stock_receipt(session: Session, *, tenant_id: str | UUID, payload: StockReceiptCreate):
-    """Receive stock: for each article/colour/size line, add qty to on-hand at
-    the location (creating the variant + stock row if needed)."""
+def stock_balances(session: Session, *, tenant_id: str | UUID, public_id: str) -> list[dict]:
+    from app.models.catalog import AttributeValue, Product, ProductVariant
+    from app.models.inventory import Location, StockLevel
     tid = _tid(tenant_id)
+    product = session.scalar(select(Product).where(Product.tenant_id == tid,
+        Product.public_id == public_id, Product.is_deleted.is_(False)))
+    if product is None:
+        raise HTTPException(404, "Article not found")
+    attributes = {row.id: row.value for row in session.scalars(select(AttributeValue).where(
+        AttributeValue.tenant_id == tid)).all()}
+    locations = {row.id: row.name for row in session.scalars(select(Location).where(
+        Location.tenant_id == tid, Location.is_deleted.is_(False))).all()}
+    result = []
+    for variant in session.scalars(select(ProductVariant).where(ProductVariant.tenant_id == tid,
+            ProductVariant.product_id == product.id, ProductVariant.status != "Archived")
+            .order_by(ProductVariant.id)).all():
+        if not variant.color_id or not variant.size_id:
+            continue
+        levels = session.scalars(select(StockLevel).where(StockLevel.tenant_id == tid,
+            StockLevel.variant_id == variant.id)).all()
+        result.append({"variantId": variant.id, "variantPublicId": str(variant.public_id), "sku": variant.sku,
+            "color": attributes.get(variant.color_id), "size": attributes.get(variant.size_id),
+            "locations": [{"name": locations[level.location_id], "onHand": level.on_hand,
+                           "reserved": level.reserved} for level in levels if level.location_id in locations]})
+    return result
+
+
+def stock_entries(session: Session, *, tenant_id: str | UUID, public_id: str) -> list[dict]:
+    from app.modules.inventory import ledger
+    return ledger.history(session, tenant_id=tenant_id, product_id=public_id, limit=100)["entries"]
+
+
+def create_stock_receipt(session: Session, *, tenant_id: str | UUID, payload: StockReceiptCreate,
+                         actor: str | None = None):
+    """Receive physical stock against existing catalogue variants."""
+    tid = _tid(tenant_id)
+    if len(payload.reference.strip()) < 3 or len(payload.reason.strip()) < 3:
+        raise HTTPException(400, "Reference and reason must each contain at least three characters")
+    from app.models.inventory import StockEntry
+    from app.core.audit import write_audit
+    previous = session.scalars(select(StockEntry).where(StockEntry.tenant_id == tid,
+        StockEntry.request_id == payload.requestId)).all()
+    if previous:
+        if any(entry.kind != "Receipt" for entry in previous):
+            raise HTTPException(409, "Request ID is already used for another stock operation")
+        return {"received": sum(entry.qty_delta for entry in previous),
+                "receiptId": str(payload.requestId)}
     location_id = _active_location(session, tid, payload.location)
-    from app.models.catalog import Product
+    from app.models.catalog import Product, ProductVariant
+    from app.models.inventory import StockLevel
+    from sqlalchemy import func
     planned = []
     for line in payload.lines:
         if not (line.color or "").strip() or not (line.size or "").strip():
             raise HTTPException(400, f"Select a color and size for {line.name}.")
         products = session.scalars(select(Product).where(Product.tenant_id == tid,
-            Product.title == line.name.strip(), Product.is_deleted.is_(False)).limit(2)).all()
+            Product.title == line.name.strip(), Product.is_deleted.is_(False))
+            .with_for_update().limit(2)).all()
         if len(products) != 1:
             raise HTTPException(400, f"Select a valid, unambiguous catalog product: {line.name}.")
-        planned.append((line, products[0]))
+        color = repo.find_attr_value(session, attr_type="Color", value=line.color.strip(), tenant_id=tid)
+        size = repo.find_attr_value(session, attr_type="Size", value=line.size.strip(), tenant_id=tid)
+        variant = session.scalar(select(ProductVariant).where(ProductVariant.tenant_id == tid,
+            ProductVariant.product_id == products[0].id, ProductVariant.color_id == color.id if color else False,
+            ProductVariant.size_id == size.id if size else False, ProductVariant.status != "Archived"))
+        if variant is None:
+            raise HTTPException(409, f"Save the {line.color} / {line.size} variant in Catalog before receiving stock.")
+        planned.append((line, variant))
     from app.modules.sales import fulfillment
     waiting_orders = fulfillment.lock_waiting_orders(session, tenant_id=tid)
     received = 0
-    for l, product in planned:
-        price, currency = repo.variant_defaults(session, product_id=product.id)
-        color = (repo.find_attr_value(session, attr_type="Color", value=l.color.strip(), tenant_id=tid)
-                 or repo.create_color(session, tenant_id=tid, value=l.color.strip(), hex=None))
-        size = (repo.find_attr_value(session, attr_type="Size", value=l.size.strip(), tenant_id=tid)
-                or repo.create_size(session, tenant_id=tid, value=l.size.strip()))
-        variant = repo.find_or_create_variant(
-            session, tenant_id=tid, product_id=product.id, color_id=color.id,
-            size_id=size.id, price=price, currency=currency)
-        repo.add_stock(session, tenant_id=tid, variant_id=variant.id,
-                       location_id=location_id, qty=int(l.qty or 0))
-        received += int(l.qty or 0)
+    quantity_by_variant = {}
+    for l, variant in planned:
+        quantity_by_variant[variant.id] = quantity_by_variant.get(variant.id, 0) + int(l.qty)
+    for variant_id, qty in quantity_by_variant.items():
+        level = repo.add_stock(session, tenant_id=tid, variant_id=variant_id,
+                               location_id=location_id, qty=qty)
+        from app.modules.inventory import ledger
+        ledger.record(session, level=level, before=level.on_hand-qty, kind="Receipt",
+            request_id=payload.requestId, reference=payload.reference.strip(), reason=payload.reason.strip(),
+            actor=actor, source_module="inventory", source_type="stock_receipt", source_id=payload.requestId)
+        variant = session.get(ProductVariant, variant_id)
+        variant.qty_on_hand = session.scalar(select(func.coalesce(func.sum(StockLevel.on_hand), 0)).where(
+            StockLevel.tenant_id == tid, StockLevel.variant_id == variant_id)) or 0
+        received += qty
+    write_audit(session, tenant_id=tid, action="RECEIVE", entity_type="stock_receipt",
+        entity_id=str(payload.requestId), detail=f"{received} units at {payload.location}; "
+        f"reference: {payload.reference.strip()}; reason: {payload.reason.strip()}")
     if received:
         fulfillment.refresh_waiting_orders(session, waiting_orders)
-    return received
+    session.flush()
+    return {"received": received, "receiptId": str(payload.requestId)}
+
+
+def adjust_stock_count(session: Session, *, tenant_id: str | UUID,
+                       payload: StockAdjustmentCreate, actor: str | None = None) -> dict:
+    from sqlalchemy import func
+    from app.core.audit import write_audit
+    from app.models.catalog import Product, ProductVariant
+    from app.models.inventory import StockEntry, StockLevel
+    from app.models.batches import BatchLine, BatchLot
+    tid = _tid(tenant_id)
+    if len(payload.reference.strip()) < 3 or len(payload.reason.strip()) < 3:
+        raise HTTPException(400, "Reference and reason must each contain at least three characters")
+    previous = session.scalar(select(StockEntry).where(StockEntry.tenant_id == tid,
+        StockEntry.request_id == payload.requestId).limit(1))
+    if previous:
+        if previous.kind != "Adjustment" or previous.variant_id != payload.variantId:
+            raise HTTPException(409, "Request ID is already used for another stock operation")
+        return {"adjustmentId": str(payload.requestId), "delta": previous.qty_delta,
+                "onHand": previous.after_qty}
+    location_id = _active_location(session, tid, payload.location)
+    variant = session.scalar(select(ProductVariant).join(Product, Product.id == ProductVariant.product_id).where(
+        ProductVariant.id == payload.variantId, ProductVariant.tenant_id == tid,
+        Product.tenant_id == tid, Product.is_deleted.is_(False),
+        ProductVariant.status != "Archived"))
+    if variant is None:
+        raise HTTPException(404, "Active variant not found")
+    session.scalar(select(Product).where(Product.id == variant.product_id,
+        Product.tenant_id == tid).with_for_update())
+    level = session.scalar(select(StockLevel).where(StockLevel.tenant_id == tid,
+        StockLevel.variant_id == variant.id, StockLevel.location_id == location_id)
+        .with_for_update().execution_options(populate_existing=True))
+    before = level.on_hand if level else 0
+    delta = payload.countedQty - before
+    if not delta:
+        raise HTTPException(400, "The counted quantity matches the current balance")
+    if delta < 0:
+        traced = session.scalar(select(func.coalesce(func.sum(BatchLot.on_hand), 0)).join(
+            BatchLine, BatchLine.id == BatchLot.line_id).where(BatchLot.tenant_id == tid,
+            BatchLine.variant_id == variant.id, BatchLot.location_id == location_id)) or 0
+        if payload.countedQty < traced:
+            raise HTTPException(409, "Count correction cannot remove batch-traced stock; reconcile its batch first")
+    from app.modules.sales import fulfillment
+    waiting_orders = fulfillment.lock_waiting_orders(session, tenant_id=tid) if delta > 0 else []
+    repo.adjust_stock(session, tenant_id=tid, variant_id=variant.id,
+        location_id=location_id, on_hand_delta=delta)
+    variant.qty_on_hand = session.scalar(select(func.coalesce(func.sum(StockLevel.on_hand), 0)).where(
+        StockLevel.tenant_id == tid, StockLevel.variant_id == variant.id)) or 0
+    from app.modules.inventory import ledger
+    level = session.scalar(select(StockLevel).where(StockLevel.tenant_id == tid,
+        StockLevel.variant_id == variant.id, StockLevel.location_id == location_id))
+    ledger.record(session, level=level, before=before, kind="Adjustment", request_id=payload.requestId,
+        reference=payload.reference.strip(), reason=payload.reason.strip(), actor=actor,
+        source_module="inventory", source_type="count", source_id=payload.requestId)
+    write_audit(session, tenant_id=tid, action="ADJUST", entity_type="stock_level",
+        entity_id=f"{variant.id}:{location_id}", detail=f"{variant.sku}: {before} → {payload.countedQty}; "
+        f"reference: {payload.reference.strip()}; reason: {payload.reason.strip()}")
+    if waiting_orders:
+        fulfillment.refresh_waiting_orders(session, waiting_orders)
+    session.flush()
+    return {"adjustmentId": str(payload.requestId), "delta": delta,
+            "onHand": payload.countedQty}
 
 
 # ---------- Locations ----------
@@ -273,7 +411,7 @@ def transfers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
     )
 
 
-def create_transfer(session: Session, *, tenant_id: str | UUID, payload: TransferCreate):
+def create_transfer(session: Session, *, tenant_id: str | UUID, payload: TransferCreate, actor=None):
     tid = _tid(tenant_id)
     from_id = _active_location(session, tid, payload.from_)
     to_id = _active_location(session, tid, payload.to)
@@ -302,9 +440,19 @@ def create_transfer(session: Session, *, tenant_id: str | UUID, payload: Transfe
     lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku, "qty": l.qty}
              for l in payload.lines]
     trf = repo.create_transfer(session, tenant_id=tid, from_id=from_id, to_id=to_id, lines=lines)
+    from app.modules.inventory import ledger
     for vid, qty in quantities.items():
+        before_source = source[vid].on_hand
         repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=from_id, on_hand_delta=-qty)
+        ledger.record(session, level=source[vid], before=before_source, kind="Transfer out",
+            request_id=trf.public_id, reference=trf.transfer_no, reason=f"Transfer to {payload.to}", actor=actor,
+            source_module="inventory", source_type="transfer", source_id=trf.public_id)
         repo.adjust_stock(session, tenant_id=tid, variant_id=vid, location_id=to_id, on_hand_delta=qty)
+        destination = session.scalar(select(StockLevel).where(StockLevel.tenant_id == tid,
+            StockLevel.variant_id == vid, StockLevel.location_id == to_id))
+        ledger.record(session, level=destination, before=destination.on_hand-qty, kind="Transfer in",
+            request_id=trf.public_id, reference=trf.transfer_no, reason=f"Transfer from {payload.from_}", actor=actor,
+            source_module="inventory", source_type="transfer", source_id=trf.public_id)
     trf.status = "Received"
     session.flush()
     return trf
@@ -376,42 +524,13 @@ def receive_stock_lines(session, *, tenant_id, lines) -> None:
 # ---------- Reorder alerts ----------
 
 def alerts_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
-    rows, total = repo.list_alerts(session, limit=limit, offset=offset)
-    def _money(v):
-        return f"€{v:,.2f}" if v is not None else "—"
-
-    grid = []
-    for r in rows:
-        name, sku = _variant_name(r["title"], r["color"], r["size"], r["sku"])
-        avail = r["available"] or 0
-        avail_cell = text_cell(str(avail), align="right", mono=True)
-        if avail == 0:
-            avail_cell["color"] = "#C0392B"
-        grid.append([
-            text_cell(name, avatar=True, sub=r["color"] or "—"),
-            text_cell(r["sku"] or "—", mono=True),
-            avail_cell,
-            text_cell(str(r["reorder_point"] or 0), align="right", mono=True),
-            text_cell(str(r["suggested"] or 0), align="right", mono=True, strong=True),
-            text_cell(_money(r["retail"]), align="right", mono=True),
-            text_cell(_money(r["online"]), align="right", mono=True),
-            text_cell(_money(r["wholesale"]), align="right", mono=True),
-            text_cell(r["severity"], badge=_SEVERITY_TONE.get(r["severity"], "neutral")),
-        ])
-    return list_config(
-        columns=[
-            {"label": "Variant"}, {"label": "SKU ID"},
-            {"label": "Available", "align": "right"},
-            {"label": "Reorder pt", "align": "right"},
-            {"label": "Suggested", "align": "right"},
-            {"label": "Retail Price", "align": "right"},
-            {"label": "Online Price", "align": "right"},
-            {"label": "Wholesale Price", "align": "right"}, {"label": "Severity"},
-        ],
-        rows=grid, total=total,
-        records=[{"category": r["category"]} for r in rows],
-        search="Search alerts…", action="Create PO", filters=["Severity", "Category"],
-    )
+    from app.modules.inventory.replenishment import visible_alerts
+    alerts = visible_alerts(session)
+    rows = alerts[offset:offset + limit]
+    return list_config(columns=[{"label": name} for name in
+        ("Variant", "Warehouse", "Available", "Incoming", "Minimum", "Target", "Suggested", "Supplier")],
+        rows=[[text_cell(str(r[key])) for key in ("label", "warehouse", "available", "incoming", "minimum", "target", "suggested", "supplier")]
+            for r in rows], total=len(alerts), ids=[r["id"] for r in rows], search="Search replenishment…", filters=[])
 
 
 def create_alert(session: Session, *, tenant_id: str | UUID, payload: ReorderAlertCreate):

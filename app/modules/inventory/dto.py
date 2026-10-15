@@ -1,4 +1,5 @@
 """Inventory API contracts (Pydantic v2) — match the frontend forms."""
+from uuid import UUID, uuid4
 from pydantic import BaseModel, Field
 
 
@@ -14,6 +15,31 @@ class StockReceiptLineIn(BaseModel):
 class StockReceiptCreate(BaseModel):
     location: str = Field(min_length=1, max_length=120)
     lines: list[StockReceiptLineIn] = Field(min_length=1)
+    reference: str = Field(min_length=3, max_length=80)
+    reason: str = Field(min_length=3, max_length=400)
+    requestId: UUID = Field(default_factory=uuid4)
+
+
+class WarehouseReceiptLine(BaseModel):
+    poLineId: UUID
+    quantity: int = Field(gt=0)
+
+
+class WarehouseReceiptCreate(BaseModel):
+    locationId: UUID
+    lines: list[WarehouseReceiptLine] = Field(min_length=1)
+    reference: str = Field(min_length=3, max_length=80)
+    reason: str = Field(min_length=3, max_length=400)
+    requestId: UUID
+
+
+class StockAdjustmentCreate(BaseModel):
+    variantId: int = Field(gt=0)
+    location: str = Field(min_length=1, max_length=120)
+    countedQty: int = Field(ge=0)
+    reference: str = Field(min_length=3, max_length=80)
+    reason: str = Field(min_length=3, max_length=400)
+    requestId: UUID = Field(default_factory=uuid4)
 
 
 class LocationCreate(BaseModel):
@@ -58,7 +84,7 @@ class StatusUpdate(BaseModel):
 class MatrixCellIn(BaseModel):
     size: str = Field(min_length=1, max_length=60)
     originalSize: str | None = Field(default=None, max_length=60)
-    qty: int = Field(ge=0)
+    qty: int | None = Field(default=None, ge=0)
 
 
 class MatrixColorIn(BaseModel):

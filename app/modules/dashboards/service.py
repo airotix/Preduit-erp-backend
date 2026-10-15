@@ -187,9 +187,8 @@ def overview(session: Session) -> dict:
         select(func.count()).select_from(Inspection)
         .where(Inspection.is_deleted == False, Inspection.result == "Fail")  # noqa: E712
     ).scalar_one()
-    reorder = session.execute(
-        select(func.count()).select_from(ReorderAlert).where(ReorderAlert.is_deleted == False)  # noqa: E712
-    ).scalar_one()
+    from app.modules.inventory.replenishment import visible_alerts
+    reorder = len(visible_alerts(session))
     alerts = []
     if out_stock:
         alerts.append(_alert("red", f"{out_stock} variant(s) out of stock", "inventory"))
@@ -294,9 +293,9 @@ def invdash(session: Session) -> dict:
     out_stock = session.execute(
         select(func.count()).select_from(StockLevel).where((StockLevel.on_hand - StockLevel.reserved) <= 0)
     ).scalar_one()
-    reorder = session.execute(
-        select(func.count()).select_from(ReorderAlert).where(ReorderAlert.is_deleted == False)  # noqa: E712
-    ).scalar_one()
+    from app.modules.inventory.replenishment import visible_alerts
+    live_reorder = visible_alerts(session)
+    reorder = len(live_reorder)
 
     # Donut: stock by location
     loc_rows = session.execute(
@@ -312,12 +311,8 @@ def invdash(session: Session) -> dict:
               "pct": round(int(u) / loc_total * 100) if loc_total else 0} for n, u in loc_rows]
 
     # Table: low-stock items
-    lows = session.execute(
-        select(ReorderAlert.sku, ReorderAlert.available, ReorderAlert.reorder_point,
-               ReorderAlert.suggested, ReorderAlert.severity)
-        .where(ReorderAlert.is_deleted == False)  # noqa: E712
-        .order_by(ReorderAlert.available.asc()).limit(6)
-    ).all()
+    lows = [(r["label"] + " · " + r["warehouse"], r["available"], r["minimum"], r["suggested"],
+             "Critical" if r["available"] <= 0 else "Low") for r in live_reorder[:6]]
     rows = [[sku, f"{avail:,}", f"{rp:,}", f"{sug:,}",
              _TONE["red"][1] if (sev or "").lower() in ("high", "critical") else _accent(i)]
             for i, (sku, avail, rp, sug, sev) in enumerate(lows)]

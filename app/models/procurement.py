@@ -7,6 +7,7 @@ from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numer
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
+from app.models.inventory_operations import ReplenishmentRule  # register the PO's optional replenishment FK
 
 
 class Supplier(Base):
@@ -45,6 +46,9 @@ class Supplier(Base):
 
 class PurchaseOrder(Base):
     __tablename__ = "purchase_orders"
+    incoming_location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"), nullable=True)
+    replenishment_rule_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("inventory_replenishment_rules.id"), nullable=True)
+    replenishment_request_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     sales_order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_orders.id"), nullable=True)
     inventory_received: Mapped[bool] = mapped_column(Boolean, default=False)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -76,6 +80,12 @@ class GoodsReceipt(Base):
     status: Mapped[str] = mapped_column(String(20), default="Expected")
     received_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
     location: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"), nullable=True)
+    request_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    request_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    actor: Mapped[str | None] = mapped_column(String(256), nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -88,10 +98,13 @@ class GoodsReceiptLine(Base):
     sku: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ordered: Mapped[int] = mapped_column(Integer, default=0)
     received: Mapped[int] = mapped_column(Integer, default=0)
+    po_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("purchase_order_lines.id"), nullable=True)
+    variant_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("product_variants.id"), nullable=True)
 
 
 class PurchaseOrderLine(Base):
     __tablename__ = "purchase_order_lines"
+    variant_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("product_variants.id"), nullable=True)
     sales_order_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_order_lines.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     # Client-side default so multi-line POs insert cleanly: SQLAlchemy batches

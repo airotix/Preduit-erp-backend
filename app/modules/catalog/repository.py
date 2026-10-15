@@ -47,8 +47,11 @@ def sku_taken(session: Session, *, sku: str, exclude_product_id: int | None = No
 
 def list_products(session: Session, *, limit: int, offset: int) -> tuple[list[dict], int]:
     """Return (rows, total). Each row aggregates its variants."""
+    saleable = ProductVariant.color_id.is_not(None) & ProductVariant.size_id.is_not(None)
+    def saleable_min(column):
+        return func.min(case((saleable, column)))
     v_count = func.count(ProductVariant.id)
-    v_min = func.min(ProductVariant.price)
+    v_min = saleable_min(ProductVariant.price)
     v_ccy = func.min(ProductVariant.currency_code)
 
     stmt = (
@@ -60,12 +63,13 @@ def list_products(session: Session, *, limit: int, offset: int) -> tuple[list[di
             v_min.label("min_price"),
             v_ccy.label("currency_code"),
             func.min(ProductVariant.sku).label("sku"),
-            func.min(ProductVariant.retail_price).label("retail"),
-            func.min(ProductVariant.online_price).label("online"),
-            func.min(ProductVariant.wholesale_price).label("wholesale"),
-            func.min(ProductVariant.supplier_price).label("supplier"),
+            saleable_min(ProductVariant.retail_price).label("retail"),
+            saleable_min(ProductVariant.online_price).label("online"),
+            saleable_min(ProductVariant.wholesale_price).label("wholesale"),
+            saleable_min(ProductVariant.supplier_price).label("supplier"),
         )
-        .outerjoin(ProductVariant, (ProductVariant.product_id == Product.id) & (ProductVariant.status != "Archived"))
+        .outerjoin(ProductVariant, (ProductVariant.product_id == Product.id) &
+                   (ProductVariant.status != "Archived"))
         .outerjoin(Category, Category.id == Product.category_id)
         .where(Product.is_deleted == False)  # noqa: E712
         .group_by(
@@ -95,8 +99,11 @@ def search_products(session: Session, *, q: str, limit: int = 10) -> list[dict]:
             func.min(ProductVariant.supplier_price).label("supplier"),
             func.min(ProductVariant.currency_code).label("currency_code"),
         )
-        .outerjoin(ProductVariant, (ProductVariant.product_id == Product.id) & (ProductVariant.status != "Archived"))
-        .where(Product.is_deleted == False, Product.title.ilike(f"%{q}%"))  # noqa: E712
+        .outerjoin(ProductVariant, (ProductVariant.product_id == Product.id) &
+                   (ProductVariant.status != "Archived") &
+                   ProductVariant.color_id.is_not(None) & ProductVariant.size_id.is_not(None))
+        .where(Product.is_deleted == False, Product.status == "Active",
+               Product.title.ilike(f"%{q}%"))  # noqa: E712
         .group_by(Product.id, Product.title)
         .order_by(Product.title)
         .limit(limit)
@@ -187,8 +194,7 @@ def create_product(session: Session, *, tenant_id: UUID, title: str,
 
 
 def update_product(session: Session, *, public_id: str, title: str, category_id: int | None,
-                   season: str | None, status: str, retail=None, wholesale=None,
-                   online=None, supplier=None, currency_code: str = "EUR", image_url=None,
+                   season: str | None, status: str, image_url=None,
                    specs: dict | None = None) -> Product | None:
     product = session.execute(
         select(Product).where(Product.public_id == public_id,
@@ -211,33 +217,6 @@ def update_product(session: Session, *, public_id: str, title: str, category_id:
         product.hs_code = (specs.get("hsCode") or "").strip() or None
         product.weight = (specs.get("weight") or "").strip() or None
     session.flush()
-    # If any price was supplied, apply it to every variant of this product
-    # (create one with an auto SKU if none exists yet). The detail/list screens
-    # show MIN(price) across variants, so a partial update — e.g. only the
-    # first variant — would leave the displayed price unchanged whenever a
-    # cheaper untouched variant still "won" the MIN. Only the prices actually
-    # provided are changed; other fields on each variant are left alone.
-    if any(p is not None for p in (retail, wholesale, online, supplier)):
-        variants = session.execute(
-            select(ProductVariant).where(ProductVariant.product_id == product.id, ProductVariant.status != "Archived")
-            .order_by(ProductVariant.id)
-        ).scalars().all()
-        if not variants:
-            create_variant(session, tenant_id=product.tenant_id, product_id=product.id,
-                           retail=retail, wholesale=wholesale, online=online,
-                           supplier=supplier, currency_code=currency_code)
-        else:
-            for variant in variants:
-                if retail is not None:
-                    variant.retail_price = retail
-                    variant.price = retail
-                if wholesale is not None:
-                    variant.wholesale_price = wholesale
-                if online is not None:
-                    variant.online_price = online
-                if supplier is not None:
-                    variant.supplier_price = supplier
-        session.flush()
     session.refresh(product)
     return product
 
@@ -267,7 +246,8 @@ def get_product_detail(session: Session, *, public_id: str) -> dict | None:
     Size = aliased(AttributeValue)
     vstmt = (
         select(
-            ProductVariant.sku, ProductVariant.price, ProductVariant.currency_code,
+            ProductVariant.public_id, ProductVariant.sku, ProductVariant.barcode,
+            ProductVariant.price, ProductVariant.currency_code,
             ProductVariant.retail_price, ProductVariant.wholesale_price, ProductVariant.online_price,
             ProductVariant.supplier_price,
             ProductVariant.status, ProductVariant.qty_on_hand,
@@ -321,6 +301,23 @@ def set_product_sku(session: Session, *, product: Product, sku: str,
 
 # ---------- Categories ----------
 
+def category_for_delete(session: Session, *, tenant_id: UUID, public_id: UUID) -> Category | None:
+    return session.scalar(select(Category).where(
+        Category.public_id == public_id, Category.tenant_id == tenant_id,
+    ).with_for_update())
+
+
+def category_dependencies(session: Session, *, category_id: int) -> tuple[int, int]:
+    # Include archived products so deletion preserves their category history too.
+    products = session.scalar(select(func.count()).select_from(Product).where(
+        Product.category_id == category_id,
+    ))
+    children = session.scalar(select(func.count()).select_from(Category).where(
+        Category.parent_id == category_id,
+    ))
+    return products or 0, children or 0
+
+
 def list_categories(session: Session, *, limit: int, offset: int) -> tuple[list[dict], int]:
     Parent = aliased(Category)
     active_sum = func.sum(case((Product.status == "Active", 1), else_=0))
@@ -364,21 +361,6 @@ def update_category(session: Session, *, public_id: str, name: str,
     session.flush()
     session.refresh(c)
     return c
-
-
-def update_attribute(session: Session, *, public_id: str, attr_type: str,
-                     value: str, code: str) -> AttributeValue | None:
-    a = session.execute(
-        select(AttributeValue).where(AttributeValue.public_id == public_id)
-    ).scalar_one_or_none()
-    if a is None:
-        return None
-    a.attr_type = attr_type
-    a.value = value
-    a.code = code
-    session.flush()
-    session.refresh(a)
-    return a
 
 
 def find_category_id(session: Session, *, name: str) -> int | None:

@@ -134,6 +134,7 @@ def create_order(session: Session, *, tenant_id: UUID, customer_id: int | None,
         price = Decimal(str(l["price"]))
         session.add(SalesOrderLine(
             tenant_id=tenant_id, order_id=order.id, name=l["name"],
+            variant_id=l.get("variant_id"),
             color=l.get("color"), size=l.get("size"),
             sku=l.get("sku"), qty=qty, price=price, line_total=price * qty,
         ))

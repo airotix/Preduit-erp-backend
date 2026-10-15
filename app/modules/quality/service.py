@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models.production import ProductionOrder, ProductionOrderLine
 from app.models.quality import Inspection
+from app.models.batches import ProductionBatch, BatchLine
 from app.modules.quality import aql as aql_engine
 from app.modules.quality import repository as repo
 from app.modules.quality.dto import DefectTypeCreate, DefectTypeUpdate, InspectionCreate
@@ -15,6 +16,15 @@ from app.presenters.screen import list_config, text_cell
 _RESULT_TONE = {"Pass": "green", "Fail": "red", "Pending": "amber",
                 "In Progress": "navy", "Cancelled": "neutral"}
 _SEV_TONE = {"Critical": "red", "Major": "red", "Minor": "amber"}
+
+
+def _batch_managed_order(session, tenant_id, order_ref):
+    if not order_ref:
+        return False
+    return bool(session.scalar(select(ProductionBatch.id).join(ProductionOrder,
+        ProductionOrder.id == ProductionBatch.order_id).where(
+        ProductionOrder.order_no == order_ref, ProductionOrder.tenant_id == _tid(tenant_id),
+        ProductionBatch.tenant_id == _tid(tenant_id)).limit(1)))
 
 
 def order_items(session: Session, order_ref: str | None) -> list[dict]:
@@ -95,7 +105,8 @@ def inspections_screen(session: Session, *, limit: int = 50, offset: int = 0) ->
     groups: dict[str, list[dict]] = {}
     order: list[str] = []
     for r in rows:
-        key = r["order_ref"] or f"__{r['public_id']}"
+        batch = session.get(ProductionBatch, session.get(BatchLine, r["batch_line_id"]).batch_id) if r.get("batch_line_id") else None
+        key = f"batch::{batch.id}" if batch else r["order_ref"] or f"__{r['public_id']}"
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -104,20 +115,30 @@ def inspections_screen(session: Session, *, limit: int = 50, offset: int = 0) ->
     grid, ids, records = [], [], []
     for key in order:
         g = groups[key]
-        order_ref = g[0]["order_ref"] or "—"
+        first_line = session.get(BatchLine, g[0]["batch_line_id"]) if g[0].get("batch_line_id") else None
+        batch = session.get(ProductionBatch, first_line.batch_id) if first_line else None
+        order_ref = f"{g[0]['order_ref']} · {batch.name}" if batch else g[0]["order_ref"] or "—"
         items = [x["item"] or x["product"] or "Item" for x in g]
         uniq_items = list(dict.fromkeys(items))
         prod = uniq_items[0] + (f" +{len(uniq_items) - 1} more" if len(uniq_items) > 1 else "")
         inspectors = list(dict.fromkeys([x["inspector"] for x in g if x["inspector"]]))
         defects = sum(int(x["defect_count"] or 0) for x in g)
-        label = _group_status([x["result"] for x in g], [x["stage"] for x in g])
+        if batch:
+            from app.modules.batches import workflow as batch_workflow
+            batch_lines = session.scalars(select(BatchLine).where(BatchLine.batch_id == batch.id,
+                BatchLine.tenant_id == batch.tenant_id)).all()
+            label = batch_workflow.states(session, batch.tenant_id, batch, batch_lines)["qualityStatus"]
+            tone = "red" if "hold" in label.lower() else "green" if label == "QC complete" else "amber"
+        else:
+            label = _group_status([x["result"] for x in g], [x["stage"] for x in g])
+            tone = _GROUP_TONE.get(label, "neutral")
         grid.append([
             text_cell(order_ref, avatar=True, sub=f"{len(g)} item{'s' if len(g) != 1 else ''}"),
             order_ref,
             prod,
             text_cell(inspectors[0] + (f" +{len(inspectors) - 1}" if len(inspectors) > 1 else "") if inspectors else "—"),
             text_cell(str(defects), align="center", mono=True),
-            text_cell(label, badge=_GROUP_TONE.get(label, "neutral")),
+            text_cell(label, badge=tone),
         ])
         ids.append(str(g[0]["public_id"]))   # opens the grouped drill-down
         records.append({"status": label})
@@ -135,6 +156,9 @@ def inspections_screen(session: Session, *, limit: int = 50, offset: int = 0) ->
 def create_inspection(session, *, tenant_id, payload: InspectionCreate):
     """Create a Pending inspection, auto-pulling product/SKU/quantity from the
     production order so the inspector doesn't re-enter existing ERP data."""
+    from fastapi import HTTPException
+    if _batch_managed_order(session, tenant_id, payload.order):
+        raise HTTPException(409, "Record inspection against the production batch in Quality")
     auto = _po_autofill(session, payload.order)
     item = (payload.item or "").strip() or None
     # When an item is chosen, scope product + quantity to that item (production
@@ -156,6 +180,10 @@ def create_inspection(session, *, tenant_id, payload: InspectionCreate):
 
 
 def update_inspection(session, *, public_id, payload):
+    existing = repo.get_inspection(session, public_id=public_id)
+    if existing is not None and existing.batch_line_id:
+        from fastapi import HTTPException
+        raise HTTPException(409, "Batch inspection quantities are immutable; record a new QC action for changes")
     ss = None
     if payload.sampleSize not in (None, ""):
         try:
@@ -169,6 +197,10 @@ def update_inspection(session, *, public_id, payload):
 
 
 def start_inspection(session, *, public_id, tenant_id=None):
+    current = repo.get_inspection(session, public_id=public_id)
+    if current is not None and current.result == "Cancelled":
+        from fastapi import HTTPException
+        raise HTTPException(409, "A cancelled inspection cannot be restarted.")
     """Pending → In Progress. Guard: only a Pending inspection can be started."""
     ins = repo.get_inspection(session, public_id=public_id)
     if ins and inspection_waits_for_rework(session, ins):
@@ -264,6 +296,9 @@ def set_disposition(session, *, public_id, payload):
     ins = repo.get_inspection(session, public_id=public_id)
     if ins is None:
         return None
+    if ins.batch_line_id:
+        from fastapi import HTTPException
+        raise HTTPException(409, "Batch dispositions are recorded with their QC quantities")
     if ins.result != "Fail":
         return {"error": "not_failed"}
     child = session.scalar(select(Inspection).where(Inspection.parent_inspection_id == ins.id,
@@ -320,6 +355,8 @@ def reopen_failed(session, *, tenant_id, public_id, mode, notes=None, assigned_t
         Inspection.tenant_id == tid, Inspection.is_deleted.is_(False)).with_for_update())
     if parent is None:
         raise HTTPException(404, "Inspection not found")
+    if parent.batch_line_id:
+        raise HTTPException(409, "Record a batch reinspection from its Quality batch workspace")
     if parent.result != "Fail":
         raise HTTPException(409, "Only a failed inspection can be reopened.")
     parsed_due = None
@@ -414,9 +451,6 @@ def complete_inspection(session, *, public_id):
     ins.result = result
     ins.finalized_at = _dt.datetime.utcnow()
     session.flush()
-    if result == "Pass" and ins.stage == "Final":
-        from app.modules.sales import fulfillment
-        fulfillment.receive_inspected_production(session, tenant_id=ins.tenant_id, order_ref=ins.order_ref)
     return {"inspection": ins, "result": result,
             "reason": "Checklist failure" if checklist_fail else
                       ("AQL exceeded" if aql_exceeded else "Within acceptance criteria")}
@@ -424,13 +458,19 @@ def complete_inspection(session, *, public_id):
 
 def set_result(session, *, public_id, status, tenant_id=None):
     current = repo.get_inspection(session, public_id=public_id)
+    if current is not None and status == "Pass" and current.result == "Pending":
+        from fastapi import HTTPException
+        raise HTTPException(409, "Start and complete this inspection before recording a pass.")
+    if current is not None and current.batch_line_id:
+        from fastapi import HTTPException
+        raise HTTPException(409, "Batch inspection results are recorded with their QC quantities")
+    if current is not None and current.result == "Cancelled" and status != "Cancelled":
+        from fastapi import HTTPException
+        raise HTTPException(409, "A cancelled inspection cannot be reopened.")
     if current and status == "Pass" and inspection_waits_for_rework(session, current):
         from fastapi import HTTPException
         raise HTTPException(409, "Complete the reopened production TNA before passing reinspection.")
     ins = repo.set_result(session, public_id=public_id, result=status)
-    if ins is not None and status == "Pass" and ins.stage == "Final":
-        from app.modules.sales import fulfillment
-        fulfillment.receive_inspected_production(session, tenant_id=tenant_id or ins.tenant_id, order_ref=ins.order_ref)
     return ins
 
 
@@ -442,8 +482,14 @@ def pass_and_ship(session, *, tenant_id, public_id, carrier, destination):
     Guard: cannot ship a Pending inspection — it must be started/evaluated first.
     """
     ins = repo.get_inspection(session, public_id=public_id)
+    if ins is not None and ins.result == "Cancelled":
+        from fastapi import HTTPException
+        raise HTTPException(409, "A cancelled inspection cannot ship.")
     if ins is None:
         return None
+    if ins.batch_line_id or _batch_managed_order(session, tenant_id, ins.order_ref):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Manage batch shipments in Shipments after QC quantities are recorded")
     if ins.result == "Pending":
         # Can't create a shipment straight from a never-started inspection.
         return {"error": "not_started", "inspection": ins}
@@ -463,10 +509,7 @@ def pass_and_ship(session, *, tenant_id, public_id, carrier, destination):
         ProductionOrder.order_no == ins.order_ref, ProductionOrder.tenant_id == _tid(tenant_id),
         PurchaseOrder.tenant_id == _tid(tenant_id)))
     if source_po is not None:
-        shipment = fulfillment.receive_inspected_production(session, tenant_id=tenant_id, order_ref=ins.order_ref)
-        if shipment:
-            repo.link_shipment(session, ins=ins, shipment_no=shipment.shipment_no)
-        return {"inspection": ins, "shipment_no": shipment.shipment_no if shipment else None}
+        return {"inspection": ins, "shipment_no": None, "awaitingWarehouseReceipt": True}
 
     # Order-level gate: a shipment is only created once EVERY item's inspection
     # on this order is a FINAL-stage Pass. A passed Pre-Production / In-line item
@@ -501,6 +544,14 @@ def size_breakdown(session, ins):
     from app.models.procurement import PurchaseOrderLine
     from app.models.sales import SalesOrderLine
     from app.modules.sales.service import _size_rank
+    if ins.batch_line_id:
+        batch_line = session.get(BatchLine, ins.batch_line_id)
+        source_line = session.get(PurchaseOrderLine, batch_line.po_line_id)
+        size = source_line.size or "—"
+        inspected = ins.prod_qty or 0
+        return {"sizes": [size], "rows": [{"article": source_line.name,
+            "color": source_line.color or "—", "quantities": [inspected], "total": inspected}],
+            "totals": [inspected], "total": inspected, "ratio": [1], "source": "Batch"}
     work = production_for_inspection(session, ins)
     if work is None:
         return {"sizes": [], "rows": [], "totals": [], "total": 0, "ratio": [], "source": "Unavailable"}
@@ -579,16 +630,31 @@ def _build_workspace(session: Session, ins, *, focus_id: str) -> dict:
     ]
 
     # Inspection history: siblings on the same order + the parent/child chain.
+    historical_rows = repo.inspection_history(session, order_ref=ins.order_ref)
+    if ins.batch_line_id:
+        batch_id = session.get(BatchLine, ins.batch_line_id).batch_id
+        batch_line_ids = [line.id for line in session.scalars(select(BatchLine).where(
+            BatchLine.batch_id == batch_id, BatchLine.tenant_id == ins.tenant_id)).all()]
+        historical_rows = [dict(public_id=row.public_id, inspection_no=row.inspection_no,
+            inspection_date=row.inspection_date, stage=row.stage, inspector=row.inspector,
+            result=row.result, defect_count=row.defect_count, aql=row.aql)
+            for row in session.scalars(select(Inspection).where(
+                Inspection.batch_line_id.in_(batch_line_ids), Inspection.tenant_id == ins.tenant_id,
+                Inspection.is_deleted.is_(False)).order_by(Inspection.id.desc())).all()]
     history = [
         {"inspectionNo": h["inspection_no"], "date": _iso(h["inspection_date"]),
          "stage": h["stage"], "inspector": h["inspector"] or "—",
          "result": h["result"], "defects": h["defect_count"], "aql": h["aql"],
          "publicId": str(h["public_id"]), "current": str(h["public_id"]) == focus_id}
-        for h in repo.inspection_history(session, order_ref=ins.order_ref)
+        for h in historical_rows
     ]
 
     return {
             "publicId": str(ins.public_id),
+            "batchQuantities": {"assessed": ins.prod_qty or 0, "sampleSize": ins.sample_size or 0,
+                "approved": ins.approved_qty or 0, "held": ins.held_qty or 0,
+                "rejected": ins.rejected_qty or 0, "findings": ins.disposition_notes or "",
+                "kind": ins.inspection_type or "Final"} if ins.batch_line_id else None,
             "sizeBreakdown": size_breakdown(session, ins),
             "item": ins.item or ins.product or "Item",
             "header": {
@@ -619,11 +685,11 @@ def _build_workspace(session: Session, ins, *, focus_id: str) -> dict:
                 "evaluation": evaluation,
             },
             "shipmentRef": ins.shipment_ref,
-            "canStart": ins.result == "Pending" and not inspection_waits_for_rework(session, ins),
+            "canStart": not ins.batch_line_id and ins.result == "Pending" and not inspection_waits_for_rework(session, ins),
             "waitingForTNA": inspection_waits_for_rework(session, ins),
-            "canReopenProduction": production_for_inspection(session, ins) is not None,
-            "canDecide": ins.result == "In Progress",
-            "canDispose": ins.result == "Fail",
+            "canReopenProduction": not ins.batch_line_id and production_for_inspection(session, ins) is not None,
+            "canDecide": not ins.batch_line_id and ins.result == "In Progress",
+            "canDispose": not ins.batch_line_id and ins.result == "Fail",
             "disposition": ins.disposition,
             "dispositionNotes": ins.disposition_notes or "",
             "assignedTo": ins.assigned_to or "",
@@ -662,14 +728,22 @@ def inspection_detail(session: Session, *, public_id: str) -> dict | None:
     focus = repo.get_inspection(session, public_id=public_id)
     if focus is None:
         return None
-    group = repo.inspections_for_order(session, order_ref=focus.order_ref) or [focus]
+    batch = session.get(ProductionBatch, session.get(BatchLine, focus.batch_line_id).batch_id) if focus.batch_line_id else None
+    if focus.batch_line_id:
+        source_line = session.get(BatchLine, focus.batch_line_id)
+        related_ids = [line.id for line in session.scalars(select(BatchLine).where(
+            BatchLine.batch_id == source_line.batch_id, BatchLine.tenant_id == focus.tenant_id)).all()]
+        group = session.scalars(select(Inspection).where(Inspection.batch_line_id.in_(related_ids),
+            Inspection.tenant_id == focus.tenant_id, Inspection.is_deleted.is_(False)).order_by(Inspection.id)).all()
+    else:
+        group = repo.inspections_for_order(session, order_ref=focus.order_ref) or [focus]
     items = [_build_workspace(session, ins, focus_id=public_id) for ins in group]
     covered = {it["item"] for it in items}
 
     # Every ITEM of the order gets a tab. Items whose production isn't finished
     # yet (no inspection) show a "production not completed" placeholder — the
     # order's inspection group is complete only once all of them are inspected.
-    order_names = [oi["item"] for oi in order_items(session, focus.order_ref)]
+    order_names = [] if focus.batch_line_id else [oi["item"] for oi in order_items(session, focus.order_ref)]
     placeholders = [
         {"publicId": f"pending::{n}", "item": n, "placeholder": True,
          "header": {"inspectionNo": "—", "order": focus.order_ref or "—", "product": n,
@@ -738,11 +812,17 @@ def inspection_detail(session: Session, *, public_id: str) -> dict | None:
                        items[0]["publicId"] if items else None)
     return {
         "variant": "inspection",
+        "batchManaged": bool(focus.batch_line_id),
         "ref": focus.order_ref or "—",
-        "title": f"Inspection · {focus.order_ref or '—'}",
+        "title": f"Inspection · {focus.order_ref or '—'}{f' / {batch.name}' if batch else ''}",
+        "batchId": str(batch.public_id) if batch else None,
         "statusLabel": status_label,
         "statusTone": status_tone,
-        "meta": [
+        "meta": ([{"k": "Batch", "v": batch.name},
+                  {"k": "Assessed", "v": str(focus.prod_qty or 0)},
+                  {"k": "Approved", "v": str(focus.approved_qty or 0)},
+                  {"k": "Hold", "v": str(focus.held_qty or 0)},
+                  {"k": "Rejected", "v": str(focus.rejected_qty or 0)}] if batch else []) + [
             {"k": "Order", "v": focus.order_ref or "—"},
             {"k": "Items", "v": str(len({it["item"] for it in current_items + placeholders}))},
             {"k": "Passed", "v": f"{passed}/{total}"},

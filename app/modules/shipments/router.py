@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 from app.core.deps import tenant_db
 from app.core.security import Principal, require_module
 from app.modules.shipments import service
+from app.modules.shipments import packing
+from uuid import UUID
 from app.modules.shipments.dto import (
     CarrierCreate, CarrierUpdate, ShipmentCreate, ShipmentUpdate, StatusUpdate,
 )
@@ -13,6 +15,15 @@ router = APIRouter(prefix="/shipments", tags=["shipments"])
 
 read = require_module("shipments", "read")
 write = require_module("shipments", "write")
+
+@router.get("/shipments/{pid}/packing")
+def packing_detail(pid: UUID, p: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    return packing.detail(db, UUID(str(p.tenant_id)), pid)
+
+@router.post("/shipments/{pid}/pack")
+def confirm_packing(pid: UUID, payload: packing.PackInput, p: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules.inventory.workflows import atomic
+    return atomic(db, packing.pack, UUID(str(p.tenant_id)), pid, payload, p)
 
 
 @router.get("/shipments/screen")
@@ -32,7 +43,7 @@ def create_shipment(payload: ShipmentCreate, principal: Principal = Depends(writ
 def shipment_status(public_id: str, payload: StatusUpdate,
                     principal: Principal = Depends(write),
                     db: Session = Depends(tenant_db)):
-    s = service.set_status(db, public_id=public_id, status=payload.status)
+    s = service.set_status(db, public_id=public_id, status=payload.status, actor=principal.email)
     if s is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Shipment not found")
     return {"public_id": str(s.public_id), "status": s.status}
@@ -42,7 +53,7 @@ def shipment_status(public_id: str, payload: StatusUpdate,
 def update_shipment(public_id: str, payload: ShipmentUpdate,
                     principal: Principal = Depends(write),
                     db: Session = Depends(tenant_db)):
-    s = service.update_shipment(db, public_id=public_id, payload=payload)
+    s = service.update_shipment(db, public_id=public_id, payload=payload, actor=principal.email)
     if s is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Shipment not found")
     return {"public_id": str(s.public_id), "status": s.status}

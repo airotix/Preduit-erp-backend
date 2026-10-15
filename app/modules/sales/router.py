@@ -15,6 +15,15 @@ router = APIRouter(prefix="/sales", tags=["sales"])
 read = require_module("sales", "read")
 write = require_module("sales", "write")
 
+from app.modules.shipments.packing import PolicyInput
+from uuid import UUID
+
+@router.post("/orders/{pid}/shipment-policy")
+def shipment_policy(pid: UUID, payload: PolicyInput, p: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules.inventory.workflows import atomic
+    from app.modules.shipments.packing import policy
+    return atomic(db, policy, UUID(str(p.tenant_id)), pid, payload, p)
+
 
 @router.get("/customers/screen")
 def customers_screen(
@@ -138,7 +147,7 @@ def invoice_detail(public_id: str, _: Principal = Depends(read), db: Session = D
 def order_status(public_id: str, payload: StatusUpdate,
                  principal: Principal = Depends(write),
                  db: Session = Depends(tenant_db)):
-    o = service.set_order_status(db, public_id=public_id, status=payload.status)
+    o = service.set_order_status(db, public_id=public_id, status=payload.status, reason=payload.reason)
     if o is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Order not found")
     return {"public_id": str(o.public_id), "status": o.status}

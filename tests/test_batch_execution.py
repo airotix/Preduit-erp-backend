@@ -4,11 +4,11 @@ import uuid
 from fastapi import HTTPException
 from sqlalchemy import select
 import test_sales_fulfillment as fixtures
-from app.models.batches import ProductionBatch, BatchLine, BatchStage, BatchLot, BatchAllocation, BatchEvent
+from app.models.batches import ProductionBatch, BatchLine, BatchStage, BatchLot, BatchAllocation, BatchEvent, InboundAllocation
 from app.models.production import ProductionOrder
 from app.models.procurement import PurchaseOrderLine
 from app.models.inventory import Location, StockLevel
-from app.modules.batches import service as batches, dto
+from app.modules.batches import service as batches, dto, workflow
 from app.modules.sales import fulfillment
 
 
@@ -48,8 +48,13 @@ class BatchExecutionTests(unittest.TestCase):
         return batches.line_action(self.db, self.tid, "inspector", batch.public_id, line.id, command, "QC")
 
     def receive(self, batch, line, qty):
-        return batches.line_action(self.db, self.tid, "warehouse", batch.public_id, line.id,
-            self.cmd(dto.Quantity, qty=qty, locationId=self.location.id), "Receive approved stock")
+        result = workflow.create_inbound(self.db, self.tid, "logistics", self.work.public_id,
+            self.cmd(dto.CreateInbound, carrier="Factory carrier", allocations=[dict(lineId=line.id, qty=qty, locationId=self.location.id)]))
+        ship = batches.one(self.db, batches.Shipment, self.tid, result["publicId"])
+        workflow.inbound_status(self.db, self.tid, "logistics", ship, self.cmd(dto.ShipmentStatus, status="In transit"))
+        source = batches.rows(self.db, InboundAllocation, self.tid, InboundAllocation.shipment_id == ship.id)[0]
+        return workflow.inbound_status(self.db, self.tid, "warehouse", ship,
+            self.cmd(dto.ShipmentStatus, status="Delivered", accepted=[dict(allocationId=source.id, qty=qty)]))
 
     def ship(self, allocations):
         result = batches.create_shipment(self.db, self.tid, "logistics", self.so.public_id, "sales",
@@ -75,7 +80,7 @@ class BatchExecutionTests(unittest.TestCase):
         self.assertEqual(self.level.on_hand, 240)
         summary = batches.view(self.db, self.tid, self.so.public_id, "sales")
         self.assertEqual((summary["summary"]["dispatched"], summary["summary"]["remaining"]), (250, 750))
-        self.assertEqual([s["qty"] for s in summary["shipments"][1]["sources"]], [90, 60])
+        self.assertEqual([s["qty"] for s in next(s for s in summary["shipments"] if s["publicId"] == second)["sources"]], [90, 60])
         self.assertEqual(summary["batches"][0]["summary"]["dispatched"], 190)
         self.assertEqual(fulfillment.stock_summary(self.db, self.so)[0]["missing"], 510)
         batches.shipment_status(self.db, self.tid, first, "Delivered")
@@ -132,12 +137,17 @@ class BatchExecutionTests(unittest.TestCase):
 
     def test_receipt_retry_does_not_duplicate_stock_or_audit(self):
         batch, line = self.plan(); self.produce(batch, line); self.qc(batch, line, 200)
-        command = self.cmd(dto.Quantity, qty=100, locationId=self.location.id)
-        for _ in range(2): batches.line_action(self.db, self.tid, "warehouse", batch.public_id, line.id, command, "Receive approved stock")
+        result = workflow.create_inbound(self.db, self.tid, "logistics", self.work.public_id,
+            self.cmd(dto.CreateInbound, carrier="Carrier", allocations=[dict(lineId=line.id, qty=100, locationId=self.location.id)]))
+        ship = batches.one(self.db, batches.Shipment, self.tid, result["publicId"])
+        workflow.inbound_status(self.db, self.tid, "logistics", ship, self.cmd(dto.ShipmentStatus, status="In transit"))
+        source = batches.rows(self.db, InboundAllocation, self.tid, InboundAllocation.shipment_id == ship.id)[0]
+        command = self.cmd(dto.ShipmentStatus, status="Delivered", accepted=[dict(allocationId=source.id, qty=100)])
+        for _ in range(2): workflow.inbound_status(self.db, self.tid, "warehouse", ship, command)
         self.assertEqual(self.level.on_hand, 100)
         self.assertEqual(line.received, 100)
-        changed = command.model_copy(update={"qty": 101})
-        with self.assertRaises(HTTPException): batches.line_action(self.db, self.tid, "warehouse", batch.public_id, line.id, changed, "Receive approved stock")
+        changed = command.model_copy(update={"accepted": [dto.Acceptance(allocationId=source.id, qty=101)]})
+        with self.assertRaises(HTTPException): workflow.inbound_status(self.db, self.tid, "warehouse", ship, changed)
 
     def test_wrong_tenant_and_wrong_line_are_rejected(self):
         batch, line = self.plan()
@@ -187,9 +197,10 @@ class BatchExecutionTests(unittest.TestCase):
         result = batches.create_shipment(self.db, self.tid, "logistics", self.so.public_id, "sales", command)
         view = batches.view(self.db, self.tid, self.so.public_id, "sales")
         self.assertEqual(view["summary"]["allocated"], 1000)
-        self.assertEqual(view["shipments"][0]["qty"], 1000)
-        self.assertEqual(len(view["shipments"][0]["sources"]), 2)
-        self.assertIsNone(view["shipments"][0]["sources"][1]["batchId"])
+        outbound = next(s for s in view["shipments"] if s["publicId"] == result["publicId"])
+        self.assertEqual(outbound["qty"], 1000)
+        self.assertEqual(len(outbound["sources"]), 2)
+        self.assertIsNone(outbound["sources"][1]["batchId"])
         batches.shipment_status(self.db, self.tid, result["publicId"], "In transit")
         self.assertEqual((self.level.on_hand, self.level.reserved), (0, 0))
         self.assertEqual(self.so.status, "Shipped")

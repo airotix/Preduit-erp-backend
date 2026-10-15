@@ -41,7 +41,7 @@ def po_detail(public_id: str, _: Principal = Depends(read), db: Session = Depend
 def po_status(public_id: str, payload: StatusUpdate,
               principal: Principal = Depends(write),
               db: Session = Depends(tenant_db)):
-    po = service.set_po_status(db, public_id=public_id, status=payload.status,
+    po = service.set_po_status(db, public_id=public_id, status=payload.status, reason=payload.reason,
                                tenant_id=principal.tenant_id)
     if po is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "PO not found")
@@ -72,8 +72,9 @@ def receipts_screen(limit: int = Query(50, le=200), offset: int = Query(0, ge=0)
 @router.post("/receipts", status_code=status.HTTP_201_CREATED)
 def create_receipt(payload: GoodsReceiptCreate,
                    principal: Principal = Depends(write),
+                   _: Principal = Depends(require_module("inventory", "write")),
                    db: Session = Depends(tenant_db)):
-    grn = service.create_receipt(db, tenant_id=principal.tenant_id, payload=payload)
+    grn = service.create_receipt(db, tenant_id=principal.tenant_id, payload=payload, actor=principal.email)
     return {"public_id": str(grn.public_id), "grn_no": grn.grn_no}
 
 

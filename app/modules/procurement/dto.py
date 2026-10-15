@@ -4,6 +4,7 @@ from decimal import Decimal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.validation import clean_email, clean_contact
+from app.modules.inventory.dto import WarehouseReceiptCreate
 
 
 class POLineIn(BaseModel):
@@ -22,10 +23,9 @@ class PurchaseOrderCreate(BaseModel):
     lines: list[POLineIn] = Field(min_length=1)
 
 
-class GoodsReceiptCreate(BaseModel):
+class GoodsReceiptCreate(WarehouseReceiptCreate):
     po: str = Field(min_length=1, max_length=32)
-    supplier: str = Field(min_length=1, max_length=200)
-    lines: int = Field(gt=0)
+    supplier: str | None = Field(default=None, max_length=200)
 
 
 class SupplierCreate(BaseModel):
@@ -67,3 +67,4 @@ class SupplierUpdate(SupplierCreate):
 
 class StatusUpdate(BaseModel):
     status: str = Field(min_length=1, max_length=24)
+    reason: str | None = Field(default=None, max_length=400)

@@ -10,7 +10,7 @@ finance posting. Fulfillment runs in the same request transaction.
    Holds identify the sales order, its line and the stock location. Stock rows
    are locked while allocating, and held units cannot be transferred away.
 3. A fully covered order creates one **Pending** shipment with every order line
-   and immediately marks the sales order **Shipped** (handed to Shipments).
+   and marks the sales order **Packed**, ready for physical dispatch.
    Carrier and destination can be completed in Shipments.
 4. An order with a shortfall becomes **PO needed**. **Create PO** appears in both
    the Sales orders list and order detail. It opens a supplier selector. Creation
@@ -23,48 +23,40 @@ finance posting. Fulfillment runs in the same request transaction.
    procurement workflow, and the sales order becomes **Awaiting stock**.
 6. Available units remain held. Every production item must finish its TNA and
    have its latest non-cancelled final inspection pass.
-7. Final QC automatically creates a completed goods receipt and adds the PO's
-   full quantities to inventory once. The same action runs from Complete
-   inspection, a Pass status update, and Pass inspection. Finishing the last TNA
-   stage also checks the gate in case QC was passed before production finished.
-   The original order receives its manufactured units first; other waiting
-   orders are then checked oldest-first and reserve only remaining available
-   stock. Each fully covered order gets one Pending shipment. Shipment readiness
-   is based on its actual inventory holds, including stock from other receipts.
-   An active inventory location is required; a missing location stops the action
-   with a clear error. Receipt and QC commit together. Manual receipt after an
-   automatic receipt returns the existing receipt without adding stock again.
-8. Delivering the shipment consumes the exact
-   held stock and releases reservations once. Holds remain protected while the
-   shipment is Pending or in transit, even though the sales order is Shipped.
-   Cancellation before shipment creation releases only that
-   order's holds. Terminal orders cannot be reopened or shipped again.
+7. Final QC confirms quality only. Warehouse staff open Inventory > Stock >
+   Warehouse receiving, select the location that actually received the goods,
+   enter the arrived quantity against each PO line, and record a reference and
+   reason. Partial arrivals keep the remaining PO quantities open. Receipts are
+   limited to the outstanding quantity and are idempotent by request ID.
+   The source sales order receives its manufactured stock first; competing
+   waiting orders then reserve remaining stock oldest-first. A fully covered
+   order gets one Pending shipment and becomes Packed.
+8. In Shipments, **Dispatched** confirms that goods physically left the
+   warehouse. It consumes the exact order-owned holds, updates on-hand and
+   releases reservations once. In transit, Customs, Out for delivery and
+   Delivered require prior dispatch. Delivered records customer receipt and
+   never consumes inventory again. Dispatch cannot be undone through a status
+   edit. Pending orders can be cancelled before dispatch; dispatched orders
+   cannot be cancelled or reopened through the normal order status action.
 
 Repeated Create PO clicks return the linked PO; repeated receipts and shipment
 completion do not duplicate procurement, receipts, stock or consumption.
 If stock arrives before Create PO is confirmed, availability is checked again
 and an unnecessary PO is avoided.
 
-Existing orders are not retroactively allocated or relinked. Their
-`fulfillment_tracked` flag defaults to false, retaining legacy behavior.
+Legacy orders without reconciled, order-owned stock reservations cannot use the
+new dispatch action until their stock links are reconciled. V074 preserves old
+Delivered shipments, fixes pending orders incorrectly marked Shipped, and
+consumes validated holds for existing normal shipments already in transit.
 
 ## Catalogue and Inventory restocking
 
-Positive quantity increases saved through either variant matrix, and manual
-Inventory stock receipts, now recheck tracked orders in PO needed/Awaiting stock.
-The waiting queue is locked before stock writes and processed oldest-first in the
-same transaction. Existing holds remain protected; extra available units are held
-until every order line is covered. Full coverage creates one Pending shipment and
-marks the sales order Shipped. Partial restocks keep the appropriate waiting status.
-Repeated matrix saves do not create duplicate holds or shipments. Failed allocation
-rolls back the stock increase and shipment together.
-
-Independent stock can fulfill an order that already has a production PO. That PO
-is retained; its manufactured quantities still require completed TNA and final QC
-before inventory receipt. Stock reductions and colour-only/no-quantity edits do
-not trigger reallocation. Legacy, cancelled, shipped and other-tenant orders are
-excluded. The frontend refreshes Sales and Shipments after these stock writes.
-This extension needs no new database migration.
+Variant matrices define structure; quantities change through physical receipts
+or count corrections. Independent Inventory stock receipts and positive count
+corrections recheck tracked orders in PO needed/Awaiting stock. Existing holds
+remain protected. Full coverage creates one Pending shipment and marks the
+sales order Packed. Failed allocation rolls back the receipt and shipment
+creation together. A QC result remains independent of a later receipt failure.
 
 ## Catalogue and procurement
 
@@ -93,7 +85,7 @@ recovery; changing the chosen recovery afterwards is blocked. Production recover
 requires both Quality and Production write access. Already received stock must
 be reconciled before reopening a failure.
 
-These extensions use existing fields and require no migration beyond V063/V064.
+Warehouse receipt and dispatch timing require V074 in addition to the earlier migrations.
 
 ## Invoice banking and QC details
 
@@ -119,26 +111,38 @@ invoice list cache across Sales, Catalogue, Procurement and Reorder Alerts.
 
 ## Migration
 
-Apply V063 first if it is not already installed, then V064 before restarting the
-backend with these changes. V064 is also included in the consolidated PostgreSQL
-schema for fresh databases. Do not run the consolidated schema as an upgrade.
-
-From any PowerShell directory, for the existing Docker database:
-
-```powershell
-Get-Content -Raw "C:\Users\fbc\Desktop\perp\backend\db\V064_pg__sales_stock_fulfillment.sql" |
-  docker exec -i preduit-db psql -U erp_admin -d preduit -v ON_ERROR_STOP=1
-```
-
-The migration adds source links, the tracked-order flag, stable variant IDs,
-order-owned reservations with tenant RLS and grants, and a unique active shipment
-per sales order. It leaves legacy stock reservations unchanged.
+Apply V074_pg__physical_warehouse_receipts_and_dispatch.sql after V073 and before
+starting the updated backend. Existing Delivered shipments are not relieved
+again. Existing in-transit tracked shipments migrate only when their full order
+reservations reconcile with physical balances; otherwise migration aborts before
+changing stock. Generated Pending shipments correct their source order to Packed.
 
 ## Verification
 
-Tests cover full/partial/absent inventory, multiple locations, competing orders,
-duplicate variant lines, supplier and price validation, tenant isolation,
-duplicate clicks, QC and receipt gating, failed reinspection, color rename,
-cancellation, protected stock, shipment completion and transaction rollback.
-The services are exercised against isolated SQLite fixtures; PostgreSQL locking
-and the migration still require verification in the Docker environment.
+The warehouse suite covers partial arrivals into chosen locations, over-receipt,
+QC gating, tenant isolation, idempotent receipts, dispatch from multiple locations,
+tracking without double consumption, cancellation boundaries and transaction
+rollback. scripts/check_warehouse_postgres.py runs the same checks and a concurrent
+receipt retry in a disposable Docker PostgreSQL schema, using the real V074 migration.
+
+## Inventory movement history
+
+V075 adds the physical movement ledger. Inventory > Stock > History shows a
+single article; View stock movement history opens the complete ledger. Filters
+cover variant, location, type, reference/user search and date range, with pagination.
+Every recorded movement retains its article, SKU, colour, size and location names
+as they were when posted, its user, quantity, before/after balance and source reference.
+Source references open the posted movement group, with links to the source receipt,
+shipment or batch where the reader has access.
+
+Receipts, count corrections, both sides of transfers, normal and batch dispatches,
+write-offs and supplier returns append entries in the source transaction. Existing
+batch returns to QC record a returned quantity with zero warehouse balance change,
+because those pieces are held for inspection. Reservations alone do not move physical
+stock and therefore do not create physical movement entries.
+
+The migration records an opening balance for every existing variant/location pair.
+It preserves earlier recorded entries, but cannot reconstruct missing historical
+movements or their old labels. Opening balances identify the start of complete
+recording. Posted entries cannot be edited or deleted by the application role;
+corrections are separate movements.

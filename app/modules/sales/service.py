@@ -4,6 +4,8 @@ import datetime
 import json
 import uuid
 from uuid import UUID
+from fastapi import HTTPException
+from sqlalchemy import select
 
 from sqlalchemy.orm import Session
 
@@ -15,7 +17,7 @@ from app.presenters.screen import board_config, initials, list_config, text_cell
 
 _TYPE_TONE = {"Wholesale": "navy", "Retail": "neutral"}
 _CHANNEL_TONE = {"Wholesale": "navy", "Online": "green", "Marketplace": "amber", "Retail": "neutral"}
-_ORDER_STATUS_TONE = {"New": "gray", "PO needed": "amber", "Awaiting stock": "amber", "Packed": "navy", "Partially shipped": "amber", "Shipped": "green", "Cancelled": "red"}
+_ORDER_STATUS_TONE = {"New": "gray", "PO needed": "amber", "Awaiting stock": "amber", "Ready to pack": "navy", "Packed": "navy", "Partially shipped": "amber", "Shipped": "green", "Cancelled": "red", "Inactive": "gray"}
 _INV_STATUS_TONE = {"Open": "amber", "Paid": "green", "Overdue": "red"}
 _RET_STATUS_TONE = {"Inspecting": "amber", "Refunded": "green", "Rejected": "red"}
 
@@ -25,6 +27,7 @@ _BOARD_COLUMNS = [
     ("Awaiting stock", "Awaiting stock", "#D29A22", "amber", "package"),
     ("Partially shipped", "Partially shipped", "#D29A22", "amber", "truck"),
     ("New", "New", "#9499A6", "neutral", "package"),
+    ("Ready to pack", "Ready to pack", "#3A4256", "navy", "package"),
     ("Packed", "Packed", "#3A4256", "navy", "package"),
     ("Shipped", "Shipped", "#2E9E6B", "green", "truck"),
 ]
@@ -121,6 +124,8 @@ def orders_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict
 
 def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreate):
     tid = _tid(tenant_id)
+    from app.modules.sales.pricing import catalog_lines
+    lines = catalog_lines(session, tid, payload)
     name = payload.customer.strip()
     customer_id = repo.find_customer_id(session, name=name)
     if customer_id is None:
@@ -140,15 +145,13 @@ def create_order(session: Session, *, tenant_id: str | UUID, payload: OrderCreat
                 region=None, phone=None, address=None,
             )
         customer_id = cust.id
-    lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku,
-              "qty": l.qty, "price": l.price}
-             for l in payload.lines]
     order = repo.create_order(
         session, tenant_id=tid, customer_id=customer_id, customer_name=payload.customer,
         channel=payload.channel, lines=lines,
     )
     from app.modules.sales import fulfillment
     order.fulfillment_tracked = True
+    order.allow_partial_shipments = payload.allowPartialShipments
     session.flush()
     fulfillment.refresh_order(session, order)
     # Raise a receivable for the order so it lands on the customer ledger as a
@@ -323,13 +326,18 @@ def returns_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dic
     )
 
 
-def set_order_status(session, *, public_id, status):
+def set_order_status(session, *, public_id, status, reason=None):
     from app.models.sales import SalesOrder
     from sqlalchemy import select
     from fastapi import HTTPException
     from app.modules.sales import fulfillment
+    if status == "Inactive":
+        from app.modules.catalog.commitments import inactive_order
+        return inactive_order(session, public_id=public_id, reason=reason)
     order = session.scalar(select(SalesOrder).where(SalesOrder.public_id == UUID(str(public_id)),
         SalesOrder.is_deleted.is_(False)).with_for_update().execution_options(populate_existing=True))
+    if order is not None and order.status == "Inactive":
+        raise HTTPException(409, "An inactive order cannot be reopened.")
     if order is not None and order.fulfillment_tracked:
         from app.modules.batches.service import managed_sales
         if managed_sales(session, order):
@@ -343,19 +351,17 @@ def set_order_status(session, *, public_id, status):
         if status == order.status:
             return order
         if status == "Cancelled":
+            if any(r["dispatched"] for r in fulfillment.stock_summary(session, order)):
+                raise HTTPException(409, "A partially dispatched order cannot be cancelled; reconcile its shipped quantities first")
             fulfillment.release_holds(session, order)
             from app.models.shipments import Shipment
             for shipment in session.scalars(select(Shipment).where(Shipment.sales_order_id == order.id,
                 Shipment.tenant_id == order.tenant_id, Shipment.is_deleted.is_(False))).all():
                 shipment.status = "Cancelled"
         elif status == "Shipped":
-            fulfillment.complete_shipment(session, order)
-            from app.models.shipments import Shipment
-            for shipment in session.scalars(select(Shipment).where(Shipment.sales_order_id == order.id,
-                Shipment.tenant_id == order.tenant_id, Shipment.is_deleted.is_(False))).all():
-                shipment.status = "Delivered"
-        elif status in ("New", "Packed") and any(r["missing"] for r in fulfillment.stock_summary(session, order)):
-            raise HTTPException(409, "This order is waiting for stock.")
+            raise HTTPException(409, "Confirm dispatch in Shipments. Marking a sales order Shipped cannot confirm customer delivery.")
+        elif status in ("New", "Packed"):
+            raise HTTPException(409, "Readiness is calculated from stock; confirm actual packing in Shipments")
         order.status = status
         session.flush()
         return order
@@ -367,15 +373,15 @@ def set_invoice_status(session, *, public_id, status):
 
 
 def set_return_status(session, *, public_id, status):
+    from app.models.sales import SalesReturn
+    current = session.scalar(select(SalesReturn).where(SalesReturn.public_id == public_id))
+    if current and current.sales_order_id:
+        raise HTTPException(409, "Use the return receipt, QC and put-away workflow to update this return")
     return repo.set_return_status(session, public_id=public_id, status=status)
 
 
 def create_return(session: Session, *, tenant_id: str | UUID, payload: ReturnCreate):
-    tid = _tid(tenant_id)
-    return repo.create_return(
-        session, tenant_id=tid, order_ref=payload.order, customer_name=payload.customer,
-        reason=payload.reason, refund=payload.refund,
-    )
+    raise HTTPException(409, "Authorize returns using the quantity-based return form in Sales Returns")
 
 
 # ---------- Detail pages ----------
@@ -411,9 +417,10 @@ def order_detail(session: Session, *, public_id: str) -> dict | None:
         return None
     o, lines, cust = data["order"], data["lines"], data["customer"]
     subtotal = sum((l["line_total"] or 0) for l in lines)
-    idx = _ORDER_STAGES.index(o.status) if o.status in _ORDER_STAGES else 0
-    stages = [("shopping-bag", "accent", "Order placed"),
-              ("package", "navy", "Packed"), ("truck", "green", "Shipped")]
+    idx = {"New": 0, "PO needed": 0, "Awaiting stock": 0, "Ready to pack": 1,
+        "Packed": 2, "Partially shipped": 3, "Shipped": 4}.get(o.status, 0)
+    stages = [("shopping-bag", "accent", "Order placed"), ("package", "navy", "Ready to pack"),
+              ("package", "navy", "Packed"), ("truck", "accent", "Partially shipped"), ("truck", "green", "Shipped")]
     timeline = [{"icon": ic, "tone": tn, "title": ti, "time": "", "done": i <= idx}
                 for i, (ic, tn, ti) in enumerate(stages)]
     return {
@@ -603,6 +610,7 @@ def build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type: 
     if data is None:
         return None
     source = repo.order_by_no(session, order_no=order_no)
+    data["_orderLocked"] = True
     from app.modules.invoice_banking import profile_defaults
     return profile_defaults(session, source.tenant_id, data, actor_id, sales=True)
 
@@ -614,6 +622,7 @@ def _build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type:
     order = repo.order_by_no(session, order_no=order_no)
     if order is None:
         return None
+    invoice_type = order.channel if order.channel in ("Retail", "Online", "Wholesale") else "Retail"
     lines = repo.order_lines(session, order_id=order.id)
     variants = repo.variants_by_sku(session, skus=[l["sku"] for l in lines])
     customer = repo._customer_by_id(session, order.customer_id)
@@ -661,13 +670,13 @@ def _build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type:
             color = (l.get("color") or (v or {}).get("color") or "—").strip()
             size = (l.get("size") or (v or {}).get("size") or "—").strip()
             qty = int(l["qty"] or 0)
-            price = _channel_price(v, invoice_type, l["price"])
+            price = round(float(l["price"]), 4)
             a = articles.setdefault(art, {
                 "colors": {}, "sizes": set(),
                 "image": (v or {}).get("image"), "fabric": (v or {}).get("fabric") or "",
                 "hs": (v or {}).get("hs_code") or "", "sku": (l["sku"] or ""),
             })
-            row = a["colors"].setdefault(color, {"qty": {}, "price": price})
+            row = a["colors"].setdefault((color, price), {"qty": {}, "price": price})
             row["qty"][size] = row["qty"].get(size, 0) + qty
             if price and not row["price"]:
                 row["price"] = price
@@ -680,7 +689,7 @@ def _build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type:
         for art, a in articles.items():
             sizes = sorted(a["sizes"], key=_size_rank)
             rows = []
-            for color, cd in a["colors"].items():
+            for (color, _price), cd in a["colors"].items():
                 total = sum(cd["qty"].values())
                 unit = round(float(cd["price"]), 4)
                 rows.append({"color": color, "qty": cd["qty"], "total": total,
@@ -715,7 +724,7 @@ def _build_sales_invoice_draft(session: Session, *, order_no: str, invoice_type:
     for l in lines:
         v = variants.get((l["sku"] or "").strip())
         qty = int(l["qty"] or 0)
-        unit = _channel_price(v, invoice_type, l["price"])
+        unit = round(float(l["price"]), 4)
         amount = round(qty * unit, 2)
         grand_qty += qty
         grand_amt += amount
@@ -762,10 +771,14 @@ def _sinv_persist_fields(data: dict) -> dict:
 
 def list_sales_invoice_docs(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
     rows, total = repo.list_sales_invoices(session, limit=limit, offset=offset)
+    from app.models.sales import SalesOrder
+    sources = {o.order_no: o for o in session.scalars(select(SalesOrder).where(
+        SalesOrder.order_no.in_([r["order_no"] for r in rows if r["order_no"]])))}
     return {"invoices": [{
         "publicId": str(r["public_id"]), "invoiceNo": r["invoice_no"], "orderNo": r["order_no"],
         "customer": r["customer_name"], "invoiceType": r["invoice_type"],
-        "currency": r["currency_code"], "total": float(r["total"] or 0), "status": r["status"],
+        "currency": sources[r["order_no"]].currency_code if r["order_no"] in sources else r["currency_code"],
+        "total": float(sources[r["order_no"]].total if r["order_no"] in sources else r["total"] or 0), "status": r["status"],
         "createdAt": r["created_at"].isoformat() + "Z" if r["created_at"] else None,
     } for r in rows], "total": total}
 
@@ -774,6 +787,15 @@ def create_sales_invoice_doc(session: Session, *, tenant_id, data: dict, actor_i
     from app.modules.invoice_banking import profile_defaults
     from app.core.validation import validate_invoice_phones
     validate_invoice_phones(data)
+    from app.models.sales import SalesOrder
+    from app.modules.sales.pricing import lock_document_values
+    reference = data.get("orderNo") or data.get("orderRef") or data.get("poNo")
+    if reference:
+        order = session.scalar(select(SalesOrder).where(SalesOrder.tenant_id == _tid(tenant_id),
+            SalesOrder.order_no == reference, SalesOrder.is_deleted.is_(False)).with_for_update())
+        if order is None:
+            raise HTTPException(409, "Choose a valid source sales order")
+        data = lock_document_values(session, order, data)
     data = profile_defaults(session, tenant_id, data, actor_id, sales=True)
     validate_invoice_phones(data)
     f = _sinv_persist_fields(data)
@@ -787,10 +809,18 @@ def get_sales_invoice_doc(session: Session, *, public_id: str, actor_id=None) ->
         return None
     from app.modules.invoice_banking import company_bank, fill_missing
     data = json.loads(inv.data)
+    if inv.order_no:
+        from app.modules.sales.pricing import lock_document_values
+        source = repo.order_by_no(session, order_no=inv.order_no)
+        if source:
+            data = lock_document_values(session, source, data)
     data["remit"] = fill_missing(data.get("remit"), company_bank(repo.company_info(session)))
     from app.modules.invoice_banking import profile_defaults
     data = profile_defaults(session, inv.tenant_id, data, actor_id, sales=True)
-    return {**_sinv_summary(inv), "data": data}
+    summary = _sinv_summary(inv)
+    if data.get("_orderLocked"):
+        summary["total"], summary["currency"] = data["totals"]["total"], data["currency"]
+    return {**summary, "data": data}
 
 
 def update_sales_invoice_doc(session: Session, *, public_id: str, data: dict) -> dict | None:
@@ -799,6 +829,19 @@ def update_sales_invoice_doc(session: Session, *, public_id: str, data: dict) ->
     inv = repo.get_sales_invoice(session, public_id=public_id)
     if inv is None:
         return None
+    if inv.order_no:
+        from app.models.sales import SalesOrder
+        from app.modules.sales.pricing import lock_document_values
+        incoming = data.get("orderNo") or data.get("orderRef") or data.get("poNo")
+        if incoming != inv.order_no:
+            raise HTTPException(409, "A linked invoice cannot be moved to another order")
+        order = session.scalar(select(SalesOrder).where(SalesOrder.tenant_id == inv.tenant_id,
+            SalesOrder.order_no == inv.order_no).with_for_update())
+        if order is None:
+            raise HTTPException(409, "Source order not found")
+        data = lock_document_values(session, order, data)
+    elif data.get("orderNo") or data.get("orderRef") or data.get("poNo"):
+        raise HTTPException(409, "Create a new order-linked document rather than relinking an existing invoice")
     f = _sinv_persist_fields(data)
     inv.invoice_no = f["invoice_no"] or inv.invoice_no
     inv.order_no = f["order_no"]

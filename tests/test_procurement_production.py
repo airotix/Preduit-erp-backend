@@ -19,6 +19,7 @@ from app.models.procurement import PurchaseOrder, PurchaseOrderLine, PoInvoice
 from app.models.production import ProductionOrder, ProductionOrderLine, ProductionStage
 from app.models.sales import SalesOrder
 from app.models.finance import SupplierBill
+from app.models.inventory import Location  # Register FK target for isolated schema copy.
 from app.models.quality import Inspection
 from app.modules.procurement import service as procurement
 from app.modules.procurement.dto import PurchaseOrderCreate
@@ -92,7 +93,8 @@ class ProcurementProductionTests(unittest.TestCase):
         second = production.create_for_purchase_order(self.db, tenant_id=self.tid, purchase_order=po)
         self.assertEqual(first.id, second.id)
         procurement.set_po_status(self.db, public_id=po.public_id, status="Approved")
-        procurement.set_po_status(self.db, public_id=po.public_id, status="Received")
+        with self.assertRaises(HTTPException):
+            procurement.set_po_status(self.db, public_id=po.public_id, status="Received")
         self.assertEqual(self.count(ProductionOrder), 1)
         self.assertEqual(self.count(ProductionOrderLine), 2)
         self.assertEqual(self.count(PoInvoice), 1)
@@ -215,8 +217,10 @@ class ProcurementProductionTests(unittest.TestCase):
         stage = self.db.scalar(select(ProductionStage).where(ProductionStage.name == "Packed"))
         self.assertEqual(stage.status, "In Progress")
         with patch("app.modules.documents.service.write_audit"):
-            production.techpacks.upload_line(self.db, tenant_id=self.tid, public_id=item.public_id,
+            uploaded = production.techpacks.upload_line(self.db, tenant_id=self.tid, public_id=item.public_id,
                 filename="tech-pack.pdf", content_type="application/pdf", data=b"%PDF-1.4 test")
+        production.techpacks.approve_line_revision(self.db, tenant_id=self.tid,
+            public_id=item.public_id, revision_id=uploaded["pendingRevision"]["id"])
         production.stage_action(self.db, action="complete", public_id=stage.public_id)
         inspection = self.db.scalar(select(Inspection))
         self.assertEqual(inspection.order_ref, work.order_no)

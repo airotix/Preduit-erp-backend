@@ -16,7 +16,7 @@ def list_inspections(session, *, limit, offset):
         select(Inspection.public_id, Inspection.inspection_no, Inspection.order_ref,
                Inspection.stage, Inspection.aql, Inspection.defect_count, Inspection.result,
                Inspection.product, Inspection.inspector, Inspection.inspection_date,
-               Inspection.item)
+               Inspection.item, Inspection.batch_line_id)
         .where(Inspection.is_deleted == False)  # noqa: E712
         .order_by(Inspection.id.desc()).limit(limit).offset(offset)
     )
@@ -258,10 +258,7 @@ def delete_inspection_defect(session: Session, *, public_id: str) -> Inspection 
 
 
 def set_result(session: Session, *, public_id: str, result: str) -> Inspection | None:
-    ins = session.execute(
-        select(Inspection).where(Inspection.public_id == public_id,
-                                 Inspection.is_deleted == False)  # noqa: E712
-    ).scalar_one_or_none()
+    ins = get_inspection(session, public_id=public_id)
     if ins is None:
         return None
     ins.result = result
@@ -323,8 +320,12 @@ def inspections_for_order(session: Session, *, order_ref: str | None) -> list[In
 
 
 def get_inspection(session: Session, *, public_id: str) -> Inspection | None:
+    try:
+        inspection_id = UUID(str(public_id))
+    except (ValueError, TypeError):
+        return None
     return session.execute(
-        select(Inspection).where(Inspection.public_id == public_id,
+        select(Inspection).where(Inspection.public_id == inspection_id,
                                  Inspection.is_deleted == False)  # noqa: E712
     ).scalar_one_or_none()
 
@@ -351,6 +352,7 @@ def create_reinspection(session: Session, *, tenant_id: UUID, parent: Inspection
         tenant_id=tenant_id, order_ref=parent.order_ref, item=parent.item, stage=parent.stage, aql=plan["aql"],
         result="Pending", defect_count=0, sku=parent.sku, product=parent.product,
         batch_lot=parent.batch_lot, inspection_type=parent.inspection_type,
+        batch_line_id=parent.batch_line_id,
         prod_qty=parent.prod_qty, sample_size=plan["sampleSize"], max_defects=plan["maxDefects"],
         inspection_date=datetime.date.today(), inspector=parent.inspector,
         parent_inspection_id=parent.id,
