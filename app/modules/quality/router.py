@@ -5,15 +5,44 @@ from sqlalchemy.orm import Session
 from app.core.deps import tenant_db
 from app.core.security import Principal, require_module
 from app.modules.quality import service
+from app.modules.quality import workflow
 from app.modules.quality.dto import (
-    CheckIn, DefectIn, DefectTypeCreate, DefectTypeUpdate, DispositionIn,
-    InspectionCreate, InspectionHeaderUpdate, PassShipIn, StatusUpdate, ReopenIn,
+    CheckIn, DecideTask, DefectIn, DefectTypeCreate, DefectTypeUpdate, DispositionIn,
+    InspectionCreate, InspectionHeaderUpdate, PassShipIn, ResolveTask, StartTask, StatusUpdate, ReopenIn,
 )
 
 router = APIRouter(prefix="/quality", tags=["quality"])
 
 read = require_module("quality", "read")
 write = require_module("quality", "write")
+
+
+@router.get("/work-queue")
+def work_queue(_: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    return workflow.work_queue(db, _.tenant_id)
+
+
+@router.get("/tasks")
+def quality_task(task: str = Query(...), principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    return workflow.get_task(db, principal.tenant_id, task, principal.permissions)
+
+
+@router.post("/tasks/start")
+def start_task(payload: StartTask, principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    return workflow.start_task(db, tenant_id=principal.tenant_id, actor=principal.email,
+                               permissions=principal.permissions, key=payload.taskKey, payload=payload)
+
+
+@router.post("/tasks/decide")
+def decide_task(payload: DecideTask, principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    return workflow.decide_task(db, tenant_id=principal.tenant_id, permissions=principal.permissions,
+                                key=payload.taskKey, payload=payload)
+
+
+@router.post("/tasks/resolve")
+def resolve_task(payload: ResolveTask, principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    return workflow.resolve_hold(db, tenant_id=principal.tenant_id, actor=principal.email,
+                                 key=payload.taskKey, payload=payload)
 
 
 @router.get("/inspections/screen")

@@ -11,7 +11,6 @@ from app.models.inventory import Location, OrderStockReservation, StockLevel
 from app.models.sales import Customer, SalesOrder, SalesOrderLine
 from app.models.procurement import PurchaseOrder, PurchaseOrderLine, Supplier
 from app.models.production import ProductionOrder, ProductionOrderLine
-from app.models.quality import Inspection
 from app.models.shipments import Shipment, ShipmentLine
 from app.models.batches import ProductionBatch
 from app.modules.sales.ordinary_shipping import dispatched as normal_dispatched
@@ -203,27 +202,19 @@ def procurement_summary(session, order):
         row["toPurchase"] = max(0, row["missing"] - outstanding.get(row["lineId"], 0))
         variant = variant_for(session, order, sources[row["lineId"]])
         row["productId"] = variant.product_id if variant else None
+        from app.models.supplier_pricing import SupplierPrice
+        quotes = session.execute(select(SupplierPrice, Supplier).join(Supplier, Supplier.id == SupplierPrice.supplier_id).where(
+            SupplierPrice.tenant_id == order.tenant_id, Supplier.tenant_id == order.tenant_id,
+            SupplierPrice.variant_id == variant.id if variant else False,
+            SupplierPrice.active.is_(True), Supplier.is_deleted.is_(False))).all()
+        row["suppliers"] = [{"publicId": str(s.public_id), "name": s.name, "price": float(q.price), "currency": q.currency}
+            for q, s in quotes]
     return rows
 
 
 def qc_cleared(session, po):
-    work = session.scalar(select(ProductionOrder).where(ProductionOrder.purchase_order_id == po.id,
-        ProductionOrder.tenant_id == po.tenant_id, ProductionOrder.is_deleted.is_(False)))
-    if work is None:
-        return False
-    items = session.scalars(select(ProductionOrderLine).where(ProductionOrderLine.order_id == work.id,
-        ProductionOrderLine.tenant_id == po.tenant_id)).all()
-    inspections = session.scalars(select(Inspection).where(Inspection.order_ref == work.order_no,
-        Inspection.tenant_id == po.tenant_id, Inspection.is_deleted.is_(False))).all()
-    if not items or not inspections:
-        return False
-    from app.modules.production.service import _line_is_complete
-    latest = {}
-    for ins in sorted(inspections, key=lambda row: row.id):
-        if ins.stage == "Final" and ins.result != "Cancelled":
-            latest[ins.item] = ins
-    return all(_line_is_complete(session, line.id) and line.name in latest and latest[line.name].result == "Pass"
-               for line in items)
+    from app.modules.quality.workflow import supplier_release
+    return supplier_release(session, po)["ready"]
 
 
 def refresh_order(session, order):
@@ -288,13 +279,19 @@ def create_shortage_pos(session, *, tenant_id, public_id, supplier_id=None, assi
     groups = {}
     for row in shortages:
         variant = variant_for(session, order, source_lines[row["lineId"]])
-        if variant is None or variant.supplier_price is None:
-            raise HTTPException(409, f"Set a catalog variant and supplier purchase price for {row['name']} ({row['color'] or 'no color'}, {row['size'] or 'no size'}) before creating its PO.")
+        if variant is None:
+            raise HTTPException(409, "Save an exact Catalog variant before creating its shortage PO")
+        from app.modules.catalog.supplier_pricing import agreed_price
+        selected = session.scalar(select(Supplier).where(Supplier.tenant_id == order.tenant_id,
+            Supplier.public_id == UUID(str(chosen[row["lineId"]])), Supplier.is_deleted.is_(False)))
+        if selected is None:
+            raise HTTPException(404, "Supplier not found")
+        price = agreed_price(session, order.tenant_id, variant, selected.id)
         group = groups.setdefault(variant.product_id, {"supplierId": chosen[row["lineId"]], "lines": [], "sources": []})
         if group["supplierId"] != chosen[row["lineId"]]:
             raise HTTPException(400, "Choose one supplier for all variants of an item.")
         group["lines"].append({"name": row["name"], "color": row["color"], "size": row["size"],
-            "sku": variant.sku, "qty": row["toPurchase"], "price": variant.supplier_price})
+            "sku": variant.sku, "qty": row["toPurchase"], "price": price})
         group["sources"].append(row["lineId"])
     from app.modules.procurement.dto import PurchaseOrderCreate
     from app.modules.procurement import service as procurement
@@ -313,7 +310,7 @@ def create_shortage_pos(session, *, tenant_id, public_id, supplier_id=None, assi
         if lead and "week" in supplier.lead_time.lower():
             days *= 7
         po = procurement.create_po(session, tenant_id=order.tenant_id, resolved_supplier=supplier, payload=PurchaseOrderCreate(
-            supplier=supplier.name, expected=(date.today() + timedelta(days=min(days, 3650))).strftime("%d %b %Y"), lines=group["lines"]))
+            supplier=supplier.name, supplierId=supplier.public_id, expected=(date.today() + timedelta(days=min(days, 3650))).isoformat(), lines=group["lines"]))
         po.sales_order_id = order.id
         po_lines = session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.po_id == po.id,
             PurchaseOrderLine.tenant_id == order.tenant_id).order_by(PurchaseOrderLine.id)).all()

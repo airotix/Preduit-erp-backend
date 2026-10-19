@@ -3,7 +3,7 @@ import datetime
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Uuid, text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -43,9 +43,14 @@ class Inspection(Base):
     parent_inspection_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     shipment_ref: Mapped[str | None] = mapped_column(String(32), nullable=True)
     batch_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("production_batch_lines.id"), index=True)
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("production_batches.id"), nullable=True)
     approved_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
     held_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rejected_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sampling_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    exception_reason: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    release_decision: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    legacy_clearance: Mapped[bool] = mapped_column(Boolean, default=False)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -87,6 +92,40 @@ class InspectionDefect(Base):
     corrective: Mapped[str | None] = mapped_column(String(400), nullable=True)
     image_doc_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class QcLineBalance(Base):
+    """Approved / held / rejected pieces for one ordinary production colour-size line."""
+    __tablename__ = "qc_line_balances"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    production_line_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("production_order_lines.id"))
+    approved: Mapped[int] = mapped_column(Integer, default=0)
+    held: Mapped[int] = mapped_column(Integer, default=0)
+    rejected: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class QcReservation(Base):
+    """Pieces claimed by an open inspection so a second inspection cannot release them."""
+    __tablename__ = "qc_reservations"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    public_id: Mapped[uuid.UUID] = mapped_column(Uuid, server_default=text("gen_random_uuid()"))
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    inspection_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("inspections.id"))
+    production_line_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    batch_line_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    qty: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(16))
+
+
+class QcCommand(Base):
+    """Idempotency record for start, decision and hold resolution."""
+    __tablename__ = "qc_commands"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    request_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    result: Mapped[str] = mapped_column(Text)
 
 
 class DefectType(Base):

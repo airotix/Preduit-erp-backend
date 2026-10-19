@@ -20,6 +20,17 @@ router = APIRouter(prefix="/catalog", tags=["catalog"])
 read = require_module("catalog", "read")
 write = require_module("catalog", "write")
 inventory_write = require_module("inventory", "write")
+from app.modules.catalog.supplier_pricing import SupplierPricesIn
+
+@router.get("/products/{pid}/supplier-prices")
+def supplier_prices(pid: UUID, p: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    from app.modules.catalog import supplier_pricing
+    return supplier_pricing.detail(db, UUID(str(p.tenant_id)), pid)
+
+@router.post("/products/{pid}/supplier-prices")
+def save_supplier_prices(pid: UUID, payload: SupplierPricesIn, p: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules.catalog import supplier_pricing
+    return supplier_pricing.save(db, UUID(str(p.tenant_id)), pid, payload, p.email)
 shipment_write = require_module("shipments", "write")
 
 

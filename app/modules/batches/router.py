@@ -118,7 +118,7 @@ def complete(batch_id: str, line_id: int, command: dto.Quantity,
 @router.post("/{batch_id}/lines/{line_id}/qc")
 def qc(batch_id: str, line_id: int, command: dto.QC,
        p: Principal = Depends(require_module("quality", "write")), db: Session = Depends(tenant_db)):
-    return service.line_action(db, p.tenant_id, p.user_id or p.email, batch_id, line_id, command, "QC")
+    raise HTTPException(409, "Open the article in Quality and finish its inspection before releasing quantities.")
 
 
 @router.post("/{batch_id}/lines/{line_id}/receive")

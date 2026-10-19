@@ -84,3 +84,43 @@ class PassShipIn(BaseModel):
     """Mark an inspection Passed and ship it (carrier + destination)."""
     carrier: str = Field(min_length=1, max_length=120)
     destination: str = Field(min_length=1, max_length=160)
+
+
+class QcQtyLine(BaseModel):
+    sourceId: int
+    qty: int = Field(ge=0)
+
+
+class StartTask(BaseModel):
+    taskKey: str = Field(min_length=3)
+    requestId: str = Field(min_length=8)
+    stage: Literal["Final", "Inline"]
+    purpose: Literal["awaiting", "held"] = "awaiting"
+    samplingMode: Literal["sample", "full"]
+    sampleSize: int | None = None
+    aql: str = Field(default="2.5", max_length=10)
+    inspector: str | None = Field(default=None, max_length=120)
+    lines: list[QcQtyLine] = []
+
+
+class QcSplitLine(BaseModel):
+    sourceId: int
+    approved: int = Field(ge=0)
+    held: int = Field(ge=0)
+    rejected: int = Field(ge=0)
+
+
+class DecideTask(BaseModel):
+    taskKey: str
+    requestId: str
+    decision: Literal["approve_all", "hold_all", "split", "inline"]
+    exceptionReason: str | None = Field(default=None, max_length=400)
+    allocations: list[QcSplitLine] = []
+
+
+class ResolveTask(BaseModel):
+    taskKey: str
+    requestId: str
+    action: Literal["reinspect", "rework", "reject"]
+    reason: str = Field(default="", max_length=400)
+    lines: list[QcQtyLine] = []

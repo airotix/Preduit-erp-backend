@@ -32,7 +32,9 @@ def pending_shipments(db, tid, *, order_id=None, work_ids=(), lock=False):
         BatchAllocation.tenant_id == tid, BatchAllocation.lot_id.in_(lot_ids))
     inbound_ids = select(InboundAllocation.shipment_id).join(BatchLine, BatchLine.id == InboundAllocation.line_id).where(
         InboundAllocation.tenant_id == tid, BatchLine.batch_id.in_(batch_ids))
-    condition = Shipment.id.in_(shipment_ids) | Shipment.id.in_(inbound_ids)
+    po_ids = select(ProductionOrder.purchase_order_id).where(ProductionOrder.tenant_id == tid,
+        ProductionOrder.id.in_(work_ids), ProductionOrder.purchase_order_id.is_not(None))
+    condition = Shipment.id.in_(shipment_ids) | Shipment.id.in_(inbound_ids) | Shipment.purchase_order_id.in_(po_ids)
     if order_id is not None:
         condition = condition | (Shipment.sales_order_id == order_id)
     query = select(Shipment).where(Shipment.tenant_id == tid,
@@ -139,37 +141,6 @@ def inactive_order(db, *, public_id, reason):
 
 
 def inactive_po(db, *, public_id, reason):
-    reason = _reason(reason)
-    po = db.scalar(select(PurchaseOrder).where(PurchaseOrder.public_id == UUID(str(public_id)),
-        PurchaseOrder.is_deleted.is_(False)))
-    if po is None:
-        return None
-    order = fulfillment.lock_order(db, tenant_id=po.tenant_id, order_id=po.sales_order_id) if po.sales_order_id else None
-    po = db.scalar(select(PurchaseOrder).where(PurchaseOrder.id == po.id).with_for_update().execution_options(populate_existing=True))
-    if po.status == "Inactive":
-        return po
-    if po.status in ("Received", "Rejected", "Cancelled", "Partially received") or po.inventory_received:
-        raise HTTPException(409, "Received or closed POs cannot be made inactive. Reconcile received goods first.")
-    if po.po_no and db.scalar(select(GoodsReceipt.id).where(GoodsReceipt.tenant_id == po.tenant_id,
-            GoodsReceipt.po_ref == po.po_no, GoodsReceipt.is_deleted.is_(False), GoodsReceipt.received_count > 0).limit(1)):
-        raise HTTPException(409, "This PO has received goods. Reconcile its receipt first.")
-    if po.po_no and db.scalar(select(SupplierBill.id).join(PoInvoice, PoInvoice.supplier_bill_id == SupplierBill.id).where(
-            PoInvoice.tenant_id == po.tenant_id, PoInvoice.po_no == po.po_no, PoInvoice.is_deleted.is_(False),
-            SupplierBill.tenant_id == po.tenant_id, SupplierBill.is_deleted.is_(False), SupplierBill.status == "Paid").limit(1)):
-        raise HTTPException(409, "This PO has a paid supplier bill. Resolve its payment before making it inactive.")
-    works = db.scalars(select(ProductionOrder).where(ProductionOrder.tenant_id == po.tenant_id,
-        ProductionOrder.purchase_order_id == po.id, ProductionOrder.is_deleted.is_(False)).with_for_update()).all()
-    received = db.scalar(select(BatchLine.id).join(ProductionBatch, ProductionBatch.id == BatchLine.batch_id).where(
-        BatchLine.tenant_id == po.tenant_id, ProductionBatch.order_id.in_([w.id for w in works]), BatchLine.received > 0).limit(1))
-    if received:
-        raise HTTPException(409, "This PO has warehouse receipts. Reconcile its inventory before withdrawal.")
-    cancel_pending(db, po.tenant_id, pending_shipments(db, po.tenant_id, work_ids=[w.id for w in works], lock=True), reason)
-    stop_work(db, po.tenant_id, works, reason)
-    po.status = "Inactive"
-    db.flush()
-    if order is not None and order.status == "Awaiting stock" and not fulfillment.purchase_orders(db, order):
-        order.status = "PO needed"
-    write_audit(db, tenant_id=po.tenant_id, action="UPDATE", entity_type="purchase_order",
-                entity_id=str(po.public_id), detail=f"Made inactive: {reason}")
-    db.flush()
-    return po
+    # PO withdrawals must use Procurement's impact review. Never cascade a
+    # catalog cleanup into work, stock allocations, or accounting.
+    raise HTTPException(409, "Open this PO in Procurement and review its linked issues before making it inactive.")

@@ -10,6 +10,7 @@ from app.models.base import Base
 
 class Shipment(Base):
     __tablename__ = "shipments"
+    purchase_order_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("purchase_orders.id"), nullable=True)
     packed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     packed_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
     batch_managed: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -25,6 +26,10 @@ class Shipment(Base):
     order_ref: Mapped[str | None] = mapped_column(String(40), nullable=True)
     carrier: Mapped[str | None] = mapped_column(String(120), nullable=True)
     destination: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    origin: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    tracking_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    dispatch_on: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    legacy_ambiguous: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(24), default="Label created")
     eta: Mapped[str | None] = mapped_column(String(40), nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -45,6 +50,7 @@ class Carrier(Base):
 
 class ShipmentLine(Base):
     __tablename__ = "shipment_lines"
+    po_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("purchase_order_lines.id"), nullable=True)
     order_line_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("sales_order_lines.id"), nullable=True)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(Uuid)
@@ -52,3 +58,9 @@ class ShipmentLine(Base):
     sku: Mapped[str | None] = mapped_column(String(64), nullable=True)
     description: Mapped[str] = mapped_column(String(200))
     qty: Mapped[int] = mapped_column(Integer, default=0)
+    delivered_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    discrepancy_qty: Mapped[int] = mapped_column(Integer, default=0)
+    discrepancy_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    discrepancy_reason: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    discrepancy_resolved_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    discrepancy_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

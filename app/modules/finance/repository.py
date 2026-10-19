@@ -6,6 +6,7 @@ from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.models.catalog import Category, Product
+from app.models.supplier_returns import SupplierReturn
 from app.models.finance import (
     Account, BankAccount, BankTransaction, BudgetLine, CreditNote, FiscalPeriod,
     FixedAsset, JournalEntry, JournalLine, LedgerEntry, Payment, SupplierBill,
@@ -494,6 +495,7 @@ def _supplier_entries(session: Session, supplier_id: int, supplier_name: str | N
     """Ledger entries for a supplier. Match bills/payments by supplier_id OR name
     (mirrors the customer side) so the party-list balance matches the statement."""
     entries: list[dict] = []
+    entries.extend(supplier_return_entries(session, supplier_id))
     bill_match = [SupplierBill.supplier_id == supplier_id]
     pay_match = [and_(Payment.party_type == "supplier", Payment.party_id == supplier_id)]
     if supplier_name:
@@ -851,7 +853,7 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
         )
     ).scalars().all()
     debit_by_bill: dict[str, float] = {}
-    extras: list[dict] = []
+    extras: list[dict] = supplier_return_entries(session, s.id)
     for p in disbursements:
         alloc = (p.allocated_to or "").strip()
         amt = float(p.amount or 0)
@@ -877,7 +879,8 @@ def supplier_statement(session: Session, *, public_id: str) -> dict | None:
     bill_rows = []
     for b in bills:
         amt = float(b.amount or 0)
-        applied = round(debit_by_bill.get(b.bill_no or "", 0.0), 2)
+        applied = disbursements_applied_to_bill(session, bill_no=b.bill_no,
+            supplier_id=b.supplier_id, supplier_name=b.supplier_name)
         bill_rows.append({
             "date": b.issued_date or b.due_on, "ref": b.bill_no or "BILL",
             "desc": b.memo or b.po_ref or "Supplier bill",
@@ -920,7 +923,28 @@ def disbursements_applied_to_bill(session: Session, *, bill_no: str | None,
             Payment.allocated_to == bill_no, or_(*party),
         )
     ).scalar_one()
-    return float(total or 0)
+    return float(total or 0) + supplier_credits_applied(session, bill_no)
+
+
+def supplier_credits_applied(session, bill_no):
+    return float(session.scalar(select(func.coalesce(func.sum(SupplierReturn.amount), 0))
+        .join(SupplierBill, SupplierBill.id == SupplierReturn.supplier_bill_id).where(
+            SupplierBill.bill_no == bill_no, SupplierReturn.credit_journal_id.is_not(None))) or 0)
+
+
+def supplier_return_entries(session, supplier_id):
+    entries = []
+    for ret in session.scalars(select(SupplierReturn).join(SupplierBill,
+            SupplierBill.id == SupplierReturn.supplier_bill_id).where(
+            SupplierBill.supplier_id == supplier_id, SupplierReturn.credit_journal_id.is_not(None))).all():
+        entries.append({'date': ret.credit_on, 'ref': f'SR-{ret.id}',
+            'desc': f'Supplier credit {ret.credit_reference}', 'debit': float(ret.amount), 'credit': 0.0,
+            'editType': None, 'editId': None, 'paymentType': None})
+        if ret.refund_journal_id:
+            entries.append({'date': ret.refund_on, 'ref': f'SR-{ret.id}',
+                'desc': f'Supplier refund {ret.refund_reference}', 'debit': 0.0, 'credit': float(ret.amount),
+                'editType': None, 'editId': None, 'paymentType': ret.refund_channel})
+    return entries
 
 
 # ---------- Profitability ----------
@@ -1047,6 +1071,14 @@ def reverse_journal(session: Session, *, public_id: str) -> JournalEntry | None:
     ).scalar_one_or_none()
     if src is None:
         return None
+    linked_return = session.scalar(select(SupplierReturn.id).where(
+        (SupplierReturn.credit_journal_id == src.id) | (SupplierReturn.refund_journal_id == src.id)).limit(1))
+    linked_bill = session.scalar(select(SupplierReturn.id).join(SupplierBill,
+        SupplierBill.id == SupplierReturn.supplier_bill_id).where(SupplierBill.gl_journal_id == src.id,
+        SupplierReturn.credit_journal_id.is_not(None)).limit(1))
+    if linked_return or linked_bill:
+        from fastapi import HTTPException
+        raise HTTPException(409, "This journal is linked to a supplier return. Reconcile the linked return and its Finance history before a correction; a standalone reversal would leave the payable inconsistent.")
     lines = session.execute(
         select(JournalLine).where(JournalLine.entry_id == src.id)
     ).scalars().all()

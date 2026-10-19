@@ -7,6 +7,7 @@ from app.core.security import Principal, require_module
 from app.modules.shipments import service
 from app.modules.shipments import packing
 from uuid import UUID
+from app.modules.shipments.actions import ActionBody, PrepareBody
 from app.modules.shipments.dto import (
     CarrierCreate, CarrierUpdate, ShipmentCreate, ShipmentUpdate, StatusUpdate,
 )
@@ -37,6 +38,36 @@ def create_shipment(payload: ShipmentCreate, principal: Principal = Depends(writ
                     db: Session = Depends(tenant_db)):
     s = service.create_shipment(db, tenant_id=principal.tenant_id, payload=payload)
     return {"public_id": str(s.public_id), "shipment_no": s.shipment_no}
+
+
+@router.get("/workspace")
+def shipment_workspace(view: str = Query("active"), direction: str = Query(""), party: str = Query(""),
+                       source: str = Query(""), status: str = Query(""),
+                       principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    from app.modules.shipments import workspace
+    return workspace.load(db, tenant_id=principal.tenant_id, view=view, direction=direction,
+        party=party, source=source, status=status)
+
+
+@router.post("/prepare", status_code=status.HTTP_201_CREATED)
+def prepare_shipment(payload: PrepareBody, principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules.inventory.workflows import atomic
+    from app.modules.shipments.actions import prepare
+    return atomic(db, prepare, UUID(str(principal.tenant_id)), principal.email, payload)
+
+
+@router.get("/shipments/{public_id}/actions")
+def shipment_actions(public_id: UUID, principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
+    from app.modules.shipments.actions import state
+    return state(db, UUID(str(principal.tenant_id)), public_id)
+
+
+@router.post("/shipments/{public_id}/actions")
+def run_shipment_action(public_id: UUID, payload: ActionBody, principal: Principal = Depends(write),
+                        db: Session = Depends(tenant_db)):
+    from app.modules.inventory.workflows import atomic
+    from app.modules.shipments.actions import perform
+    return atomic(db, perform, UUID(str(principal.tenant_id)), principal.email, public_id, payload)
 
 
 @router.post("/shipments/{public_id}/status")

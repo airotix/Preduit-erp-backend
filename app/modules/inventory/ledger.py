@@ -60,6 +60,8 @@ def serialize(entry, variant):
                   ("sales", "order"): "/sales/orders/",
                   ("inventory", "return"): "/inventory/returns/",
                   ("inventory", "stocktake"): "/inventory/stocktakes/"}.get((entry.source_module, entry.source_type))
+        if (entry.source_module, entry.source_type) == ("procurement", "supplier_return"):
+            href = "/procurement/returns"
         if prefix:
             href = prefix + str(entry.source_id)
     return {"id": str(entry.public_id), "receiptId": str(entry.request_id),

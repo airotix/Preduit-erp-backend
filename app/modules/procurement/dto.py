@@ -1,5 +1,6 @@
 """Procurement API contracts — match the frontend forms."""
 from decimal import Decimal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -14,13 +15,40 @@ class POLineIn(BaseModel):
     size: str | None = Field(default=None, max_length=60)
     sku: str | None = Field(default=None, max_length=64)
     qty: int = Field(gt=0)
-    price: Decimal = Field(ge=0)
+    price: Decimal | None = Field(default=None, ge=0)  # canonical price is read from Catalog
 
 
 class PurchaseOrderCreate(BaseModel):
     supplier: str = Field(min_length=1, max_length=200)
+    supplierId: UUID | None = None
     expected: str = Field(min_length=1, max_length=40)
     lines: list[POLineIn] = Field(min_length=1)
+
+    @field_validator("expected")
+    @classmethod
+    def expected_date(cls, value):
+        from app.modules.procurement.performance import iso_date
+        if iso_date(value) is None:
+            raise ValueError("Expected delivery must be a complete date in YYYY-MM-DD format")
+        return value
+
+
+class SupplierPOLineIn(POLineIn):
+    supplierId: UUID
+
+
+class GroupedPurchaseOrderCreate(BaseModel):
+    requestId: UUID
+    expected: str = Field(min_length=1, max_length=40)
+    lines: list[SupplierPOLineIn] = Field(min_length=1, max_length=1000)
+
+    @field_validator("expected")
+    @classmethod
+    def expected_date(cls, value):
+        from app.modules.procurement.performance import iso_date
+        if iso_date(value) is None:
+            raise ValueError("Expected delivery must be a complete date in YYYY-MM-DD format")
+        return value
 
 
 class GoodsReceiptCreate(WarehouseReceiptCreate):
@@ -68,3 +96,17 @@ class SupplierUpdate(SupplierCreate):
 class StatusUpdate(BaseModel):
     status: str = Field(min_length=1, max_length=24)
     reason: str | None = Field(default=None, max_length=400)
+    reviewToken: str | None = Field(default=None, max_length=64)
+    acknowledged: bool = False
+
+
+class ResolveImpact(BaseModel):
+    key: str = Field(min_length=3, max_length=80)
+    reason: str = Field(min_length=3, max_length=400)
+
+
+class POExpectedUpdate(BaseModel):
+    expected: str = Field(min_length=1, max_length=40)
+    reason: str = Field(min_length=3, max_length=400)
+    reviewToken: str = Field(min_length=64, max_length=64)
+    acknowledged: bool = False

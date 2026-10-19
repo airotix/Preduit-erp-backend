@@ -7,7 +7,7 @@ from app.core.security import Principal, require_module
 from app.modules.production import service
 from app.modules.production.dto import (
     BomCreate, BomUpdate, ProductionOrderCreate, ShipOrderIn, StageAssignIn,
-    StageExtendIn, StageNotesIn, StartProductionIn, StatusUpdate,
+    StageExtendIn, StageNotesIn, StartProductionIn, StatusUpdate, StopProductionIn,
 )
 
 router = APIRouter(prefix="/production", tags=["production"])
@@ -81,6 +81,13 @@ def start_production(public_id: str, payload: StartProductionIn,
     if po is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Production order not found")
     return {"public_id": str(po.public_id), "stage": po.stage}
+
+
+@router.post("/porders/{public_id}/stop")
+def stop_production(public_id: str, payload: StopProductionIn,
+                    principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules.production import withdrawal
+    return withdrawal.stop(db, principal.tenant_id, public_id, payload.reason, principal.email)
 
 
 @router.post("/porders/{public_id}/inspect")

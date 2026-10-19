@@ -49,7 +49,14 @@ def list_products(session: Session, *, limit: int, offset: int) -> tuple[list[di
     """Return (rows, total). Each row aggregates its variants."""
     saleable = ProductVariant.color_id.is_not(None) & ProductVariant.size_id.is_not(None)
     def saleable_min(column):
-        return func.min(case((saleable, column)))
+        # New drafts store their starting prices on a seed variant. Show those
+        # until real variants exist; never hide missing real-variant prices by
+        # falling back to an unrelated seed after the matrix has been saved.
+        return case(
+            (func.count(case((saleable, 1))) > 0, func.min(case((saleable, column)))),
+            (Product.status == "Draft", func.min(column)),
+            else_=None,
+        )
     v_count = func.count(ProductVariant.id)
     v_min = saleable_min(ProductVariant.price)
     v_ccy = func.min(ProductVariant.currency_code)

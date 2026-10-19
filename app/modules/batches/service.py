@@ -215,6 +215,9 @@ def stage(db, tid, actor, batch_id, stage_id, command):
     stages = rows(db, BatchStage, tid, BatchStage.batch_id == batch.id)
     found = next((s for s in stages if s.id == stage_id), None)
     if found is None: raise HTTPException(404, "Batch stage not found")
+    if found.status == "Pending":
+        from app.modules.production.approval import require_approved_po
+        require_approved_po(db, work)
     if found.name == "Tech Pack": raise HTTPException(409, "Upload the article's tech pack to receive this stage")
     if found.status == "Completed" and command.status != "Completed":
         raise HTTPException(409, "A completed stage cannot be reopened")
@@ -237,6 +240,8 @@ def start_style(db, tid, actor, batch_id, command):
     batch, work, lines = locked_batch(db, tid, batch_id)
     prior, payload = begin(db, tid, command, "Start batch style", batch_id)
     if prior is not None: return prior
+    from app.modules.production.approval import require_approved_po
+    require_approved_po(db, work)
     if batch.status == "Cancelled": raise HTTPException(409, "This batch is cancelled")
     source_lines = [db.get(PurchaseOrderLine, line.po_line_id) for line in lines]
     if command.productionLineId not in {source.production_line_id for source in source_lines}:
@@ -286,6 +291,9 @@ def stage_action(db, tid, actor, batch_id, stage_id, action, command):
     all_stages = rows(db, BatchStage, tid, BatchStage.batch_id == batch.id)
     found = next((stage for stage in all_stages if stage.id == stage_id), None)
     if found is None: raise HTTPException(404, "Batch stage not found")
+    if action in ("start", "complete"):
+        from app.modules.production.approval import require_approved_po
+        require_approved_po(db, work)
     if found.name == "Tech Pack":
         raise HTTPException(409, "Upload the article's tech pack to receive this stage")
     if found.status in ("Completed", "Received"):
@@ -334,6 +342,8 @@ def line_action(db, tid, actor, batch_id, line_id, command, action):
     if line is None: raise HTTPException(404, "Batch variant not found")
     active_article(db, line)
     if action == "Complete production":
+        from app.modules.production.approval import require_approved_po
+        require_approved_po(db, work)
         from app.modules.batches.workflow import style_complete
         if not style_complete(db, tid, line):
             raise HTTPException(409, "Complete this style's production stages first")
@@ -490,6 +500,8 @@ def create_shipment(db, tid, actor, order_id, kind, command):
             source = stock_sources[a.reservationId]
             remaining[source["lineId"]] -= a.qty
         if any(q < 0 for q in remaining.values()): raise HTTPException(409, "Shipment exceeds remaining customer demand")
+        if not order.allow_partial_shipments and any(q > 0 for q in remaining.values()):
+            raise HTTPException(409, "This order must ship complete. Include every remaining unit.")
     if not command.carrier.strip() or not command.destination.strip():
         raise HTTPException(400, "Enter carrier and destination")
     ship = Shipment(tenant_id=uid(tid), sales_order_id=sales_id, batch_managed=True,
@@ -580,8 +592,12 @@ def shipment_status(db, tid, public_id, status, actor=None):
         raise HTTPException(409, "Shipment status cannot move backwards")
     if status == "Cancelled" and any(a.status == "Dispatched" for a in allocations + stock_allocations):
         raise HTTPException(409, "Dispatched stock requires a recorded return; it cannot be cancelled")
+    if status == "Delivered":
+        raise HTTPException(409, "Confirm customer delivery on the shipment, with the quantities that arrived. Delivery does not deduct warehouse stock again.")
     if ship.status == "Pending" and status not in ("In transit", "Cancelled"):
         raise HTTPException(409, "Confirm dispatch before recording delivery progress")
+    if status == "In transit" and ship.status == "Pending" and ship.direction != "Inbound" and not ship.packed_at:
+        raise HTTPException(409, "Confirm packing before dispatch.")
     lots = {l.id: l for l in rows(db, BatchLot, tid, BatchLot.id.in_([a.lot_id for a in allocations]), lock=True)}
     for a in allocations:
         if a.status != "Reserved": continue
@@ -826,7 +842,8 @@ def receive_stock(db, tid, work, line, qty, location_id, actor=None, request_id=
     else: db.add(BatchLot(tenant_id=uid(tid), line_id=line.id, location_id=location[0].id, on_hand=qty))
     line.received += qty
     receipt = GoodsReceipt(tenant_id=uid(tid), po_ref=po.po_no, supplier_name=po.supplier_name,
-        line_count=1, received_count=qty, status="Received", location=location[0].name)
+        line_count=1, received_count=qty, status="Received", location=location[0].name,
+        location_id=location[0].id, received_on=date.today())
     db.add(receipt); db.flush(); receipt.grn_no = f"GRN-{3000 + receipt.id}"
     from app.modules.inventory import ledger
     ledger.record(db, level=level, before=level.on_hand-qty, kind="Receipt",
@@ -834,7 +851,7 @@ def receive_stock(db, tid, work, line, qty, location_id, actor=None, request_id=
         actor=actor, source_module="procurement", source_type="receipt", source_id=receipt.public_id,
         batch_id=db.get(ProductionBatch, line.batch_id).public_id)
     db.add(GoodsReceiptLine(tenant_id=uid(tid), grn_id=receipt.id, name=source.name,
-        sku=source.sku, ordered=source.qty, received=qty))
+        sku=source.sku, ordered=source.qty, received=qty, po_line_id=source.id, variant_id=source.variant_id))
     all_sources = rows(db, PurchaseOrderLine, tid, PurchaseOrderLine.po_id == po.id)
     all_lines = rows(db, BatchLine, tid, BatchLine.po_line_id.in_([s.id for s in all_sources]))
     if sum(l.received for l in all_lines) >= sum(s.qty for s in all_sources):
@@ -843,3 +860,4 @@ def receive_stock(db, tid, work, line, qty, location_id, actor=None, request_id=
     else:
         po.status = "Partially received"
     db.flush()
+    return receipt

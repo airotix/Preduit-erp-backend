@@ -30,8 +30,14 @@ def label(session, variant):
 def options(session, tid):
     from app.models.core import User
     from app.core.roles import permissions_for, has_permission
+    from app.models.supplier_pricing import SupplierPrice
+    supplier_ids = {}
+    for vid, pid in session.execute(select(SupplierPrice.variant_id, Supplier.public_id).join(Supplier,
+            Supplier.id == SupplierPrice.supplier_id).where(SupplierPrice.tenant_id == tid, Supplier.tenant_id == tid,
+            SupplierPrice.active.is_(True), Supplier.is_deleted.is_(False))):
+        supplier_ids.setdefault(vid, []).append(str(pid))
     return {
-        "variants": [{"id": str(v.public_id), "label": label(session, v)} for v in session.scalars(
+        "variants": [{"id": str(v.public_id), "label": label(session, v), "supplierIds": supplier_ids.get(v.id, [])} for v in session.scalars(
             select(ProductVariant).join(Product, Product.id == ProductVariant.product_id).where(
                 ProductVariant.tenant_id == tid, Product.tenant_id == tid,
                 Product.is_deleted.is_(False), ProductVariant.status != "Archived").order_by(ProductVariant.sku))],
@@ -52,6 +58,8 @@ def save_rule(session, tid, payload):
         raise HTTPException(409, "Choose an active catalog variant")
     loc = get(session, Location, tid, payload.locationId)
     supplier = get(session, Supplier, tid, payload.supplierId)
+    from app.modules.catalog.supplier_pricing import agreed_price
+    agreed_price(session, tid, v, supplier.id)
     r = session.scalar(select(ReplenishmentRule).where(ReplenishmentRule.tenant_id == tid,
         ReplenishmentRule.variant_id == v.id, ReplenishmentRule.location_id == loc.id).with_for_update())
     if r is None:
@@ -97,6 +105,7 @@ def incoming(session, tid):
 
 
 def plan(session, tid):
+    from app.models.supplier_pricing import SupplierPrice
     arrivals = incoming(session, tid)
     rows = []
     for rule in session.scalars(select(ReplenishmentRule).where(ReplenishmentRule.tenant_id == tid).order_by(ReplenishmentRule.id)):
@@ -110,7 +119,9 @@ def plan(session, tid):
         pending = [p for p in arrivals if p["variant"] == v.id]
         assigned = sum(p["quantity"] for p in pending if p["location"] == loc.id)
         unassigned = sum(p["quantity"] for p in pending if p["location"] is None)
-        enabled = rule.active and not product.is_deleted and product.status == "Active" and not loc.is_deleted and not supplier.is_deleted and v.status != "Archived"
+        quote = session.scalar(select(SupplierPrice).where(SupplierPrice.tenant_id == tid,
+            SupplierPrice.variant_id == v.id, SupplierPrice.supplier_id == supplier.id, SupplierPrice.active.is_(True)))
+        enabled = bool(quote) and rule.active and not product.is_deleted and product.status == "Active" and not loc.is_deleted and not supplier.is_deleted and v.status != "Archived"
         shortage = max(0, rule.target - available - assigned) if enabled and available + assigned <= rule.minimum else 0
         suggested = math.ceil(max(shortage, rule.minimum_order) / rule.pack_multiple) * rule.pack_multiple if shortage else 0
         rows.append({"id": str(rule.public_id), "variantId": str(v.public_id), "label": label(session, v),
@@ -119,6 +130,8 @@ def plan(session, tid):
             "minimumOrder": rule.minimum_order, "packMultiple": rule.pack_multiple, "active": rule.active,
             "available": available, "incoming": assigned, "unassigned": unassigned, "suggested": suggested,
             "enabled": enabled, "expected": (date.today() + timedelta(days=rule.lead_days)).isoformat()})
+        rows[-1]["priceConfigured"] = bool(quote)
+        rows[-1]["catalogHref"] = f"/catalog/products/{product.public_id}"
     return {"rules": rows, "unassigned": [{k: value for k, value in p.items() if k != "variant"} for p in arrivals if p["location"] is None]}
 
 
@@ -151,10 +164,8 @@ def create_po(session, tid, pid, payload):
         raise HTTPException(409, "Assign outstanding incoming POs to a warehouse before creating more stock")
     if not row["suggested"] or not row["enabled"]:
         raise HTTPException(409, "This warehouse no longer needs replenishment")
-    if v.supplier_price is None or v.supplier_price <= 0:
-        raise HTTPException(409, "Set the variant's supplier price in Catalog first")
-    if v.currency_code != "EUR":
-        raise HTTPException(409, "Replenishment POs currently use EUR; set a supplier price in EUR before creating this proposal")
+    from app.modules.catalog.supplier_pricing import agreed_price
+    price = agreed_price(session, tid, v, rule.supplier_id)
     from app.modules.procurement.dto import PurchaseOrderCreate, POLineIn
     from app.modules.procurement.service import create_po as purchase
     product = session.get(Product, v.product_id)
@@ -162,9 +173,9 @@ def create_po(session, tid, pid, payload):
     size = session.get(AttributeValue, v.size_id) if v.size_id else None
     supplier = session.get(Supplier, rule.supplier_id)
     po = purchase(session, tenant_id=tid, resolved_supplier=supplier, payload=PurchaseOrderCreate(
-        supplier=supplier.name, expected=row["expected"], lines=[POLineIn(name=product.title,
+        supplier=supplier.name, supplierId=supplier.public_id, expected=row["expected"], lines=[POLineIn(name=product.title,
             color=color.value if color else None, size=size.value if size else None,
-            sku=v.sku, qty=row["suggested"], price=v.supplier_price)]))
+            sku=v.sku, qty=row["suggested"], price=price)]))
     po.incoming_location_id, po.replenishment_rule_id, po.replenishment_request_id = rule.location_id, rule.id, payload.requestId
     for line in session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.tenant_id == tid, PurchaseOrderLine.po_id == po.id)):
         line.variant_id = v.id

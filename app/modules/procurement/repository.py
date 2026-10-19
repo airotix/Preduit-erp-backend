@@ -135,6 +135,7 @@ def list_pos_for_board(session: Session) -> list[dict]:
 
 def create_po(session: Session, *, tenant_id: UUID, supplier: Supplier | None,
               supplier_name: str, expected: str, lines: list[dict]) -> PurchaseOrder:
+    from app.modules.procurement.performance import iso_date
     item_count = sum(int(l["qty"]) for l in lines)
     total = sum((Decimal(str(l["price"])) * int(l["qty"]) for l in lines), Decimal("0"))
     po = PurchaseOrder(
@@ -143,6 +144,7 @@ def create_po(session: Session, *, tenant_id: UUID, supplier: Supplier | None,
         supplier_name=supplier_name,
         supplier_country=supplier.country_code if supplier else None,
         item_count=item_count, total=total, expected=expected, status="Pending approval",
+        original_due_on=iso_date(expected), due_baseline_recorded=True,
     )
     session.add(po)
     session.flush()
@@ -152,6 +154,7 @@ def create_po(session: Session, *, tenant_id: UUID, supplier: Supplier | None,
         price = Decimal(str(l["price"]))
         session.add(PurchaseOrderLine(
             tenant_id=tenant_id, po_id=po.id, name=l["name"], color=l.get("color"),
+            variant_id=l.get("variant_id"),
             size=l.get("size"), sku=l.get("sku"), qty=qty, price=price,
             line_total=price * qty,
         ))
@@ -363,7 +366,7 @@ def get_supplier_detail(session: Session, *, public_id: str) -> dict | None:
         .order_by(PurchaseOrder.id.desc())
     )]
     ytd = sum((p["total"] or 0) for p in pos)
-    open_pos = sum(1 for p in pos if p["status"] in ("Pending approval", "Approved"))
+    open_pos = sum(1 for p in pos if p["status"] in ("Pending approval", "Approved", "Partially received"))
     return {"supplier": supplier, "pos": pos, "ytd": ytd, "open_pos": open_pos}
 
 

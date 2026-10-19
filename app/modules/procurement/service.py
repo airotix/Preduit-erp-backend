@@ -4,6 +4,7 @@ import datetime
 import json
 import uuid
 from uuid import UUID
+from decimal import Decimal, ROUND_HALF_UP
 from fastapi import HTTPException
 
 from sqlalchemy import select
@@ -61,7 +62,7 @@ def amount_in_words(amount: float, currency: str = "USD") -> str:
     return words + " only"
 
 
-_PO_TONE = {"Pending approval": "amber", "Approved": "green", "Rejected": "red", "Received": "green", "Partially received": "amber", "Inactive": "gray"}
+_PO_TONE = {"Pending approval": "amber", "Approved": "green", "Rejected": "red", "Received": "green", "Partially received": "amber", "Inactive": "gray", "Cancelled": "red"}
 _GRN_TONE = {"Complete": "green", "Received": "green", "Partial": "amber", "Expected": "neutral"}
 _SUP_TONE = {"Preferred": "green", "On watch": "amber", "New": "neutral", "Suspended": "red"}
 
@@ -126,34 +127,26 @@ def create_po(session: Session, *, tenant_id: str | UUID, payload: PurchaseOrder
     tid = _tid(tenant_id)
     from app.modules.catalog.lifecycle import ensure_new_lines_orderable
     ensure_new_lines_orderable(session, tenant_id=tid, lines=payload.lines)
-    supplier = resolved_supplier or repo.find_supplier(session, name=payload.supplier)
+    if payload.supplierId:
+        supplier = session.scalar(select(Supplier).where(Supplier.tenant_id == tid,
+            Supplier.public_id == payload.supplierId, Supplier.is_deleted.is_(False)))
+        if supplier is None:
+            raise HTTPException(404, "Supplier not found")
+        if resolved_supplier and resolved_supplier.id != supplier.id:
+            raise HTTPException(409, "Supplier selections disagree")
+    else:
+        supplier = resolved_supplier or repo.find_supplier(session, name=payload.supplier)
     if supplier is not None and (supplier.tenant_id != tid or supplier.is_deleted):
         raise HTTPException(404, "Supplier not found")
     if supplier is None:
-        # Auto-register an unknown supplier so it appears in the Suppliers tab and
-        # on the supplier ledger — mirrors how a new customer is created on order.
-        supplier = repo.create_supplier(session, tenant_id=tid, name=payload.supplier,
-                                        region=None, lead_time=None, category=None)
-    lines = [{"name": l.name, "color": l.color, "size": l.size, "sku": l.sku, "qty": l.qty, "price": l.price}
-             for l in payload.lines]
+        raise HTTPException(409, "Save the supplier and its article prices in Catalog before creating a PO")
+    from app.modules.catalog.supplier_pricing import po_lines
+    lines = po_lines(session, tid, supplier, payload.lines)
     po = repo.create_po(
-        session, tenant_id=tid, supplier=supplier, supplier_name=payload.supplier,
+        session, tenant_id=tid, supplier=supplier, supplier_name=supplier.name,
         expected=payload.expected, lines=lines,
     )
     # The PO and its production work are committed together by tenant_db.
-    from app.models.procurement import PurchaseOrderLine
-    from app.modules.sales.fulfillment import variant_for
-    from types import SimpleNamespace
-    for line in session.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.tenant_id == tid,
-            PurchaseOrderLine.po_id == po.id)):
-        try:
-            variant = variant_for(session, SimpleNamespace(tenant_id=tid), line)
-            line.variant_id = variant.id if variant else None
-        except HTTPException:
-            # Existing custom PO lines remain supported; the warehouse must
-            # resolve those variants before receipt.
-            pass
-    session.flush()
     from app.modules.production import service as prod_service
     prod_service.create_for_purchase_order(session, tenant_id=tid, purchase_order=po)
     # Invoice generation creates/reuses and posts the payable atomically.
@@ -170,6 +163,8 @@ def ensure_po_invoice(session, *, tenant_id, po_id):
         PurchaseOrder.tenant_id == tid, PurchaseOrder.is_deleted.is_(False)).with_for_update())
     if po is None:
         raise HTTPException(404, "Purchase order not found")
+    if po.status in ("Cancelled", "Rejected", "Inactive"):
+        return False
     existing = session.scalar(select(PoInvoice).where(PoInvoice.tenant_id == tid,
         PoInvoice.po_no == po.po_no, PoInvoice.is_deleted.is_(False)).limit(1))
     if existing is not None:
@@ -191,7 +186,7 @@ def generate_missing_invoices(session, *, tenant_id):
         PoInvoice.po_no == PurchaseOrder.po_no, PoInvoice.is_deleted.is_(False),
         PoInvoice.supplier_bill_id.is_(None)).exists()
     ids = session.scalars(select(PurchaseOrder.id).where(PurchaseOrder.tenant_id == tid,
-        PurchaseOrder.is_deleted.is_(False), (~exists) | unlinked).order_by(PurchaseOrder.id)).all()
+        PurchaseOrder.is_deleted.is_(False), PurchaseOrder.status.not_in(["Cancelled", "Rejected", "Inactive"]), (~exists) | unlinked).order_by(PurchaseOrder.id)).all()
     generated = sum(ensure_po_invoice(session, tenant_id=tid, po_id=po_id) for po_id in ids)
     return {"generated": generated}
 
@@ -225,6 +220,7 @@ def po_detail(session: Session, *, public_id: str) -> dict | None:
         "meta": [
             {"k": "Supplier", "v": po.supplier_name},
             {"k": "Expected", "v": po.expected or "—"},
+            {"k": "Original delivery date", "v": po.original_due_on.isoformat() if po.original_due_on else "Not captured"},
             {"k": "Items", "v": str(po.item_count)},
             {"k": "Total", "v": _po_money(po.total)},
         ],
@@ -318,53 +314,26 @@ def create_receipt(session: Session, *, tenant_id: str | UUID, payload: GoodsRec
         payload=payload, actor=actor)
 
 
-def set_po_status(session, *, public_id, status, tenant_id=None, reason=None):
-    from fastapi import HTTPException
-    from app.models.procurement import PurchaseOrder
-    if status == "Inactive":
-        from app.modules.catalog.commitments import inactive_po
-        return inactive_po(session, public_id=public_id, reason=reason)
-    data = repo.get_po_detail(session, public_id=public_id)
-    order = None
-    if data:
-        source = data["po"]
-        # Match receipt lock order: sales order, PO, then production/stock.
-        if source.sales_order_id:
-            from app.modules.sales import fulfillment
-            order = fulfillment.lock_order(session, tenant_id=source.tenant_id, order_id=source.sales_order_id)
-        source = session.scalar(select(PurchaseOrder).where(PurchaseOrder.id == source.id,
-            PurchaseOrder.tenant_id == source.tenant_id).with_for_update()
-            .execution_options(populate_existing=True))
-        if source.status == "Inactive":
-            raise HTTPException(409, "An inactive PO cannot be reopened.")
-        if source.status == "Rejected" and status != "Rejected":
-            raise HTTPException(409, "Rejected POs cannot be reopened. Create a replacement PO.")
-        if status == "Rejected" and (source.inventory_received or source.status in ("Received", "Partially received")):
-            raise HTTPException(409, "A received PO cannot be rejected.")
-        if source.status == "Partially received" and status != "Partially received":
-            raise HTTPException(409, "This PO has partial warehouse receipts. Receive the outstanding quantities in Inventory.")
-        if status in ("Rejected", "Received"):
-            from app.models.batches import BatchLine, ProductionBatch
-            from app.models.production import ProductionOrder
-            if session.scalar(select(BatchLine.id).join(ProductionBatch, ProductionBatch.id == BatchLine.batch_id)
-                    .join(ProductionOrder, ProductionOrder.id == ProductionBatch.order_id).where(BatchLine.tenant_id == source.tenant_id,
-                        ProductionOrder.purchase_order_id == source.id, BatchLine.completed > 0).limit(1)):
-                raise HTTPException(409, "Reconcile batch production and receipts before changing this PO status.")
-    if data and status == "Received" and not data["po"].inventory_received:
-        raise HTTPException(409, "Confirm physical receipt in Inventory after final QC to receive this PO.")
-    po = repo.set_po_status(session, public_id=public_id, status=status)
-    if po is not None and status == "Rejected":
-        from app.modules.production.service import cancel_for_purchase_order
-        cancel_for_purchase_order(session, po)
-        if order is not None:
-            from app.modules.sales import fulfillment
-            fulfillment.refresh_order(session, order)
-    # On approval, auto-generate the commercial invoice for the PO (once) so it
-    # shows up in the Invoices list immediately.
-    if po is not None and status == "Approved" and tenant_id is not None:
-        ensure_po_invoice(session, tenant_id=tenant_id, po_id=po.id)
+def set_po_status(session, *, public_id, status, tenant_id=None, reason=None,
+                  review_token=None, acknowledged=False, actor_id=None):
+    from app.modules.procurement import changes
+    from app.modules.sales import fulfillment
+    po = changes.get_po(session, public_id, tenant_id)
+    # Keep the receipt lock ordering: sales order, then PO.
+    if po.sales_order_id:
+        fulfillment.lock_order(session, tenant_id=po.tenant_id, order_id=po.sales_order_id)
+    po = changes.get_po(session, public_id, tenant_id, lock=True)
+    if status in changes.CLOSED:
+        return changes.confirm(session, po, status=status, reason=reason,
+            review_token=review_token, acknowledged=acknowledged, actor_id=actor_id)
+    if po.status == status:
+        return po
+    if status != "Approved" or po.status != "Pending approval":
+        raise HTTPException(409, "Only pending POs can be approved. Use the impact review to withdraw a PO; receipt status is controlled by Inventory.")
+    po.status = "Approved"
+    session.flush()
+    ensure_po_invoice(session, tenant_id=tenant_id, po_id=po.id)
     return po
-
 
 def set_receipt_status(session, *, public_id, status):
     from fastapi import HTTPException
@@ -380,13 +349,15 @@ def set_receipt_status(session, *, public_id, status):
 
 def suppliers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
     rows, total = repo.list_suppliers(session, limit=limit, offset=offset)
+    from app.modules.procurement.performance import metrics_for
+    metrics = metrics_for(session, [r['public_id'] for r in rows])
     grid = [
         [
             text_cell(r["name"], avatar=True, sub=r["category"] or ""),
             r["region"] or "—",
             r["lead_time"] or "—",
-            text_cell(f"{r['on_time_pct']}%", align="right", mono=True),
-            text_cell(_num(r["score"]), align="right", mono=True, strong=True),
+            text_cell(_performance_percent(metrics[str(r['public_id'])]['onTimePct']), align="right", mono=True),
+            text_cell(str(metrics[str(r['public_id'])]['overdue']), align="right", mono=True, strong=True),
             text_cell(r["status"], badge=_SUP_TONE.get(r["status"], "neutral")),
         ]
         for r in rows
@@ -394,7 +365,7 @@ def suppliers_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
     return list_config(
         columns=[
             {"label": "Supplier"}, {"label": "Region"}, {"label": "Lead time"},
-            {"label": "On-time", "align": "right"}, {"label": "Score", "align": "right"},
+            {"label": "On-time", "align": "right"}, {"label": "Overdue POs", "align": "right"},
             {"label": "Status"},
         ],
         rows=grid, total=total,
@@ -447,15 +418,20 @@ def update_supplier(session: Session, *, public_id: str, payload: SupplierUpdate
 
 # ---------- Vendor scorecards ----------
 
+def _performance_percent(value):
+    return f'{value:g}%' if value is not None else '—'
+
 def scorecard_screen(session: Session, *, limit: int = 50, offset: int = 0) -> dict:
     rows, total = repo.list_suppliers(session, limit=limit, offset=offset)
+    from app.modules.procurement.performance import metrics_for
+    metrics = metrics_for(session, [r['public_id'] for r in rows])
     grid = [
         [
             text_cell(r["name"], avatar=True, sub=r["category"] or ""),
-            text_cell(f"{r['on_time_pct']}%", align="right", mono=True),
-            text_cell(f"{r['defect_rate']}%" if r["defect_rate"] is not None else "—", align="right", mono=True),
-            text_cell(_num(r["price_rating"]), align="right", mono=True),
-            text_cell(_num(r["score"]), align="right", mono=True, strong=True),
+            text_cell(_performance_percent(metrics[str(r['public_id'])]['onTimePct']), align="right", mono=True),
+            text_cell(_performance_percent(metrics[str(r['public_id'])]['firstPassPct']), align="right", mono=True),
+            text_cell(_performance_percent(metrics[str(r['public_id'])]['returnRate']), align="right", mono=True),
+            text_cell(str(metrics[str(r['public_id'])]['overdue']), align="right", mono=True, strong=True),
             text_cell(r["status"], badge=_SUP_TONE.get(r["status"], "neutral")),
         ]
         for r in rows
@@ -463,8 +439,8 @@ def scorecard_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
     return list_config(
         columns=[
             {"label": "Supplier"}, {"label": "On-time", "align": "right"},
-            {"label": "Defect rate", "align": "right"}, {"label": "Price rating", "align": "right"},
-            {"label": "Score", "align": "right"}, {"label": "Rating"},
+            {"label": "Final QC first pass", "align": "right"}, {"label": "Returned units", "align": "right"},
+            {"label": "Overdue POs", "align": "right"}, {"label": "Supplier status"},
         ],
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
@@ -480,7 +456,9 @@ def supplier_detail(session: Session, *, public_id: str) -> dict | None:
     if data is None:
         return None
     s, pos = data["supplier"], data["pos"]
-    ytd, open_pos = data["ytd"], data["open_pos"]
+    open_pos = data["open_pos"]
+    from app.modules.procurement.performance import calculate
+    performance = calculate(session, [s])[0][str(s.public_id)]
     return {
         "variant": "entity",
         "ref": "SUPPLIER",
@@ -491,16 +469,16 @@ def supplier_detail(session: Session, *, public_id: str) -> dict | None:
             {"k": "Region", "v": s.region or "—"},
             {"k": "Lead time", "v": s.lead_time or "—"},
             {"k": "Open POs", "v": str(open_pos)},
-            {"k": "YTD spend", "v": f"€{ytd:,.0f}"},
+            {"k": "Received units", "v": str(performance['receivedUnits'])},
         ],
         "tabs": ["Overview", "Purchase Orders", "Scorecard", "Activity"],
         "entity": {
             "scorecardTitle": "Vendor scorecard",
             "scorecard": [
-                {"label": "On-time delivery", "value": f"{s.on_time_pct}%", "sub": "last 12 mo", "tone": "green"},
-                {"label": "Defect rate", "value": f"{s.defect_rate}%" if s.defect_rate is not None else "—", "sub": "AQL 2.5", "tone": "amber"},
-                {"label": "Price rating", "value": f"{_num(s.price_rating)} / 5", "sub": "vs market", "tone": "navy"},
-                {"label": "Overall score", "value": _num(s.score), "sub": s.status, "tone": "accent"},
+                {"label": "On-time delivery", "value": _performance_percent(performance['onTimePct']), "sub": f"{performance['onTime']} / {performance['measuredDeliveries']} fully dated completed POs · recorded history", "tone": "green"},
+                {"label": "Final QC first pass", "value": _performance_percent(performance['firstPassPct']), "sub": f"{performance['passedFirstTime']} / {performance['qualityLots']} inspected styles/batch variants", "tone": "amber"},
+                {"label": "Returned units", "value": _performance_percent(performance['returnRate']), "sub": f"{performance['returnedUnits']} returned / {performance['receivedUnits'] + performance['replacementUnits']} physically received units", "tone": "navy"},
+                {"label": "Overdue deliveries", "value": str(performance['overdue']), "sub": f"{performance['openReturns']} supplier return(s) unresolved", "tone": "accent"},
             ],
             "relatedTitle": "Recent purchase orders",
             "related": [
@@ -595,6 +573,7 @@ def build_invoice_draft(session: Session, *, po_no: str, actor_id=None) -> dict 
     if data is None:
         return None
     source = repo.po_by_no(session, po_no=po_no)
+    data["_financialLocked"] = True
     from app.modules.invoice_banking import profile_defaults
     return profile_defaults(session, source.tenant_id, data, actor_id, sales=False)
 
@@ -618,28 +597,26 @@ def _build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
         color = (l["color"] or "—").strip()
         size = (l["size"] or "—").strip()
         qty = int(l["qty"] or 0)
-        price = float(l["price"] or 0)
+        price = Decimal(str(l["price"] or 0))
         a = articles.setdefault(art, {"colors": {}, "sizes": set()})
-        row = a["colors"].setdefault(color, {"qty": {}, "price": price})
+        row = a["colors"].setdefault((color, price), {"qty": {}, "price": price})
         row["qty"][size] = row["qty"].get(size, 0) + qty
-        if price and not row["price"]:
-            row["price"] = price
         a["sizes"].add(size)
 
     article_list = []
     grand_qty = 0
-    grand_amt = 0.0
+    grand_amt = Decimal("0")
     for art, a in articles.items():
         sizes = sorted(a["sizes"], key=_size_rank)
         rows = []
-        for color, cd in a["colors"].items():
+        for (color, _price), cd in a["colors"].items():
             total = sum(cd["qty"].values())
-            unit = round(float(cd["price"]), 4)
-            amount = round(total * unit, 2)
+            unit = cd["price"]
+            amount = (total * unit).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             rows.append({"color": color, "qty": cd["qty"], "total": total,
-                         "unitPrice": unit, "amount": amount})
+                         "unitPrice": float(unit), "amount": float(amount)})
         sub_qty = sum(r["total"] for r in rows)
-        sub_amt = round(sum(r["amount"] for r in rows), 2)
+        sub_amt = sum((Decimal(str(r["amount"])) for r in rows), Decimal("0"))
         grand_qty += sub_qty
         grand_amt += sub_amt
         sp = specs.get(art) or {}
@@ -647,16 +624,20 @@ def _build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
             "articleNo": "", "style": art, "description": art,
             "fabric": sp.get("fabric") or "", "hsCode": sp.get("hsCode") or "",
             "image": images.get(art) or None, "sizes": sizes, "rows": rows,
-            "subtotalQty": sub_qty, "subtotalAmount": sub_amt,
+            "subtotalQty": sub_qty, "subtotalAmount": float(sub_amt),
         })
 
-    grand_amt = round(grand_amt, 2)
+    total_amount = Decimal(str(po.total)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    line_amount = sum((Decimal(str(l["price"] or 0)) * int(l["qty"] or 0) for l in lines), Decimal("0"))
+    if total_amount != line_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP):
+        raise HTTPException(409, "The PO total does not match its saved line quantities and prices. Reconcile the PO before generating its invoice.")
+    rounding = total_amount - grand_amt
     today = datetime.date.today().isoformat()
     # Document presentation: our business is the letterhead (top-left) card; the
     # supplier is shown as the counterparty in the right-hand box.
     company = repo.company_info(session)
     biz = company.get("name") or ""
-    supplier_name = supplier.name if supplier else po.supplier_name
+    supplier_name = po.supplier_name
     # Auto invoice number: BusinessName-0001, 0002, … (per tenant).
     slug = "".join(biz.split()) or "INV"
     seq = repo.count_po_invoices(session) + 1
@@ -693,8 +674,8 @@ def _build_invoice_draft(session: Session, *, po_no: str) -> dict | None:
         },
         "articles": article_list,
         "totals": {
-            "totalQty": grand_qty, "subtotal": grand_amt, "freight": 0.0,
-            "total": grand_amt, "amountInWords": amount_in_words(grand_amt, currency),
+            "totalQty": grand_qty, "subtotal": float(grand_amt), "freight": 0.0, "rounding": float(rounding),
+            "total": float(total_amount), "amountInWords": amount_in_words(float(total_amount), currency),
         },
         "preparedBy": "",
     }
@@ -758,6 +739,9 @@ def ensure_invoice_payable(session, invoice):
             po_ref=invoice.po_no, amount=invoice.total,
             due_on=datetime.date.today() + datetime.timedelta(days=30), status="Open")
     if bill:
+        from app.modules.procurement.invoice_integrity import cents
+        if cents(bill.amount) != cents(invoice.total) or bill.supplier_name != invoice.supplier_name or bill.po_ref != invoice.po_no:
+            raise HTTPException(409, "The invoice and existing Finance payable differ. Reconcile the payable before linking this document; its posted amount will not be changed automatically.")
         invoice.supplier_bill_id = bill.id
         session.flush()
         finance.post_unposted(session, tenant_id=tid)
@@ -765,9 +749,16 @@ def ensure_invoice_payable(session, invoice):
 
 
 def create_invoice(session: Session, *, tenant_id, data: dict, actor_id=None) -> dict:
+    from app.models.procurement import PurchaseOrder
+    source = session.scalar(select(PurchaseOrder).where(PurchaseOrder.tenant_id == _tid(tenant_id),
+        PurchaseOrder.po_no == data.get("poNo")).with_for_update())
+    if source is not None and source.status in ("Cancelled", "Rejected", "Inactive"):
+        raise HTTPException(409, "This PO is withdrawn. Reconcile its existing invoice and payable manually; a new invoice cannot be generated.")
     from app.modules.invoice_banking import profile_defaults
     from app.core.validation import validate_invoice_phones
     validate_invoice_phones(data)
+    from app.modules.procurement.invoice_integrity import prepare
+    data = prepare(session, _tid(tenant_id), data, lock=True)
     data = profile_defaults(session, tenant_id, data, actor_id, sales=False)
     validate_invoice_phones(data)
     f = _persist_fields(data)
@@ -782,6 +773,8 @@ def get_invoice(session: Session, *, public_id: str, actor_id=None) -> dict | No
         return None
     from app.modules.invoice_banking import fill_missing, supplier_bank
     data = json.loads(inv.data)
+    from app.modules.procurement.invoice_integrity import display
+    data = display(session, inv, data)
     po = repo.po_by_no(session, po_no=inv.po_no) if inv.po_no else None
     supplier = session.get(Supplier, po.supplier_id) if po and po.supplier_id else repo.find_supplier(session, name=inv.supplier_name)
     if supplier is not None and supplier.tenant_id != inv.tenant_id:
@@ -798,14 +791,21 @@ def update_invoice(session: Session, *, public_id: str, data: dict) -> dict | No
     inv = repo.get_po_invoice(session, public_id=public_id)
     if inv is None:
         return None
+    from app.modules.procurement.invoice_integrity import prepare
+    data = prepare(session, inv.tenant_id, data, invoice=inv, lock=True)
     f = _persist_fields(data)
-    if inv.supplier_bill_id and any((
+    if inv.supplier_bill_id and not inv.po_no and any((
         f["po_no"] != inv.po_no, f["supplier_name"] != inv.supplier_name,
         f["currency_code"] != inv.currency_code,
         round(f["total"], 2) != round(float(inv.total or 0), 2),
     )):
         from fastapi import HTTPException
         raise HTTPException(409, "This invoice has a finance payable. Reconcile that payable before changing its supplier, PO, currency or total. Other invoice details can still be edited.")
+    from app.modules.procurement.invoice_integrity import signature, cents
+    if signature(json.loads(inv.data)) != signature(data) or cents(inv.total) != cents(f["total"]):
+        from app.core.audit import write_audit
+        write_audit(session, tenant_id=inv.tenant_id, action="UPDATE", entity_type="po_invoice",
+            entity_id=str(inv.public_id), detail=f"Aligned invoice with saved PO after payable verification; amount {inv.total} -> {f['total']}. Finance entries were not changed.")
     inv.invoice_no = f["invoice_no"] or inv.invoice_no
     inv.po_no = f["po_no"]
     inv.supplier_name = f["supplier_name"]

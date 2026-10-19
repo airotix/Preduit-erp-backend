@@ -159,6 +159,8 @@ def create_inspection(session, *, tenant_id, payload: InspectionCreate):
     from fastapi import HTTPException
     if _batch_managed_order(session, tenant_id, payload.order):
         raise HTTPException(409, "Record inspection against the production batch in Quality")
+    from app.modules.shipments.supplier_inbound import guard_final_qc_change
+    guard_final_qc_change(session, _tid(tenant_id), payload.order, payload.stage)
     auto = _po_autofill(session, payload.order)
     item = (payload.item or "").strip() or None
     # When an item is chosen, scope product + quantity to that item (production
@@ -378,6 +380,11 @@ def reopen_failed(session, *, tenant_id, public_id, mode, notes=None, assigned_t
         po = session.get(PurchaseOrder, work.purchase_order_id) if work.purchase_order_id else None
         if po and po.inventory_received:
             raise HTTPException(409, "This PO has already entered inventory; reconcile received stock before reopening it.")
+        if po and po.supplier_shipment_required:
+            from app.modules.shipments.supplier_inbound import for_po
+            incoming = for_po(session, po)
+            if incoming and incoming.dispatched_at:
+                raise HTTPException(409, "Supplier goods have already been dispatched; reconcile the shipment before reopening production or QC.")
     if mode == "production":
         if work is None:
             raise HTTPException(409, "This inspection has no production TNA to reopen.")
@@ -417,47 +424,18 @@ def ai_insights(session):
 # ---------- Completion (auto result) ----------
 
 def complete_inspection(session, *, public_id):
-    """Evaluate checklist + AQL and set Pass/Fail. Guards:
-      - inspection must be In Progress
-      - at least one checklist item
-      - no checklist item left Pending
-    Returns {error} on a guard failure, else {inspection, result}.
-    """
-    ins = repo.get_inspection(session, public_id=public_id)
-    if ins is None:
-        return None
-    if ins.result != "In Progress":
-        return {"error": "not_in_progress"}
-    if inspection_waits_for_rework(session, ins):
-        from fastapi import HTTPException
-        raise HTTPException(409, "Complete the reopened production TNA before completing reinspection.")
-    checks = repo.list_checks(session, inspection_id=ins.id)
-    if not checks:
-        return {"error": "no_checks"}
-    if any(c.result == "Pending" for c in checks):
-        return {"error": "pending_checks"}
-
-    # Result = Fail if any checklist item failed OR the AQL limit is exceeded.
-    # The limit is the inspection's max_defects (honours a manual sample-size
-    # override); fall back to the lot-based plan for legacy rows.
-    checklist_fail = any(c.result == "Fail" for c in checks)
-    max_defects = ins.max_defects
-    if max_defects is None:
-        max_defects = aql_engine.evaluate(ins.prod_qty, ins.aql, ins.defect_count)["maxDefects"]
-    aql_exceeded = ins.defect_count > max_defects
-    result = "Fail" if (checklist_fail or aql_exceeded) else "Pass"
-
-    import datetime as _dt
-    ins.result = result
-    ins.finalized_at = _dt.datetime.utcnow()
-    session.flush()
-    return {"inspection": ins, "result": result,
-            "reason": "Checklist failure" if checklist_fail else
-                      ("AQL exceeded" if aql_exceeded else "Within acceptance criteria")}
+    from fastapi import HTTPException
+    raise HTTPException(409, "Save the checklist, then confirm approve, hold, or split quantities. Completing an inspection does not release the order by itself.")
 
 
 def set_result(session, *, public_id, status, tenant_id=None):
     current = repo.get_inspection(session, public_id=public_id)
+    if status == "Pass" and (current is None or current.result != "Pass"):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Approve quantities from the inspection decision. A status change cannot release goods.")
+    if status == "Fail" and current is not None and current.result in ("Pending", "In Progress"):
+        from fastapi import HTTPException
+        raise HTTPException(409, "Record the hold or rejection from the inspection decision.")
     if current is not None and status == "Pass" and current.result == "Pending":
         from fastapi import HTTPException
         raise HTTPException(409, "Start and complete this inspection before recording a pass.")
@@ -470,62 +448,18 @@ def set_result(session, *, public_id, status, tenant_id=None):
     if current and status == "Pass" and inspection_waits_for_rework(session, current):
         from fastapi import HTTPException
         raise HTTPException(409, "Complete the reopened production TNA before passing reinspection.")
+    if current and current.result != status:
+        from app.modules.shipments.supplier_inbound import guard_final_qc_change
+        guard_final_qc_change(session, current.tenant_id, current.order_ref, current.stage)
     ins = repo.set_result(session, public_id=public_id, result=status)
+    from app.modules.shipments.supplier_inbound import after_inspection
+    after_inspection(session, ins)
     return ins
 
 
 def pass_and_ship(session, *, tenant_id, public_id, carrier, destination):
-    """Mark an inspection Passed and create its shipment with the given carrier
-    and destination. Idempotent — one shipment per order; the created (or
-    existing) shipment reference is linked back onto the inspection.
-
-    Guard: cannot ship a Pending inspection — it must be started/evaluated first.
-    """
-    ins = repo.get_inspection(session, public_id=public_id)
-    if ins is not None and ins.result == "Cancelled":
-        from fastapi import HTTPException
-        raise HTTPException(409, "A cancelled inspection cannot ship.")
-    if ins is None:
-        return None
-    if ins.batch_line_id or _batch_managed_order(session, tenant_id, ins.order_ref):
-        from fastapi import HTTPException
-        raise HTTPException(409, "Manage batch shipments in Shipments after QC quantities are recorded")
-    if ins.result == "Pending":
-        # Can't create a shipment straight from a never-started inspection.
-        return {"error": "not_started", "inspection": ins}
-    if inspection_waits_for_rework(session, ins):
-        from fastapi import HTTPException
-        raise HTTPException(409, "Complete the reopened production TNA before passing reinspection.")
-    from app.modules.shipments import repository as ship_repo
-    ins = repo.set_result(session, public_id=public_id, result="Pass")
-
-    # Sales shortage production replenishes inventory; it never ships alone.
-    from sqlalchemy import select
-    from app.models.production import ProductionOrder
-    from app.models.procurement import PurchaseOrder
-    from app.modules.sales import fulfillment
-    source_po = session.scalar(select(PurchaseOrder).join(ProductionOrder,
-        ProductionOrder.purchase_order_id == PurchaseOrder.id).where(
-        ProductionOrder.order_no == ins.order_ref, ProductionOrder.tenant_id == _tid(tenant_id),
-        PurchaseOrder.tenant_id == _tid(tenant_id)))
-    if source_po is not None:
-        return {"inspection": ins, "shipment_no": None, "awaitingWarehouseReceipt": True}
-
-    # Order-level gate: a shipment is only created once EVERY item's inspection
-    # on this order is a FINAL-stage Pass. A passed Pre-Production / In-line item
-    # (or a still-open sibling) must not trigger a shipment.
-    siblings = repo.inspections_for_order(session, order_ref=ins.order_ref) or [ins]
-    all_cleared = all(s.result == "Pass" and s.stage == "Final" for s in siblings)
-    if not all_cleared:
-        return {"error": "not_all_cleared", "inspection": ins, "shipment_no": None}
-
-    existing = ship_repo.shipment_for_order(session, order_ref=ins.order_ref)
-    if existing is None:
-        existing = ship_repo.create_shipment(session, tenant_id=_tid(tenant_id), order_ref=ins.order_ref,
-                                             carrier=carrier or "Pending", destination=destination or "—")
-    # Link the (created or pre-existing) shipment back onto the inspection.
-    repo.link_shipment(session, ins=ins, shipment_no=existing.shipment_no)
-    return {"inspection": ins, "shipment_no": existing.shipment_no}
+    from fastapi import HTTPException
+    raise HTTPException(409, "Create the shipment in Shipments after final QC approval. Quality does not collect a carrier or destination.")
 
 
 _PROGRESS_STEPS = ["Created", "Sampling", "Inspection", "Defect Review", "Decision", "Completed"]
@@ -810,8 +744,12 @@ def inspection_detail(session: Session, *, public_id: str) -> dict | None:
         PurchaseOrder.tenant_id == focus.tenant_id))
     ship_target = next((it["publicId"] for it in current_items if _cleared(it)),
                        items[0]["publicId"] if items else None)
+    from app.modules.shipments.supplier_inbound import for_po
+    incoming = for_po(session, source_po) if source_po and source_po.supplier_shipment_required else None
+    from app.modules.quality.workflow import task_key_for_inspection
     return {
         "variant": "inspection",
+        "taskKey": task_key_for_inspection(session, focus),
         "batchManaged": bool(focus.batch_line_id),
         "ref": focus.order_ref or "—",
         "title": f"Inspection · {focus.order_ref or '—'}{f' / {batch.name}' if batch else ''}",
@@ -835,7 +773,11 @@ def inspection_detail(session: Session, *, public_id: str) -> dict | None:
             # Final-stage pass (idempotent /pass links the shipment back).
             "shipment": {
                 "replenishmentPO": {"publicId": str(source_po.public_id), "poNo": source_po.po_no,
-                                    "received": source_po.inventory_received} if source_po else None,
+                                    "received": source_po.inventory_received,
+                                    "supplierShipmentRequired": source_po.supplier_shipment_required,
+                                    "supplier": source_po.supplier_name,
+                                    "shipment": {"id": str(incoming.public_id), "ref": incoming.shipment_no,
+                                        "status": incoming.status} if incoming else None} if source_po else None,
                 "allPassed": all_passed,
                 "passedCount": passed,
                 "total": total,

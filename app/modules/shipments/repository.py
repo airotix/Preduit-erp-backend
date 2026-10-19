@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.shipments import Carrier, Shipment, ShipmentLine
+from app.models.procurement import PurchaseOrder
 
 
 # ---------- Shipments ----------
@@ -12,7 +13,10 @@ from app.models.shipments import Carrier, Shipment, ShipmentLine
 def list_shipments(session, *, limit, offset):
     stmt = (
         select(Shipment.public_id, Shipment.shipment_no, Shipment.order_ref, Shipment.carrier,
-               Shipment.destination, Shipment.status, Shipment.eta)
+               Shipment.destination, Shipment.status, Shipment.eta, Shipment.direction,
+               PurchaseOrder.supplier_name.label("supplier"))
+        .outerjoin(PurchaseOrder, (PurchaseOrder.id == Shipment.purchase_order_id) &
+                   (PurchaseOrder.tenant_id == Shipment.tenant_id))
         .where(Shipment.is_deleted == False)  # noqa: E712
         .order_by(Shipment.id.desc()).limit(limit).offset(offset)
     )

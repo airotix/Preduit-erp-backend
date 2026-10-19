@@ -97,6 +97,12 @@ class Acceptance(BaseModel):
     qty: int = Field(ge=0, strict=True)
 
 
+class ReceiveInbound(Command):
+    locationId: int = Field(gt=0)
+    reference: str = Field(min_length=3, max_length=80)
+    accepted: list[Acceptance] = Field(min_length=1)
+
+
 class AllocationIn(BaseModel):
     lotId: int = Field(gt=0)
     qty: int = Field(gt=0, strict=True)

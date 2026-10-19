@@ -24,6 +24,15 @@ _CLOSED_POS = {"Received", "Rejected", "Cancelled", "Inactive"}
 _CLOSED_INSPECTIONS = {"Pass", "Fail", "Cancelled"}
 
 
+def replacement_commitments(session, product):
+    from app.models.supplier_returns import SupplierReturn
+    return session.scalar(select(SupplierReturn.id).join(PurchaseOrderLine,
+        PurchaseOrderLine.id == SupplierReturn.po_line_id).join(ProductVariant,
+        ProductVariant.id == PurchaseOrderLine.variant_id).where(SupplierReturn.tenant_id == product.tenant_id,
+        ProductVariant.product_id == product.id, SupplierReturn.resolution == "Replacement",
+        SupplierReturn.replaced.is_(False)).limit(1)) is not None
+
+
 def _product(session: Session, tenant_id: UUID, public_id: str, *, lock: bool = False):
     tenant_id = UUID(str(tenant_id))
     try:
@@ -259,13 +268,16 @@ def preview(session: Session, *, tenant_id: UUID, public_id: str) -> dict:
         "transfers": [{"id": str(t.public_id), "ref": t.transfer_no or str(t.public_id), "status": t.status} for t in transfers],
         "openStages": len(open_stages),
         "openInspections": len(open_inspections),
-        "canDelete": not (any(s.on_hand or s.reserved for s in stock) or
+        "awaitingReplacement": replacement_commitments(session, product),
+        "canDelete": not (replacement_commitments(session, product) or any(s.on_hand or s.reserved for s in stock) or
                           legacy_mismatch or batch_mismatch or any(lot.on_hand or lot.allocated for lot in lot_balance) or pending or holds or orders or pos or transfers),
     }
 
 
 def dispose_stock(session: Session, *, tenant_id: UUID, public_id: str,
                   payload: StockDisposition, actor=None) -> dict:
+    if payload.kind == "Return to supplier":
+        raise HTTPException(409, "Record this in Procurement → Supplier returns so the source PO and supplier credit, refund or replacement are tracked.")
     product = _product(session, tenant_id, public_id, lock=True)
     tenant_id = product.tenant_id
     variants, stock, orders, pos, transfers, holds, _, _, _ = _dependencies(session, product, lock=True)
@@ -346,6 +358,8 @@ def reconcile_stock_cache(session: Session, *, tenant_id: UUID, public_id: str,
 
 def retire(session: Session, *, tenant_id: UUID, public_id: str) -> dict:
     product = _product(session, tenant_id, public_id, lock=True)
+    if replacement_commitments(session, product):
+        raise HTTPException(409, "Resolve the supplier replacement in Procurement → Supplier returns before retiring this article.")
     tenant_id = product.tenant_id
     variants, stock, orders, pos, transfers, holds, skus, _, po_lines = _dependencies(session, product, lock=True)
     legacy_mismatch = any((variant.qty_on_hand or 0) != sum(level.on_hand for level in stock if level.variant_id == variant.id)

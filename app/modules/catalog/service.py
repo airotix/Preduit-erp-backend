@@ -128,6 +128,10 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
         return None
     prod, category, variants = data["product"], data["category"], data["variants"]
     priced_variants = [v for v in variants if v["color"] and v["size"]]
+    if prod.status == "Draft" and not priced_variants:
+        # Match the list: retain visibility of the prices entered on creation
+        # while the draft has no colour/size matrix yet.
+        priced_variants = variants
 
     def _minp(key: str) -> str:
         vals = [v[key] for v in priced_variants if v.get(key) is not None]
@@ -345,8 +349,8 @@ def update_variant_prices(session: Session, *, tenant_id: str | UUID, public_id:
     for entry in payload.variants:
         values = (entry.retailPrice, entry.wholesalePrice,
                   entry.onlinePrice, entry.supplierPrice)
-        if product.status == "Active" and any(value is None or value <= 0 for value in values):
-            raise HTTPException(409, "Active articles need positive retail, wholesale, online and supplier prices for every variant.")
+        if product.status == "Active" and any(value is None or value <= 0 for value in values[:3]):
+            raise HTTPException(409, "Active articles need positive retail, wholesale and online prices for every variant. Set supplier purchase prices separately in Supplier pricing.")
         variant = by_id[entry.variantId]
         variant.retail_price, variant.wholesale_price = values[:2]
         variant.online_price, variant.supplier_price = values[2:]

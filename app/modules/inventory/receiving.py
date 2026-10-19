@@ -55,16 +55,47 @@ def queue(session, *, tenant_id, limit=50, offset=0):
             .order_by(PurchaseOrderLine.id)).all()
         received = received_quantities(session, tid, [line.id for line in lines])
         ready = fulfillment.qc_cleared(session, po)
+        from app.modules.shipments import supplier_inbound
+        incoming = supplier_inbound.for_po(session, po) if po.supplier_shipment_required else None
+        status = "Ready for warehouse receipt" if ready else "Awaiting production / final QC"
+        if ready and po.supplier_shipment_required:
+            ready = bool(incoming and incoming.status in supplier_inbound.IN_FLIGHT)
+            if not ready:
+                status = "Dispatch the supplier shipment in Shipments before receiving"
         result.append({"id": str(po.public_id), "poNo": po.po_no, "supplier": po.supplier_name,
+            "shipment": {"id": str(incoming.public_id), "ref": incoming.shipment_no, "status": incoming.status} if incoming else None,
             "plannedLocation": session.get(Location, po.incoming_location_id).name if po.incoming_location_id else None,
-            "ready": ready, "status": "Ready for warehouse receipt" if ready else "Awaiting production / final QC",
+            "ready": ready, "status": status,
             "lines": [{"id": str(line.public_id), "name": line.name, "color": line.color,
                 "size": line.size, "sku": line.sku, "ordered": line.qty,
                 "received": received.get(line.id, 0),
                 "remaining": max(0, line.qty - received.get(line.id, 0))} for line in lines]})
     locations = session.scalars(select(Location).where(Location.tenant_id == tid,
         Location.is_deleted.is_(False)).order_by(Location.name)).all()
-    return {"orders": result, "total": total,
+    from app.models.batches import BatchLine, InboundAllocation, ProductionBatch
+    from app.models.shipments import Shipment
+    batch_ships = session.scalars(select(Shipment).where(Shipment.tenant_id == tid,
+        Shipment.batch_managed.is_(True), Shipment.direction == "Inbound", Shipment.is_deleted.is_(False),
+        Shipment.status.in_(["In transit", "Customs", "Out for delivery", "Dispatched"]))
+        .order_by(Shipment.id)).all()
+    batch_rows = []
+    for ship in batch_ships:
+        allocations = session.scalars(select(InboundAllocation).where(InboundAllocation.tenant_id == tid,
+            InboundAllocation.shipment_id == ship.id).order_by(InboundAllocation.id)).all()
+        supplier = session.get(PurchaseOrder, ship.purchase_order_id).supplier_name if ship.purchase_order_id else None
+        lines = []
+        for allocation in allocations:
+            line = session.get(BatchLine, allocation.line_id)
+            source = session.get(PurchaseOrderLine, line.po_line_id) if line else None
+            batch = session.get(ProductionBatch, line.batch_id) if line else None
+            if supplier is None and source is not None:
+                supplier = session.get(PurchaseOrder, source.po_id).supplier_name
+            lines.append({"allocationId": allocation.id, "name": source.name if source else "Article",
+                "color": source.color if source else None, "size": source.size if source else None,
+                "batch": batch.name if batch else "Batch", "shipped": allocation.qty})
+        batch_rows.append({"id": str(ship.public_id), "ref": ship.shipment_no, "supplier": supplier or "Supplier",
+            "destination": ship.destination, "status": ship.status, "lines": lines})
+    return {"orders": result, "total": total, "batchShipments": batch_rows,
         "locations": [{"id": str(loc.public_id), "name": loc.name} for loc in locations]}
 
 
@@ -123,6 +154,10 @@ def _post(session, *, tenant_id, public_id, payload, actor):
         raise HTTPException(409, "Receive this order using its batch warehouse controls.")
     if not fulfillment.qc_cleared(session, po):
         raise HTTPException(409, "Complete production and pass final QC before warehouse receipt.")
+    from app.modules.shipments import supplier_inbound
+    incoming = supplier_inbound.for_po(session, po, lock=True) if po.supplier_shipment_required else None
+    if po.supplier_shipment_required and (incoming is None or incoming.status not in supplier_inbound.IN_FLIGHT):
+        raise HTTPException(409, "Dispatch this PO's supplier shipment in Shipments before warehouse receipt.")
     location = session.scalar(select(Location).where(Location.public_id == payload.locationId,
         Location.tenant_id == tid, Location.is_deleted.is_(False)))
     if location is None:
@@ -156,6 +191,7 @@ def _post(session, *, tenant_id, public_id, payload, actor):
     grn = procurement.create_receipt(session, tenant_id=tid, po_ref=po.po_no,
         supplier=supplier, supplier_name=po.supplier_name, lines=len(planned))
     grn.request_id, grn.request_payload = payload.requestId, fingerprint
+    grn.received_on = date.today()
     grn.location_id, grn.location = location.id, location.name
     grn.reference, grn.reason, grn.actor = payload.reference.strip(), payload.reason.strip(), actor
     grn.received_count, grn.received_date = len(planned), date.today().strftime("%d %b %Y")
@@ -176,6 +212,10 @@ def _post(session, *, tenant_id, public_id, payload, actor):
     complete = all(received.get(line.id, 0) == line.qty for line in lines)
     po.inventory_received = complete
     po.status = "Received" if complete else "Partially received"
+    if complete and incoming:
+        from datetime import datetime, timezone
+        incoming.status = "Delivered"
+        incoming.delivered_at = datetime.now(timezone.utc)
     grn.status = "Received"  # This document records one completed physical receipt.
     session.flush()
     write_audit(session, tenant_id=tid, action="RECEIVE", entity_type="goods_receipt",
@@ -195,3 +235,24 @@ def _post(session, *, tenant_id, public_id, payload, actor):
                 inspection.shipment_ref = shipment.shipment_no
     session.flush()
     return grn
+
+
+def post_batch(session, *, tenant_id, public_id, payload, actor):
+    from app.models.shipments import Shipment
+    from app.modules.batches import dto as batch_dto
+    from app.modules.batches import workflow
+    tid, pid = UUID(str(tenant_id)), UUID(str(public_id))
+    ship = session.scalar(select(Shipment).where(Shipment.tenant_id == tid, Shipment.public_id == pid,
+        Shipment.is_deleted.is_(False)))
+    if ship is None:
+        raise HTTPException(404, "Shipment not found")
+    location = session.scalar(select(Location).where(Location.public_id == payload.locationId,
+        Location.tenant_id == tid, Location.is_deleted.is_(False)))
+    if location is None:
+        raise HTTPException(404, "Choose an active warehouse location.")
+    command = batch_dto.ReceiveInbound(requestId=payload.requestId, reason=payload.reason.strip(),
+        reference=payload.reference.strip(), locationId=location.id,
+        accepted=[batch_dto.Acceptance(allocationId=line.allocationId, qty=line.quantity) for line in payload.lines])
+    result = workflow.receive_inbound(session, tid, actor, ship, command)
+    return {"public_id": result.get("publicId"), "grn_no": result.get("grnNo") or ship.shipment_no,
+        "status": result.get("status", ship.status)}

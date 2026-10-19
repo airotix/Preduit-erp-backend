@@ -9,10 +9,10 @@ class ShipmentCreate(BaseModel):
 
 
 class ShipmentUpdate(BaseModel):
-    carrier: str = Field(min_length=1, max_length=120)
-    destination: str = Field(min_length=1, max_length=160)
+    carrier: str = Field(max_length=120)
+    destination: str = Field(max_length=160)
     eta: str | None = Field(default=None, max_length=40)
-    status: str = Field(min_length=1, max_length=24)
+    status: str = Field(default="", max_length=24)
 
 
 class CarrierCreate(BaseModel):

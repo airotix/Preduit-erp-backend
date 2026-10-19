@@ -109,7 +109,7 @@ def send_for_inspection(session, *, tenant_id, public_id):
         return None
     if session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == po.id, ProductionBatch.tenant_id == po.tenant_id).limit(1)):
         from fastapi import HTTPException
-        raise HTTPException(409, "Record QC on each production batch; whole-order approval is disabled.")
+        raise HTTPException(409, "Open this order in Quality. Each batch is inspected on its own, not as a whole order.")
     lines = repo.list_lines(session, po.id)
     made_any = False
     for ln in lines:
@@ -193,6 +193,9 @@ def create_for_purchase_order(session, *, tenant_id, purchase_order: PurchaseOrd
 
 def set_stage(session, *, public_id, status):
     work = repo.order_by_public(session, public_id)
+    if work and status not in ("Tech Pack", "Cancelled") and status != work.stage:
+        from app.modules.production.approval import require_approved_po
+        require_approved_po(session, work)
     if work and session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == work.id,
             ProductionBatch.tenant_id == work.tenant_id).limit(1)):
         from fastapi import HTTPException
@@ -337,6 +340,8 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
     po, mats, stages = data["order"], data["materials"], data["stages"]
     sales_order, order_lines = data.get("sales_order"), data.get("order_lines") or []
     purchase_order = data.get("purchase_order")
+    from app.modules.production.approval import start_block_reason
+    tna_start_blocked = start_block_reason(po, purchase_order)
     today = datetime.date.today()
 
     def _money(v) -> str:
@@ -368,6 +373,10 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         batch_summary = view(session, po.tenant_id, po.public_id)["summary"]
         progress = min(100, round(100 * batch_summary["completed"] / max(1, po.qty)))
         status_label = "Production complete" if progress == 100 else "Batch production"
+        can_inspect = False
+
+    if po.stage == "Cancelled":
+        status_label = "Cancelled"
         can_inspect = False
 
     # One timeline per production line (style) → tabs on the detail page.
@@ -402,7 +411,8 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         "orderLines": order_lines_out,
         "orderTotal": order_total,
         "sourcePurchaseOrder": {"publicId": str(purchase_order.public_id),
-                                "poNo": purchase_order.po_no} if purchase_order else None,
+                                "poNo": purchase_order.po_no, "status": purchase_order.status} if purchase_order else None,
+        "tnaStartBlockedReason": tna_start_blocked,
         "started": started,
         "batchManaged": batch_managed,
         "progress": progress,
@@ -425,6 +435,8 @@ def start_production(session, *, tenant_id, public_id, stages, line_id=None):
     from app.models.catalog import Product, ProductVariant
     order = repo.order_by_public(session, public_id)
     if order is not None:
+        from app.modules.production.approval import require_approved_po
+        require_approved_po(session, order)
         lines = repo.list_lines(session, order.id)
         if line_id:
             lines = [line for line in lines if str(line.public_id) == str(line_id)]
@@ -443,6 +455,11 @@ def start_production(session, *, tenant_id, public_id, stages, line_id=None):
 def stage_action(session, *, action, public_id, days=None, worker=None, notes=None):
     from fastapi import HTTPException
     stage = repo.get_stage(session, public_id=public_id)
+    if stage is not None and action in ("start", "complete"):
+        from app.modules.production.approval import require_approved_po
+        work = session.get(ProductionOrder, stage.order_id)
+        if work is not None:
+            require_approved_po(session, work)
     if stage is not None and stage.status == "Cancelled":
         raise HTTPException(409, "This production stage has been stopped.")
     if stage is not None and session.scalar(select(ProductionBatch.id).where(ProductionBatch.order_id == stage.order_id,
@@ -471,6 +488,11 @@ def stage_action(session, *, action, public_id, days=None, worker=None, notes=No
                     qc_repo.create_inspection(session, tenant_id=stage.tenant_id,
                                               order_ref=po.order_no, stage="Final", aql="2.5",
                                               product=po.style, prod_qty=po.qty)
+            if po is not None and po.purchase_order_id:
+                from app.modules.shipments.supplier_inbound import ensure
+                source_po = session.get(PurchaseOrder, po.purchase_order_id)
+                if source_po:
+                    ensure(session, source_po)
         return stage
     if action == "extend":
         return repo.extend_stage(session, public_id=public_id, days=days or 0)

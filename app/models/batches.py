@@ -67,6 +67,11 @@ class InboundAllocation(Identity, Base):
     qty: Mapped[int] = mapped_column(Integer)
     accepted: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(24), default="Reserved")
+    discrepancy_qty: Mapped[int] = mapped_column(Integer, default=0)
+    discrepancy_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    discrepancy_reason: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    discrepancy_resolved_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    discrepancy_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class BatchLot(Identity, Base):

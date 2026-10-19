@@ -3,7 +3,7 @@ import datetime
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid, text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -46,6 +46,7 @@ class Supplier(Base):
 
 class PurchaseOrder(Base):
     __tablename__ = "purchase_orders"
+    supplier_shipment_required: Mapped[bool] = mapped_column(Boolean, default=False)
     incoming_location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"), nullable=True)
     replenishment_rule_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("inventory_replenishment_rules.id"), nullable=True)
     replenishment_request_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
@@ -62,6 +63,8 @@ class PurchaseOrder(Base):
     total: Mapped[Decimal] = mapped_column(Numeric(19, 4), default=0)
     currency_code: Mapped[str] = mapped_column(String(3), default="EUR")
     expected: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    original_due_on: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    due_baseline_recorded: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(24), default="Pending approval")
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -79,6 +82,7 @@ class GoodsReceipt(Base):
     received_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="Expected")
     received_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    received_on: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
     location: Mapped[str | None] = mapped_column(String(120), nullable=True)
     location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"), nullable=True)
     request_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)

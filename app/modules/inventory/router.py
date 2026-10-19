@@ -11,7 +11,7 @@ from app.core.security import Principal, require_module
 from app.modules.inventory import service
 from app.modules.inventory.dto import (
     LocationCreate, LocationUpdate, MatrixUpdate, ReorderAlertCreate, StatusUpdate,
-    StockAdjustmentCreate, StockReceiptCreate, TransferCreate, WarehouseReceiptCreate,
+    StockAdjustmentCreate, StockReceiptCreate, TransferCreate,     WarehouseReceiptCreate, BatchShipmentReceipt,
 )
 
 router = APIRouter(prefix="/inventory", tags=["inventory"])
@@ -38,6 +38,14 @@ def receiving_queue(limit: int = Query(50, ge=1, le=100), offset: int = Query(0,
                     principal: Principal = Depends(read), db: Session = Depends(tenant_db)):
     from app.modules.inventory import receiving
     return receiving.queue(db, tenant_id=principal.tenant_id, limit=limit, offset=offset)
+
+
+@router.post("/receiving/shipments/{public_id}", status_code=status.HTTP_201_CREATED)
+def receive_batch_shipment(public_id: UUID, payload: BatchShipmentReceipt,
+                           principal: Principal = Depends(write), db: Session = Depends(tenant_db)):
+    from app.modules.inventory import receiving
+    return receiving.post_batch(db, tenant_id=principal.tenant_id, public_id=public_id,
+        payload=payload, actor=principal.email)
 
 
 @router.post("/receiving/{public_id}", status_code=status.HTTP_201_CREATED)

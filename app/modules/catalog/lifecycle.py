@@ -35,7 +35,7 @@ def validate_activation(session: Session, *, tenant_id: UUID, product_id: int,
         if not (variant.sku or "").strip():
             missing.append("a SKU for every variant")
         for field, label in (("retail", "retail"), ("wholesale", "wholesale"),
-                             ("online", "online"), ("supplier", "supplier")):
+                             ("online", "online")):
             value = prices.get(field)
             if value is None:
                 value = getattr(variant, f"{field}_price")

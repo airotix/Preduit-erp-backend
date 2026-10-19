@@ -33,6 +33,19 @@ class WarehouseReceiptCreate(BaseModel):
     requestId: UUID
 
 
+class BatchReceiptLine(BaseModel):
+    allocationId: int = Field(gt=0)
+    quantity: int = Field(ge=0)
+
+
+class BatchShipmentReceipt(BaseModel):
+    locationId: UUID
+    lines: list[BatchReceiptLine] = Field(min_length=1)
+    reference: str = Field(min_length=3, max_length=80)
+    reason: str = Field(min_length=3, max_length=400)
+    requestId: UUID
+
+
 class StockAdjustmentCreate(BaseModel):
     variantId: int = Field(gt=0)
     location: str = Field(min_length=1, max_length=120)

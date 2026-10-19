@@ -14,7 +14,7 @@ from app.modules.shipments.dto import CarrierCreate, CarrierUpdate, ShipmentCrea
 from app.presenters.screen import list_config, text_cell
 
 _SHIP_TONE = {"Pending": "neutral", "Label created": "neutral", "Dispatched": "amber", "In transit": "amber",
-              "Customs": "navy", "Out for delivery": "amber", "Delivered": "green"}
+              "Customs": "navy", "Out for delivery": "amber", "Delivered": "green", "Cancelled": "red"}
 _CARRIER_TONE = {"Active": "green", "Paused": "amber", "Inactive": "red"}
 
 # Tracking sequence used to build the timeline.
@@ -38,6 +38,8 @@ def shipments_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
         [
             text_cell(r["shipment_no"] or "—", strong=True, mono=True),
             r["order_ref"] or "—",
+            r["supplier"] or "—",
+            r["direction"] or "Outbound",
             r["carrier"] or "—",
             r["destination"] or "—",
             text_cell(r["status"], badge=_SHIP_TONE.get(r["status"], "neutral")),
@@ -46,7 +48,7 @@ def shipments_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
         for r in rows
     ]
     return list_config(
-        columns=[{"label": "Shipment"}, {"label": "Order"}, {"label": "Carrier"},
+        columns=[{"label": "Shipment"}, {"label": "Order"}, {"label": "Supplier"}, {"label": "Direction"}, {"label": "Carrier"},
                  {"label": "Destination"}, {"label": "Status"}, {"label": "ETA"}],
         rows=grid, total=total,
         ids=[str(r["public_id"]) for r in rows],
@@ -58,6 +60,19 @@ def shipments_screen(session: Session, *, limit: int = 50, offset: int = 0) -> d
 def create_shipment(session, *, tenant_id, payload: ShipmentCreate):
     from app.modules.sales import fulfillment
     from fastapi import HTTPException
+    from app.models.procurement import PurchaseOrder
+    from app.modules.shipments import supplier_inbound
+    po = session.scalar(select(PurchaseOrder).where(PurchaseOrder.tenant_id == _tid(tenant_id),
+        PurchaseOrder.po_no == payload.order, PurchaseOrder.is_deleted.is_(False)).with_for_update())
+    if po and po.supplier_shipment_required:
+        shipment = supplier_inbound.ensure(session, po)
+        if shipment is None:
+            raise HTTPException(409, "Complete this supplier PO's TNA and final QC first; use batch controls for batch shipments.")
+        if shipment.dispatched_at:
+            raise HTTPException(409, "This supplier shipment has already dispatched. Open its existing tracking record.")
+        shipment.carrier, shipment.destination = payload.carrier, payload.destination
+        session.flush()
+        return shipment
     order = session.scalar(select(SalesOrder).where(SalesOrder.order_no == payload.order,
         SalesOrder.tenant_id == _tid(tenant_id), SalesOrder.is_deleted.is_(False)).with_for_update())
     if order and order.status in ("Cancelled", "Inactive"):
@@ -96,7 +111,7 @@ def _transition(session, *, public_id, status, actor=None):
     from app.core.audit import write_audit
     from app.modules.batches import service as batches
     from app.modules.sales import fulfillment
-    allowed = {"Pending", "Label created", "Dispatched", "In transit", "Customs", "Out for delivery", "Delivered"}
+    allowed = {"Pending", "Label created", "Dispatched", "In transit", "Customs", "Out for delivery", "Delivered", "Cancelled"}
     if status not in allowed:
         raise HTTPException(422, "Choose a valid shipment status. Cancel through the source order before dispatch.")
     shipment = session.scalar(select(Shipment).where(Shipment.public_id == UUID(str(public_id)),
@@ -105,6 +120,11 @@ def _transition(session, *, public_id, status, actor=None):
         return None
     if batches.is_batch_shipment(session, shipment):
         raise HTTPException(409, "Use the batch shipment dispatch controls to record quantities and history.")
+    if shipment.purchase_order_id:
+        from app.modules.shipments.supplier_inbound import transition
+        return transition(session, shipment, status, actor)
+    if status == "Cancelled":
+        raise HTTPException(422, "Cancel customer shipments through the source order before dispatch.")
     # Order locks precede shipment and stock locks, matching sales cancellation.
     source = _shipment_order(session, shipment)
     order = fulfillment.lock_order(session, tenant_id=shipment.tenant_id, order_id=source.id) if source else None
@@ -141,17 +161,33 @@ def _transition(session, *, public_id, status, actor=None):
 
 
 def set_status(session, *, public_id, status, actor=None):
-    with session.begin_nested():
-        return _transition(session, public_id=public_id, status=status, actor=actor)
+    raise HTTPException(409, "Use the shipment actions to prepare, pack, dispatch, track or record delivery. A status change cannot skip those checks.")
 
 
 def update_shipment(session, *, public_id, payload, actor=None):
     with session.begin_nested():
-        shipment = _transition(session, public_id=public_id, status=payload.status, actor=actor)
-        if shipment:
-            shipment.carrier, shipment.destination, shipment.eta = payload.carrier, payload.destination, payload.eta
-            session.flush()
-        return shipment
+        # Supplier dispatch validates these details in the same atomic update.
+        pending = session.scalar(select(Shipment).where(Shipment.public_id == UUID(str(public_id)),
+            Shipment.is_deleted.is_(False)))
+        if pending and not pending.purchase_order_id and (not payload.carrier.strip() or not payload.destination.strip()):
+            raise HTTPException(422, "Carrier and destination are required.")
+        if pending and pending.purchase_order_id and not pending.batch_managed:
+            from app.models.procurement import PurchaseOrder
+            session.scalar(select(PurchaseOrder).where(PurchaseOrder.id == pending.purchase_order_id,
+                PurchaseOrder.tenant_id == pending.tenant_id).with_for_update())
+            pending = session.scalar(select(Shipment).where(Shipment.id == pending.id,
+                Shipment.tenant_id == pending.tenant_id).with_for_update().execution_options(populate_existing=True))
+            if pending.dispatched_at and (pending.carrier != payload.carrier or pending.destination != payload.destination):
+                raise HTTPException(409, "Carrier and destination cannot change after supplier dispatch.")
+        if pending is None:
+            return None
+        if payload.status and payload.status != pending.status:
+            raise HTTPException(409, "Use the shipment actions to prepare, pack, dispatch, track or record delivery. A status change cannot skip those checks.")
+        if pending.dispatched_at or pending.inventory_dispatched:
+            raise HTTPException(409, "Carrier, origin and destination cannot change after dispatch.")
+        pending.carrier, pending.destination, pending.eta = payload.carrier, payload.destination, payload.eta
+        session.flush()
+        return pending
 
 
 def shipment_detail(session: Session, *, public_id: str) -> dict | None:
@@ -159,6 +195,8 @@ def shipment_detail(session: Session, *, public_id: str) -> dict | None:
     if data is None:
         return None
     s, lines = data["shipment"], data["lines"]
+    from app.models.procurement import PurchaseOrder
+    supplier_po = session.get(PurchaseOrder, s.purchase_order_id) if s.purchase_order_id else None
     from app.modules.batches.service import managed_sales
     source = _shipment_order(session, s)
     order = [name for name, _ in _TRACK]
@@ -185,6 +223,9 @@ def shipment_detail(session: Session, *, public_id: str) -> dict | None:
         "statusTone": _SHIP_TONE.get(s.status, "neutral"),
         "meta": [
             {"k": "Order", "v": s.order_ref or "—"},
+            {"k": "Direction", "v": s.direction},
+            *([{"k": "Supplier", "v": supplier_po.supplier_name},
+               {"k": "Receiving", "v": "Confirm arrival in Inventory → Warehouse receiving"}] if supplier_po or s.direction == "Inbound" else []),
             {"k": "Carrier", "v": s.carrier or "—"},
             {"k": "Destination", "v": s.destination or "—"},
             {"k": "ETA", "v": s.eta or "—"},
@@ -202,11 +243,12 @@ def shipment_detail(session: Session, *, public_id: str) -> dict | None:
                 {"name": ln["description"], "sku": ln["sku"] or "—", "qty": ln["qty"]}
                 for ln in lines
             ],
-            "form": None if s.batch_managed else {
+            "form": None if s.batch_managed or (supplier_po and s.status in ("Delivered", "Cancelled")) else {
                 "carrier": s.carrier or "", "destination": s.destination or "",
                 "eta": s.eta or "", "status": s.status,
             },
-            "statusOptions": ["Pending"] + [name for name, _ in _TRACK],
+            "statusOptions": ["Pending"] + [name for name, _ in _TRACK if not supplier_po or name != "Delivered"]
+                + (["Cancelled"] if supplier_po and not s.dispatched_at else []),
         },
     }
 

@@ -1192,7 +1192,8 @@ def _validate_allocation(session, doc, payload, exclude_id=None):
         Payment.allocated_to == (doc.invoice_no if payload.type == "Receipt" else doc.bill_no),
         Payment.status == "Cleared", Payment.is_deleted.is_(False),
         Payment.id != exclude_id if exclude_id else Payment.id.isnot(None)))
-    if payload.amount + applied > doc.amount:
+    supplier_credit = Decimal(str(repo.supplier_credits_applied(session, doc.bill_no))) if payload.type != "Receipt" else Decimal(0)
+    if payload.amount + applied + supplier_credit > doc.amount:
         raise HTTPException(409, "Payment exceeds this document's outstanding amount. Record any excess as an unallocated advance.")
 
 
@@ -1363,6 +1364,9 @@ def update_bill(session, *, public_id: str, payload: BillUpdate):
     from app.models.procurement import PoInvoice
     from fastapi import HTTPException
     bill = repo.bill_by_public(session, public_id=public_id)
+    if bill and repo.supplier_credits_applied(session, bill.bill_no) > 0:
+        if payload.supplier != bill.supplier_name or payload.poRef != bill.po_ref or payload.amount != bill.amount:
+            raise HTTPException(409, "This payable has supplier return credits. Preserve its source supplier, PO and original amount.")
     if bill and session.scalar(select(PoInvoice.id).where(PoInvoice.supplier_bill_id == bill.id,
         PoInvoice.tenant_id == bill.tenant_id, PoInvoice.is_deleted.is_(False)).limit(1)):
         if (payload.supplier != bill.supplier_name or payload.poRef != bill.po_ref
