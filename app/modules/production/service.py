@@ -96,7 +96,7 @@ def _open_line_inspection(session, *, tenant_id, order_ref, line: ProductionOrde
         return
     qty = sum(int(l.qty or 0) for l in repo.list_lines(session, line.order_id) if l.name == item)
     qc_repo.create_inspection(session, tenant_id=_tid(tenant_id),
-                              order_ref=order_ref, item=item, stage="Final", aql="2.5",
+                              order_ref=order_ref, item=item, stage="Final",
                               product=line.name, prod_qty=qty or line.qty, sku=line.sku)
 
 
@@ -121,7 +121,7 @@ def send_for_inspection(session, *, tenant_id, public_id):
         from app.modules.quality import repository as qc_repo
         if not qc_repo.inspection_exists(session, order_ref=po.order_no):
             qc_repo.create_inspection(session, tenant_id=_tid(tenant_id),
-                                      order_ref=po.order_no, stage="Final", aql="2.5",
+                                      order_ref=po.order_no, stage="Final",
                                       product=po.style, prod_qty=po.qty)
     return po
 
@@ -486,7 +486,7 @@ def stage_action(session, *, action, public_id, days=None, worker=None, notes=No
                 from app.modules.quality import repository as qc_repo
                 if not qc_repo.inspection_exists(session, order_ref=po.order_no):
                     qc_repo.create_inspection(session, tenant_id=stage.tenant_id,
-                                              order_ref=po.order_no, stage="Final", aql="2.5",
+                                              order_ref=po.order_no, stage="Final",
                                               product=po.style, prod_qty=po.qty)
             if po is not None and po.purchase_order_id:
                 from app.modules.shipments.supplier_inbound import ensure

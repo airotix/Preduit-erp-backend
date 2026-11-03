@@ -5,26 +5,20 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.audit import write_audit
+from app.core.roles import has_permission
+from app.models.core import Tenant
 from app.models.production import ProductionOrder, ProductionOrderLine
 from app.models.quality import Inspection
 from app.models.batches import ProductionBatch, BatchLine
 from app.modules.quality import aql as aql_engine
 from app.modules.quality import repository as repo
-from app.modules.quality.dto import DefectTypeCreate, DefectTypeUpdate, InspectionCreate
+from app.modules.quality.dto import DefectTypeCreate, DefectTypeUpdate
 from app.presenters.screen import list_config, text_cell
 
 _RESULT_TONE = {"Pass": "green", "Fail": "red", "Pending": "amber",
                 "In Progress": "navy", "Cancelled": "neutral"}
 _SEV_TONE = {"Critical": "red", "Major": "red", "Minor": "amber"}
-
-
-def _batch_managed_order(session, tenant_id, order_ref):
-    if not order_ref:
-        return False
-    return bool(session.scalar(select(ProductionBatch.id).join(ProductionOrder,
-        ProductionOrder.id == ProductionBatch.order_id).where(
-        ProductionOrder.order_no == order_ref, ProductionOrder.tenant_id == _tid(tenant_id),
-        ProductionBatch.tenant_id == _tid(tenant_id)).limit(1)))
 
 
 def order_items(session: Session, order_ref: str | None) -> list[dict]:
@@ -49,34 +43,30 @@ def order_items(session: Session, order_ref: str | None) -> list[dict]:
     return [{"item": n, "qty": q} for n, q in agg.items()]
 
 
-def _item_qty(session: Session, order_ref: str | None, item: str | None) -> int | None:
-    """Total quantity for one item across the order's production lines."""
-    for it in order_items(session, order_ref):
-        if it["item"] == item:
-            return it["qty"]
-    return None
-
-
-def _po_autofill(session: Session, order_ref: str | None) -> dict:
-    """Pull product/sku/qty from the matching production order (read-only) so we
-    don't ask the inspector to re-key data the ERP already has."""
-    if not order_ref:
-        return {}
-    po = session.execute(
-        select(ProductionOrder).where(ProductionOrder.order_no == order_ref,
-                                      ProductionOrder.is_deleted == False)  # noqa: E712
-    ).scalar_one_or_none()
-    if po is None:
-        return {}
-    sku = session.execute(
-        select(ProductionOrderLine.sku).where(ProductionOrderLine.order_id == po.id,
-                                               ProductionOrderLine.sku.isnot(None)).limit(1)
-    ).scalar_one_or_none()
-    return {"product": po.style, "prod_qty": po.qty, "sku": sku}
-
-
 def _tid(t: str | UUID) -> UUID:
     return t if isinstance(t, uuid.UUID) else uuid.UUID(str(t))
+
+
+# ---------- Company settings ----------
+
+def get_settings(session: Session, *, tenant_id, permissions: list[str]) -> dict:
+    return {"aql": repo.tenant_aql(session, _tid(tenant_id)),
+            "options": list(aql_engine.SUPPORTED_AQL),
+            "canEdit": has_permission(permissions, "admin.settings")}
+
+
+def update_settings(session: Session, *, tenant_id, payload, actor: str) -> dict:
+    """Change the AQL level used for new inspections. Recorded inspections keep theirs."""
+    from fastapi import HTTPException
+    tenant = session.get(Tenant, _tid(tenant_id))
+    if tenant is None:
+        raise HTTPException(404, "Company not found.")
+    previous, tenant.qc_aql = tenant.qc_aql, payload.aql
+    session.flush()
+    if previous != payload.aql:
+        write_audit(session, tenant_id=tenant.id, action="UPDATE", entity_type="quality_settings",
+                    entity_id=str(tenant.id), detail=f"AQL level {previous} to {payload.aql}; {actor}")
+    return {"aql": tenant.qc_aql}
 
 
 # ---------- Inspections ----------
@@ -153,51 +143,6 @@ def inspections_screen(session: Session, *, limit: int = 50, offset: int = 0) ->
     )
 
 
-def create_inspection(session, *, tenant_id, payload: InspectionCreate):
-    """Create a Pending inspection, auto-pulling product/SKU/quantity from the
-    production order so the inspector doesn't re-enter existing ERP data."""
-    from fastapi import HTTPException
-    if _batch_managed_order(session, tenant_id, payload.order):
-        raise HTTPException(409, "Record inspection against the production batch in Quality")
-    from app.modules.shipments.supplier_inbound import guard_final_qc_change
-    guard_final_qc_change(session, _tid(tenant_id), payload.order, payload.stage)
-    auto = _po_autofill(session, payload.order)
-    item = (payload.item or "").strip() or None
-    # When an item is chosen, scope product + quantity to that item (production
-    # line); otherwise fall back to the whole-order autofill.
-    if item:
-        product = payload.product or item
-        prod_qty = _item_qty(session, payload.order, item)
-    else:
-        product = payload.product or auto.get("product")
-        prod_qty = auto.get("prod_qty")
-    return repo.create_inspection(
-        session, tenant_id=_tid(tenant_id), order_ref=payload.order,
-        stage=payload.stage, aql=payload.aql,
-        sku=payload.sku or auto.get("sku"),
-        product=product, batch_lot=payload.batchLot,
-        inspection_type=payload.inspectionType,
-        prod_qty=prod_qty, inspector=payload.inspector, item=item,
-    )
-
-
-def update_inspection(session, *, public_id, payload):
-    existing = repo.get_inspection(session, public_id=public_id)
-    if existing is not None and existing.batch_line_id:
-        from fastapi import HTTPException
-        raise HTTPException(409, "Batch inspection quantities are immutable; record a new QC action for changes")
-    ss = None
-    if payload.sampleSize not in (None, ""):
-        try:
-            ss = int(str(payload.sampleSize).strip())
-        except ValueError:
-            ss = None
-    return repo.update_inspection_header(
-        session, public_id=public_id, inspector=payload.inspector,
-        batch_lot=payload.batchLot, inspection_type=payload.inspectionType,
-        aql=payload.aql, sample_size=ss)
-
-
 def start_inspection(session, *, public_id, tenant_id=None):
     current = repo.get_inspection(session, public_id=public_id)
     if current is not None and current.result == "Cancelled":
@@ -226,10 +171,23 @@ def _eval_check(target, tolerance, actual, result):
     return result
 
 
+def _require_open(ins):
+    """The checklist is evidence for a decision, so it is frozen once one is recorded."""
+    if ins is not None and ins.result not in ("Pending", "In Progress"):
+        from fastapi import HTTPException
+        raise HTTPException(409, "This inspection is already decided. Its checklist can no longer be changed.")
+
+
+def _check_inspection(session, check_public_id):
+    check = repo.get_check(session, public_id=check_public_id)
+    return session.get(Inspection, check.inspection_id) if check is not None else None
+
+
 def add_check(session, *, tenant_id, public_id, payload):
     ins = repo.get_inspection(session, public_id=public_id)
     if ins is None:
         return None
+    _require_open(ins)
     result = _eval_check(payload.targetValue, payload.tolerance, payload.actual, payload.result)
     return repo.add_check(session, tenant_id=_tid(tenant_id), inspection_id=ins.id,
                           criterion=payload.criterion, requirement=payload.requirement,
@@ -238,6 +196,7 @@ def add_check(session, *, tenant_id, public_id, payload):
 
 
 def update_check(session, *, check_public_id, payload):
+    _require_open(_check_inspection(session, check_public_id))
     result = _eval_check(payload.targetValue, payload.tolerance, payload.actual, payload.result)
     return repo.update_check(session, public_id=check_public_id,
                              criterion=payload.criterion, requirement=payload.requirement,
@@ -246,6 +205,7 @@ def update_check(session, *, check_public_id, payload):
 
 
 def delete_check(session, *, check_public_id):
+    _require_open(_check_inspection(session, check_public_id))
     return repo.delete_check(session, public_id=check_public_id)
 
 
@@ -291,38 +251,6 @@ def delete_defect(session, *, defect_public_id):
 
 
 # ---------- Disposition + re-inspection ----------
-
-def set_disposition(session, *, public_id, payload):
-    """Record disposition for a failed inspection. Guard: only a FAILED
-    inspection can be dispositioned."""
-    ins = repo.get_inspection(session, public_id=public_id)
-    if ins is None:
-        return None
-    if ins.batch_line_id:
-        from fastapi import HTTPException
-        raise HTTPException(409, "Batch dispositions are recorded with their QC quantities")
-    if ins.result != "Fail":
-        return {"error": "not_failed"}
-    child = session.scalar(select(Inspection).where(Inspection.parent_inspection_id == ins.id,
-        Inspection.tenant_id == ins.tenant_id, Inspection.is_deleted.is_(False)).limit(1))
-    if child and payload.disposition != ins.disposition:
-        from fastapi import HTTPException
-        raise HTTPException(409, "Recovery is already underway; keep its selected disposition.")
-    import datetime as _dt
-    due = None
-    if payload.dueDate:
-        try:
-            due = _dt.date.fromisoformat(payload.dueDate[:10])
-        except ValueError:
-            due = None
-    ins = repo.set_disposition(session, public_id=public_id, disposition=payload.disposition,
-                               notes=payload.notes, assigned_to=payload.assignedTo, due_date=due)
-    return {"inspection": ins}
-
-
-def create_reinspection(session, *, tenant_id, public_id):
-    return reopen_failed(session, tenant_id=tenant_id, public_id=public_id, mode="inspection")
-
 
 def production_for_inspection(session, ins):
     return session.scalar(select(ProductionOrder).where(ProductionOrder.tenant_id == ins.tenant_id,
@@ -419,47 +347,6 @@ def reopen_failed(session, *, tenant_id, public_id, mode, notes=None, assigned_t
 
 def ai_insights(session):
     return repo.defect_insights(session)
-
-
-# ---------- Completion (auto result) ----------
-
-def complete_inspection(session, *, public_id):
-    from fastapi import HTTPException
-    raise HTTPException(409, "Save the checklist, then confirm approve, hold, or split quantities. Completing an inspection does not release the order by itself.")
-
-
-def set_result(session, *, public_id, status, tenant_id=None):
-    current = repo.get_inspection(session, public_id=public_id)
-    if status == "Pass" and (current is None or current.result != "Pass"):
-        from fastapi import HTTPException
-        raise HTTPException(409, "Approve quantities from the inspection decision. A status change cannot release goods.")
-    if status == "Fail" and current is not None and current.result in ("Pending", "In Progress"):
-        from fastapi import HTTPException
-        raise HTTPException(409, "Record the hold or rejection from the inspection decision.")
-    if current is not None and status == "Pass" and current.result == "Pending":
-        from fastapi import HTTPException
-        raise HTTPException(409, "Start and complete this inspection before recording a pass.")
-    if current is not None and current.batch_line_id:
-        from fastapi import HTTPException
-        raise HTTPException(409, "Batch inspection results are recorded with their QC quantities")
-    if current is not None and current.result == "Cancelled" and status != "Cancelled":
-        from fastapi import HTTPException
-        raise HTTPException(409, "A cancelled inspection cannot be reopened.")
-    if current and status == "Pass" and inspection_waits_for_rework(session, current):
-        from fastapi import HTTPException
-        raise HTTPException(409, "Complete the reopened production TNA before passing reinspection.")
-    if current and current.result != status:
-        from app.modules.shipments.supplier_inbound import guard_final_qc_change
-        guard_final_qc_change(session, current.tenant_id, current.order_ref, current.stage)
-    ins = repo.set_result(session, public_id=public_id, result=status)
-    from app.modules.shipments.supplier_inbound import after_inspection
-    after_inspection(session, ins)
-    return ins
-
-
-def pass_and_ship(session, *, tenant_id, public_id, carrier, destination):
-    from fastapi import HTTPException
-    raise HTTPException(409, "Create the shipment in Shipments after final QC approval. Quality does not collect a carrier or destination.")
 
 
 _PROGRESS_STEPS = ["Created", "Sampling", "Inspection", "Defect Review", "Decision", "Completed"]

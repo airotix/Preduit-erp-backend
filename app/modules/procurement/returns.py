@@ -179,7 +179,7 @@ def create(db, tid, payload, who):
         workflows.cache(db, tid, line.variant_id)
     if ret.resolution == 'Replacement':
         from app.modules.quality.repository import create_inspection
-        ins = create_inspection(db, tenant_id=tid, order_ref=f'SR-{ret.id}', stage='Final', aql='2.5',
+        ins = create_inspection(db, tenant_id=tid, order_ref=f'SR-{ret.id}', stage='Final',
             sku=line.sku, product=line.name, prod_qty=ret.quantity, inspection_type='Supplier replacement')
         ret.inspection_id = ins.id
         ret.status = 'Awaiting replacement'

@@ -421,7 +421,12 @@ class FinanceWorkflowTests(unittest.TestCase):
         data["contact"] = "Updated contact"
         procurement.update_invoice(self.db, public_id=invoice.public_id, data=data)
         self.assertEqual(invoice.supplier_bill_id, bill.id)
-        data["totals"]["total"] += 50
+        original_total = float(invoice.total)
+        data["totals"]["total"] += 50  # derived values are recomputed from the PO, so a tampered total is ignored
+        procurement.update_invoice(self.db, public_id=invoice.public_id, data=data)
+        self.assertEqual(float(invoice.total), original_total)
+        self.assertEqual(float(bill.amount), original_total)
+        data["currency"] = "USD"  # but identity/currency cannot be changed independently of the PO
         with self.assertRaises(HTTPException):
             procurement.update_invoice(self.db, public_id=invoice.public_id, data=data)
         self.assertEqual(float(bill.amount), float(invoice.total))

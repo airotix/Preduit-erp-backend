@@ -19,7 +19,7 @@ from app.modules.procurement import service as procurement
 from app.modules.sales import service as sales
 from app.modules.sales.dto import OrderCreate
 from app.modules.quality import service as quality
-from app.modules.quality.dto import DefectIn
+from app.modules.quality.dto import CheckIn, DefectIn
 
 
 class InvoiceBankingQualityTests(unittest.TestCase):
@@ -40,9 +40,10 @@ class InvoiceBankingQualityTests(unittest.TestCase):
         self.assertEqual(json.loads(inv.data)["remit"]["account"], "123")
 
     def test_basic_sales_invoice_detail_contains_company_bank_fields(self):
+        fixtures.ensure_catalog(self.db, self.tid)
         with patch.object(sales, "build_sales_invoice_draft", return_value=None):
             sales.create_order(self.db, tenant_id=self.tid, payload=OrderCreate(customer="Buyer", channel="Retail",
-                lines=[dict(name="Article", qty=1, price=10)]))
+                lines=[dict(name="Shirt", color="Blue", size="S", sku="SH-B-S", qty=1, price=10)]))
         from app.models.sales import Invoice
         inv = self.db.scalar(select(Invoice))
         with patch.object(sales.repo, "company_info", return_value=dict(name="Brand", bank_name="Bank", bank_account="456")):
@@ -128,6 +129,55 @@ class InvoiceBankingQualityTests(unittest.TestCase):
             quality.add_defect(self.db, tenant_id=self.tid, public_id=str(ins.public_id),
                 payload=DefectIn(newDefect={"name": "Hole", "category": " ", "severity": "Major"}))
         self.assertEqual(len(self.db.scalars(select(DefectType)).all()), 0)
+
+    def test_checklist_is_frozen_once_the_inspection_is_decided(self):
+        ins = self.inspection()
+        ins.result = "In Progress"
+        check = quality.add_check(self.db, tenant_id=self.tid, public_id=str(ins.public_id),
+            payload=CheckIn(criterion="Stitching", result="Pending"))
+        quality.update_check(self.db, check_public_id=str(check.public_id),
+            payload=CheckIn(criterion="Stitching", result="Pass"))
+        ins.result = "Pass"
+        self.db.flush()
+        with self.assertRaises(HTTPException) as added:
+            quality.add_check(self.db, tenant_id=self.tid, public_id=str(ins.public_id),
+                payload=CheckIn(criterion="Colour", result="Pass"))
+        with self.assertRaises(HTTPException):
+            quality.update_check(self.db, check_public_id=str(check.public_id),
+                payload=CheckIn(criterion="Stitching", result="Fail"))
+        with self.assertRaises(HTTPException):
+            quality.delete_check(self.db, check_public_id=str(check.public_id))
+        self.assertEqual(added.exception.status_code, 409)
+
+    def test_new_inspections_use_the_company_aql_setting(self):
+        from pydantic import ValidationError
+        from app.models.core import Tenant
+        from app.modules.quality import repository as qc_repo
+        from app.modules.quality.dto import QualitySettingsIn
+        tenant = self.db.get(Tenant, self.tid) or Tenant(
+            id=self.tid, name="Company", slug=str(self.tid), base_currency_code="USD")
+        self.db.add(tenant)
+        self.db.flush()
+        current = quality.get_settings(self.db, tenant_id=self.tid, permissions=["quality.read"])
+        self.assertEqual((current["aql"], current["canEdit"]), ("2.5", False))
+        self.assertTrue(quality.get_settings(self.db, tenant_id=self.tid, permissions=["admin.settings"])["canEdit"])
+        with self.assertRaises(ValidationError):
+            QualitySettingsIn(aql="3.0")
+        with patch("app.modules.quality.service.write_audit"):
+            quality.update_settings(self.db, tenant_id=self.tid, payload=QualitySettingsIn(aql="4.0"), actor="admin")
+        first = qc_repo.create_inspection(self.db, tenant_id=self.tid, order_ref="PO-AQL", stage="Final", prod_qty=500)
+        self.assertEqual((first.aql, first.sample_size, first.max_defects), ("4.0", 50, 7))
+        explicit = qc_repo.create_inspection(self.db, tenant_id=self.tid, order_ref="PO-AQL", stage="Final",
+                                             aql="1.0", prod_qty=500)
+        self.assertEqual(explicit.aql, "1.0")
+        self.assertEqual(first.aql, "4.0")
+
+    def test_next_action_tells_the_user_what_to_do(self):
+        from app.modules.quality.workflow import _next_action
+        self.assertEqual(_next_action(awaiting=5, held=0, open_result=None), "Inspect")
+        self.assertEqual(_next_action(awaiting=5, held=2, open_result="In Progress"), "Continue")
+        self.assertEqual(_next_action(awaiting=0, held=2, open_result=None), "Resolve hold")
+        self.assertEqual(_next_action(awaiting=0, held=0, open_result=None), "Done")
 
     def test_inspection_tabs_show_latest_run_and_history_preserves_old_details(self):
         parent = self.inspection("Fail")

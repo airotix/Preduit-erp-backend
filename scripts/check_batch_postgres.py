@@ -21,6 +21,8 @@ from app.models.core import Tenant
 from app.models.catalog import Product, ProductVariant, AttributeValue
 from app.models.inventory import Location, StockLevel
 from app.models.procurement import Supplier
+from app.models.supplier_pricing import SupplierPrice
+import test_sales_fulfillment as sales_fixtures
 from test_batch_execution import BatchExecutionTests
 from test_batch_handoffs import BatchHandoffTests
 
@@ -42,39 +44,63 @@ with engine.begin() as conn:
 
 
 class PostgreSQLBatchTests(BatchExecutionTests, BatchHandoffTests):
+    approve_po = sales_fixtures.SalesFulfillmentTests.approve_po
+
     def setUp(self):
         self.engine = engine
         self.connection = engine.connect()
         self.connection.execute(text(f'SET search_path TO "{schema}", public'))
         self.db = Session(self.connection, autoflush=False)
+        # Release the connection even if setUp fails; a leaked open transaction blocks the TRUNCATE in later cleanup.
+        self.addCleanup(lambda: (self.db.close(), self.connection.rollback(), self.connection.close()))
         self.tid = uuid.uuid4()
         self.connection.execute(text("SELECT set_config('app.tenant_id', :tid, false)"), {"tid": str(self.tid)})
         self.db.add(Tenant(id=self.tid, name="Batch test", slug=str(self.tid), base_currency_code="EUR"))
         self.db.flush()
+        self.audit = [patch(target, return_value=None) for target in (
+            "app.core.audit.write_audit",
+            "app.modules.catalog.commitments.write_audit",
+            "app.modules.catalog.retirement.write_audit",
+            "app.modules.catalog.service.write_audit",
+            "app.modules.documents.service.write_audit",
+            "app.modules.finance.service.write_audit",
+            "app.modules.procurement.changes.write_audit",
+            "app.modules.procurement.performance.write_audit",
+            "app.modules.procurement.returns.write_audit",
+            "app.modules.production.withdrawal.write_audit",
+            "app.modules.shipments.actions.write_audit")]
+        for patcher in self.audit: patcher.start()  # the disposable schema has no audit_log for its tenant
         self.post = patch("app.modules.finance.service.post_unposted", return_value=0); self.post.start()
         self.company = patch("app.modules.procurement.repository.company_info", return_value={}); self.company.start()
         self.supplier = Supplier(tenant_id=self.tid, name="Factory", lead_time="14 days")
         self.location = Location(tenant_id=self.tid, name="Warehouse")
-        self.product = Product(tenant_id=self.tid, title="Shirt")
+        self.product = Product(tenant_id=self.tid, title="Shirt", status="Active")
         self.color = AttributeValue(tenant_id=self.tid, attr_type="Color", value="Blue", code="BLUE")
         self.size = AttributeValue(tenant_id=self.tid, attr_type="Size", value="S", code="S")
         self.db.add_all([self.supplier, self.location, self.product, self.color, self.size]); self.db.flush()
         self.variant = ProductVariant(tenant_id=self.tid, product_id=self.product.id, sku="SH-B-S", color_id=self.color.id,
-            size_id=self.size.id, price=20, supplier_price=8, currency_code="EUR")
+            size_id=self.size.id, price=20, retail_price=20, wholesale_price=18, online_price=22,
+            supplier_price=8, currency_code="EUR")
         self.db.add(self.variant); self.db.flush()
+        self.db.add(SupplierPrice(tenant_id=self.tid, variant_id=self.variant.id, supplier_id=self.supplier.id,
+            price=8, currency="EUR", active=True)); self.db.flush()
         self.level = StockLevel(tenant_id=self.tid, variant_id=self.variant.id, location_id=self.location.id, on_hand=0, reserved=0)
         self.db.add(self.level); self.db.flush()
         self.so = self.order(1000)
+        self.so.allow_partial_shipments = True  # these scenarios ship an order in several parts
+        self.db.flush()
         from app.modules.sales import fulfillment
         from app.models.production import ProductionOrder
         from app.models.procurement import PurchaseOrderLine
         from sqlalchemy import select
         self.po = fulfillment.create_shortage_po(self.db, tenant_id=self.tid, public_id=self.so.public_id, supplier_id=self.supplier.public_id)
+        self.approve_po(self.po)  # production only starts once the source PO is approved
         self.work = self.db.scalar(select(ProductionOrder).where(ProductionOrder.tenant_id == self.tid))
         self.source = self.db.scalar(select(PurchaseOrderLine).where(PurchaseOrderLine.tenant_id == self.tid))
 
     def tearDown(self):
         self.post.stop(); self.company.stop()
+        for patcher in self.audit: patcher.stop()
         self.db.close(); self.connection.rollback(); self.connection.close()
 
     def test_z_competing_shipments_cannot_allocate_the_same_pieces(self):

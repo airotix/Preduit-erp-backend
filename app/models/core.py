@@ -47,6 +47,8 @@ class Tenant(Base):
     bank_account: Mapped[str | None] = mapped_column(String(60), nullable=True)
     bank_iban: Mapped[str | None] = mapped_column(String(60), nullable=True)
     bank_swift: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Company-wide AQL level used for every new quality inspection (see V083).
+    qc_aql: Mapped[str] = mapped_column(String(4), default="2.5", server_default="2.5")
 
 
 class Subscription(Base):

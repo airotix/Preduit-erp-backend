@@ -340,8 +340,9 @@ def _dispatch(session, tid, actor, ship, payload):
     from app.modules.batches.dto import ShipmentStatus
     from app.modules.batches import service as batches
     from app.modules.batches import workflow
-    command = ShipmentStatus(requestId=payload.requestId, reason=payload.reason,
-        status="In transit" if ship.batch_managed else "Dispatched")
+    # The command only carries the request id/reason for batch shipments; ordinary shipments
+    # go through _transition("Dispatched") below, which is not a ShipmentStatus value.
+    command = ShipmentStatus(requestId=payload.requestId, reason=payload.reason, status="In transit")
     if ship.batch_managed and ship.direction == "Inbound":
         return workflow.inbound_status(session, tid, actor, ship, command)
     if ship.batch_managed:

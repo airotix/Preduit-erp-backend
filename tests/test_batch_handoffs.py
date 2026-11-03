@@ -33,8 +33,9 @@ class BatchHandoffTests(unittest.TestCase):
     def deliver(self, ship, accepted=None):
         workflow.inbound_status(self.db, self.tid, "shipping", ship, self.cmd(dto.ShipmentStatus, status="In transit"))
         allocations = batches.rows(self.db, InboundAllocation, self.tid, InboundAllocation.shipment_id == ship.id)
-        command = self.cmd(dto.ShipmentStatus, status="Delivered", accepted=[dict(allocationId=a.id, qty=a.qty if accepted is None else accepted) for a in allocations])
-        workflow.inbound_status(self.db, self.tid, "warehouse", ship, command)
+        command = self.cmd(dto.ReceiveInbound, locationId=self.location.id, reference="DEL-TEST",
+            accepted=[dict(allocationId=a.id, qty=a.qty if accepted is None else accepted) for a in allocations])
+        workflow.receive_inbound(self.db, self.tid, "warehouse", ship, command)
         return command
 
     def test_separate_batches_keep_one_po_and_independent_delivery(self):
@@ -47,7 +48,7 @@ class BatchHandoffTests(unittest.TestCase):
         self.assertEqual(self.po.status, "Partially received")
         self.assertFalse(self.po.inventory_received)
         self.assertEqual(self.so.status, "Awaiting stock")
-        workflow.inbound_status(self.db, self.tid, "warehouse", ship, command)
+        workflow.receive_inbound(self.db, self.tid, "warehouse", ship, command)  # a retried receipt is a no-op
         self.assertEqual(self.level.on_hand, 400)
         for kind, order_id in [("production", self.work.public_id), ("sales", self.so.public_id), ("procurement", self.po.public_id)]:
             data = batches.view(self.db, self.tid, order_id, kind)
@@ -71,7 +72,11 @@ class BatchHandoffTests(unittest.TestCase):
         batch, line = self.plan(); self.produce(batch, line); self.qc(batch, line, 200)
         ship = self.inbound(line, 200)
         self.deliver(ship, 180)
-        self.assertEqual((line.approved, line.held, line.received, self.level.on_hand), (180, 20, 180, 180))
+        # A short delivery is recorded as an open discrepancy: the 20 missing pieces are neither received
+        # nor available to ship again until it is reconciled.
+        self.assertEqual((line.approved, line.held, line.received, self.level.on_hand), (200, 0, 180, 180))
+        self.assertEqual(sum(a.discrepancy_qty or 0 for a in batches.rows(self.db, InboundAllocation, self.tid,
+            InboundAllocation.shipment_id == ship.id)), 20)
         self.assertEqual(workflow.ready(self.db, self.tid, line), 0)
         self.assertEqual(self.count(GoodsReceipt), 1)
         with self.assertRaises(HTTPException): workflow.inbound_status(self.db, self.tid, "warehouse", ship, self.cmd(dto.ShipmentStatus, status="Delivered"))
@@ -184,9 +189,6 @@ class BatchHandoffTests(unittest.TestCase):
         self.assertEqual(detail["batchId"], str(batch.public_id))
         self.assertEqual(detail["meta"][2]["v"], "150")
         self.assertEqual(self.count(batches.Shipment), 0)
-        with self.assertRaises(HTTPException):
-            quality.pass_and_ship(self.db, tenant_id=self.tid,
-                public_id=recorded["inspectionId"], carrier="Carrier", destination="Warehouse")
 
     def test_quality_lists_batches_separately_under_one_order(self):
         first, first_line = self.plan(100, "B1")
@@ -229,7 +231,12 @@ class BatchHandoffTests(unittest.TestCase):
             principal.permissions = ["inventory.read", "inventory.write"]
             self.assertEqual(client.get("/batches/work/inventory").status_code, 200)
             self.assertEqual(client.post(f"/batches/shipments/{ship_id}/status", json=self.cmd(dto.ShipmentStatus, status="Customs").model_dump(mode="json")).status_code, 403)
-            for _ in range(2): self.assertEqual(client.post(f"/batches/shipments/{ship_id}/status", json=delivery).status_code, 200)
+            # Receipt is posted in Inventory → Warehouse receiving; a retry with the same request ID is a no-op.
+            from app.modules.inventory.router import router as inventory_router
+            app.include_router(inventory_router)
+            receipt = dict(locationId=str(self.location.public_id), reference="DEL-TEST", reason="Counted at the dock",
+                           requestId=str(__import__("uuid").uuid4()), lines=[dict(allocationId=a.id, quantity=200)])
+            for _ in range(2): self.assertEqual(client.post(f"/inventory/receiving/shipments/{ship_id}", json=receipt).status_code, 201)
             self.assertEqual((self.level.on_hand, line.received, self.count(GoodsReceipt)), (200, 200, 1))
 
     def test_all_modules_retain_the_same_batch_after_completion(self):

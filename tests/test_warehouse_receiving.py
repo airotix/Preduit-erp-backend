@@ -25,6 +25,11 @@ class WarehouseReceivingTests(unittest.TestCase):
     count = sales_fixtures.SalesFulfillmentTests.count
     order = sales_fixtures.SalesFulfillmentTests.order
     create_po = sales_fixtures.SalesFulfillmentTests.create_po
+    approve_po = sales_fixtures.SalesFulfillmentTests.approve_po
+    approve_qc = sales_fixtures.SalesFulfillmentTests.approve_qc
+    act = sales_fixtures.SalesFulfillmentTests.act
+    dispatch_shipment = sales_fixtures.SalesFulfillmentTests.dispatch_shipment
+    deliver_shipment = sales_fixtures.SalesFulfillmentTests.deliver_shipment
     clear_qc = sales_fixtures.SalesFulfillmentTests.clear_qc
 
     def work(self, passed=True):
@@ -43,7 +48,7 @@ class WarehouseReceivingTests(unittest.TestCase):
         order, po, line = self.work(passed=False)
         self.assertFalse(receiving.queue(self.db, tenant_id=self.tid)["orders"][0]["ready"])
         inspection = self.db.scalar(select(quality.Inspection))
-        quality.set_result(self.db, public_id=inspection.public_id, status="Pass")
+        self.approve_qc(inspection)
         queue = receiving.queue(self.db, tenant_id=self.tid)
         self.assertTrue(queue["orders"][0]["ready"])
         self.assertEqual(queue["orders"][0]["lines"][0]["remaining"], 40)
@@ -70,7 +75,7 @@ class WarehouseReceivingTests(unittest.TestCase):
         receiving.post(self.db, tenant_id=self.tid, public_id=po.public_id, payload=self.payload(line, 25))
         self.assertTrue(po.inventory_received)
         self.assertEqual(po.status, "Received")
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         self.assertEqual(self.count(Shipment), 1)
         self.assertEqual(self.count(GoodsReceipt), 2)
         self.assertEqual(self.count(GoodsReceiptLine), 2)
@@ -114,7 +119,7 @@ class WarehouseReceivingTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             receiving.post(self.db, tenant_id=self.tid, public_id=po.public_id, payload=self.payload(line))
         inspection = self.db.scalar(select(quality.Inspection))
-        quality.set_result(self.db, public_id=inspection.public_id, status="Pass")
+        self.approve_qc(inspection)
         payload = self.payload(line, 10)
         payload.lines.append(payload.lines[0])
         with self.assertRaises(HTTPException):
@@ -136,16 +141,15 @@ class WarehouseReceivingTests(unittest.TestCase):
         self.db.add(second); self.db.flush()
         receiving.post(self.db, tenant_id=self.tid, public_id=po.public_id, payload=self.payload(line, location=second))
         shipment = self.db.scalar(select(Shipment))
-        shipping.set_status(self.db, public_id=shipment.public_id, status="Dispatched")
+        self.dispatch_shipment(shipment)
         self.assertTrue(shipment.inventory_dispatched)
         self.assertIsNotNone(shipment.dispatched_at)
         self.assertEqual(order.status, "Shipped")
         self.assertEqual(sum(level.on_hand for level in self.db.scalars(select(StockLevel))), 0)
         self.assertEqual(sum(level.reserved for level in self.db.scalars(select(StockLevel))), 0)
         self.assertEqual(fulfillment.holds_for(self.db, order), [])
-        for status in ("Dispatched", "In transit", "Delivered", "Delivered"):
-            shipping.set_status(self.db, public_id=shipment.public_id, status=status)
-        shipping.set_status(self.db, public_id=shipment.public_id, status="Dispatched")
+        self.deliver_shipment(shipment)
+        self.act(shipment, "dispatch")  # a repeated dispatch must not reset a delivered shipment
         self.assertEqual(shipment.status, "Delivered")
         self.assertIsNotNone(shipment.delivered_at)
         self.assertEqual(sum(level.on_hand for level in self.db.scalars(select(StockLevel))), 0)
@@ -158,7 +162,9 @@ class WarehouseReceivingTests(unittest.TestCase):
             shipping.update_shipment(self.db, public_id=shipment.public_id, payload=edit)
         self.assertEqual(shipment.status, "Pending")
         self.assertEqual(self.level.on_hand, 60)
-        shipping.update_shipment(self.db, public_id=shipment.public_id, payload=edit.model_copy(update={"status": "Dispatched"}))
+        with self.assertRaises(HTTPException):  # nor can an edit dispatch it: stock only moves via the dispatch action
+            shipping.update_shipment(self.db, public_id=shipment.public_id, payload=edit.model_copy(update={"status": "Dispatched"}))
+        self.dispatch_shipment(shipment)
         for status in ("Pending", "Label created", "Cancelled", "Bogus"):
             with self.assertRaises(HTTPException):
                 shipping.set_status(self.db, public_id=shipment.public_id, status=status)
@@ -171,15 +177,16 @@ class WarehouseReceivingTests(unittest.TestCase):
         self.assertEqual(self.level.reserved, 0)
         self.assertEqual(self.level.on_hand, 60)
         with self.assertRaises(HTTPException):
-            shipping.set_status(self.db, public_id=shipment.public_id, status="Dispatched")
+            self.dispatch_shipment(shipment)
 
     def test_failed_dispatch_is_atomic(self):
         order = self.order(40)
         shipment = self.db.scalar(select(Shipment))
+        self.act(shipment, "pack")
         with patch("app.core.audit.write_audit", side_effect=RuntimeError("Audit unavailable")):
             with self.assertRaises(RuntimeError):
-                shipping.set_status(self.db, public_id=shipment.public_id, status="Dispatched")
+                self.act(shipment, "dispatch")
         self.assertEqual((self.level.on_hand, self.level.reserved), (60, 40))
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Packed")  # packing stands; only the failed dispatch rolled back
         self.assertFalse(shipment.inventory_dispatched)
         self.assertEqual(shipment.status, "Pending")

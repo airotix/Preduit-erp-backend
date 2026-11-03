@@ -15,6 +15,7 @@ from app.models.production import ProductionOrder, ProductionOrderLine, Producti
 from app.models.quality import Inspection, InspectionCheck
 from app.models.sales import Invoice
 from app.models.shipments import Shipment, ShipmentLine
+from app.models.supplier_pricing import SupplierPrice
 from app.modules.sales import service as sales, fulfillment
 from app.modules.sales.dto import OrderCreate
 from app.modules.procurement import service as procurement
@@ -39,8 +40,12 @@ class SalesFulfillmentTests(unittest.TestCase):
         self.db.add_all([self.supplier, self.location, self.product, self.color, self.size])
         self.db.flush()
         self.variant = ProductVariant(tenant_id=self.tid, product_id=self.product.id, sku="SH-B-S",
-            color_id=self.color.id, size_id=self.size.id, price=20, supplier_price=Decimal("8"), currency_code="EUR")
+            color_id=self.color.id, size_id=self.size.id, price=20, retail_price=20, wholesale_price=18,
+            online_price=22, supplier_price=Decimal("8"), currency_code="EUR")
         self.db.add(self.variant)
+        self.db.flush()
+        self.db.add(SupplierPrice(tenant_id=self.tid, variant_id=self.variant.id, supplier_id=self.supplier.id,
+            price=Decimal("8"), currency="EUR", active=True))
         self.db.flush()
         self.level = StockLevel(tenant_id=self.tid, variant_id=self.variant.id, location_id=self.location.id, on_hand=60, reserved=0)
         self.db.add(self.level)
@@ -65,7 +70,7 @@ class SalesFulfillmentTests(unittest.TestCase):
     def test_catalog_restock_ships_waiting_order_once_and_preserves_holds(self):
         order = self.order()
         self.restock_matrix(100)
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         shipment = self.db.scalar(select(Shipment))
         self.assertEqual(shipment.status, "Pending")
         self.assertEqual(shipment.sales_order_id, order.id)
@@ -90,7 +95,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         inventory.create_stock_receipt(self.db, tenant_id=self.tid, payload=StockReceiptCreate(
             location=self.location.name, reference="RC-TEST", reason="Goods received",
             lines=[dict(name="Shirt", color="Blue", size="S", qty=40)]))
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         self.assertEqual((self.level.on_hand, self.level.reserved), (100, 100))
         self.assertEqual(self.count(Shipment), 1)
         self.assertFalse(po.inventory_received)
@@ -99,16 +104,17 @@ class SalesFulfillmentTests(unittest.TestCase):
     def test_restock_allocates_competing_orders_oldest_first_without_overselling(self):
         first, second = self.order(), self.order(50)
         self.restock_matrix(130)
-        self.assertEqual(first.status, "Packed")
+        self.assertEqual(first.status, "Ready to pack")
         self.assertEqual(second.status, "PO needed")
         self.assertEqual(sum(h.qty for h in fulfillment.holds_for(self.db, second)), 30)
         self.assertEqual(self.level.reserved, 130)
         self.restock_matrix(150, source="inventory")
-        self.assertEqual(second.status, "Packed")
+        self.assertEqual(second.status, "Ready to pack")
         self.assertEqual(self.count(Shipment), 2)
         self.assertEqual((self.level.on_hand, self.level.reserved), (150, 150))
 
     def test_restock_waits_for_every_size_before_shipment(self):
+        self.add_variant("M", "SH-B-M")
         order = self.order(extra_lines=[dict(name="Shirt", color="Blue", size="M", qty=5, price=20)])
         self.restock_matrix(100)
         self.assertEqual(order.status, "PO needed")
@@ -119,7 +125,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         inventory.create_stock_receipt(self.db, tenant_id=self.tid, payload=StockReceiptCreate(
             location=self.location.name, reference="RC-TEST", reason="Goods received",
             lines=[dict(name="Shirt", color="Blue", size="M", qty=5)]))
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         self.assertEqual(self.count(ShipmentLine), 2)
 
     def test_restock_failure_rolls_back_stock_and_shipment_together(self):
@@ -146,7 +152,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         self.db.flush()
         self.assertEqual([order.id for order in fulfillment.lock_waiting_orders(self.db, tenant_id=self.tid)], [waiting.id])
         self.restock_matrix(160)
-        self.assertEqual(waiting.status, "Packed")
+        self.assertEqual(waiting.status, "Ready to pack")
         self.assertEqual(legacy.status, "PO needed")
         self.assertEqual(cancelled.status, "Cancelled")
         self.assertEqual(foreign.status, "PO needed")
@@ -160,9 +166,16 @@ class SalesFulfillmentTests(unittest.TestCase):
                     dict(name="Shirt", color="Blue", size="S", sku=self.variant.sku, qty=qty, price=20, **line),
                     *(extra_lines or [])]))["order"]
 
-    def create_po(self, order):
-        return fulfillment.create_shortage_po(self.db, tenant_id=self.tid, public_id=order.public_id,
+    def approve_po(self, po):
+        # Production TNA/stages only start once the source PO is approved.
+        return procurement.set_po_status(self.db, public_id=po.public_id, status="Approved", tenant_id=self.tid)
+
+    def create_po(self, order, approve=True):
+        po = fulfillment.create_shortage_po(self.db, tenant_id=self.tid, public_id=order.public_id,
             supplier_id=self.supplier.public_id)
+        if approve and po is not None:
+            self.approve_po(po)
+        return po
 
     def clear_qc(self, po, result="Pass"):
         work = self.db.scalar(select(ProductionOrder).where(ProductionOrder.purchase_order_id == po.id))
@@ -175,7 +188,59 @@ class SalesFulfillmentTests(unittest.TestCase):
             self.db.add(ins)
             inspections.append(ins)
         self.db.flush()
+        if result == "Pass":
+            for ins in inspections:
+                self.approve_qc(ins)
         return inspections[0]
+
+    def add_variant(self, size, sku):
+        """A second saved catalog variant (new orders and POs only accept saved variants)."""
+        value = AttributeValue(tenant_id=self.tid, attr_type="Size", value=size, code=size)
+        self.db.add(value); self.db.flush()
+        variant = ProductVariant(tenant_id=self.tid, product_id=self.product.id, sku=sku, color_id=self.color.id,
+            size_id=value.id, price=20, retail_price=20, wholesale_price=18, online_price=22,
+            supplier_price=Decimal("8"), currency_code="EUR")
+        self.db.add(variant); self.db.flush()
+        self.db.add(SupplierPrice(tenant_id=self.tid, variant_id=variant.id, supplier_id=self.supplier.id,
+            price=Decimal("8"), currency="EUR", active=True))
+        self.db.flush()
+        return variant
+
+    def act(self, shipment, action, **fields):
+        """Shipment actions (prepare/pack/dispatch/deliver/...): the only way to move stock out now."""
+        from app.modules.inventory.workflows import atomic  # same savepoint wrapper the API route uses
+        from app.modules.shipments import actions
+        body = dict(requestId=uuid.uuid4(), action=action, reason="Test action", origin="Warehouse",
+                    destination="Customer", carrier="Carrier")
+        body.update(fields)
+        return atomic(self.db, actions.perform, self.tid, "tester@example.com", shipment.public_id,
+                      actions.ActionBody(**body))
+
+    def dispatch_shipment(self, shipment):
+        if not shipment.packed_at:
+            self.act(shipment, "pack")
+        return self.act(shipment, "dispatch")
+
+    def deliver_shipment(self, shipment):
+        lines = self.db.scalars(select(ShipmentLine).where(ShipmentLine.shipment_id == shipment.id)).all()
+        return self.act(shipment, "deliver", lines=[dict(lineId=l.id, quantity=l.qty) for l in lines])
+
+    def approve_qc(self, inspection):
+        """What an approve-all QC decision records: a Pass plus approved quantities on every
+        colour/size line of the inspected article. (A status edit can no longer release goods.)"""
+        from app.models.quality import QcLineBalance
+        work = self.db.scalar(select(ProductionOrder).where(ProductionOrder.order_no == inspection.order_ref))
+        lines = self.db.scalars(select(ProductionOrderLine).where(ProductionOrderLine.order_id == work.id,
+            *( [ProductionOrderLine.name == inspection.item] if inspection.item else []))).all()
+        for line in lines:
+            balance = self.db.scalar(select(QcLineBalance).where(QcLineBalance.production_line_id == line.id))
+            if balance is None:
+                balance = QcLineBalance(tenant_id=self.tid, production_line_id=line.id, approved=0, held=0, rejected=0)
+                self.db.add(balance)
+            balance.approved, balance.held, balance.rejected = line.qty, 0, 0
+        inspection.result = "Pass"
+        self.db.flush()
+        return inspection
 
     def receive(self, po):
         if not hasattr(self, "receipt_payloads"):
@@ -190,16 +255,16 @@ class SalesFulfillmentTests(unittest.TestCase):
     def test_standalone_po_receives_once_and_fulfills_waiting_order(self):
         order = self.order(100)
         po = procurement.create_po(self.db, tenant_id=self.tid, payload=PurchaseOrderCreate(
-            supplier=self.supplier.name, expected="20 Oct 2026", lines=[dict(name="Shirt", color="Blue", size="S",
+            supplier=self.supplier.name, expected="2026-10-20", lines=[dict(name="Shirt", color="Blue", size="S",
                 sku=self.variant.sku, qty=40, price=8)]))
         ins = self.clear_qc(po, "In Progress")
-        quality.pass_and_ship(self.db, tenant_id=self.tid, public_id=ins.public_id, carrier="", destination="")
+        self.approve_qc(ins)
         self.assertFalse(po.inventory_received)
         self.receive(po)
         self.assertTrue(po.inventory_received)
         self.assertEqual(self.level.on_hand, 100)
         self.assertEqual(self.level.reserved, 100)
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         self.assertEqual(self.count(Shipment), 1)
         self.assertEqual(self.db.scalar(select(Shipment)).sales_order_id, order.id)
         self.receive(po)
@@ -220,11 +285,11 @@ class SalesFulfillmentTests(unittest.TestCase):
         self.assertEqual(quality.reopen_failed(self.db, tenant_id=self.tid, public_id=parent.public_id,
             mode="inspection")["inspection"].id, child.id)
         quality.start_inspection(self.db, public_id=child.public_id, tenant_id=self.tid)
-        quality.set_result(self.db, public_id=child.public_id, status="Pass", tenant_id=self.tid)
+        self.approve_qc(child)
         self.assertFalse(po.inventory_received)
         self.receive(po)
         self.assertTrue(po.inventory_received)
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         self.assertEqual(parent.result, "Fail")
         detail = quality.inspection_detail(self.db, public_id=child.public_id)
         self.assertTrue(detail["inspection"]["shipment"]["allPassed"])
@@ -234,7 +299,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         self.db.delete(self.level)
         self.db.flush()
         po = procurement.create_po(self.db, tenant_id=self.tid, payload=PurchaseOrderCreate(
-            supplier=self.supplier.name, expected="20 Oct 2026", lines=[
+            supplier=self.supplier.name, expected="2026-10-20", lines=[
                 dict(name="Shirt", color="Blue", size="S", sku=self.variant.sku, qty=qty, price=8)
                 for qty in [10, 20]]))
         self.clear_qc(po)
@@ -258,21 +323,19 @@ class SalesFulfillmentTests(unittest.TestCase):
         self.assertEqual(again["inspection"].id, child.id)
         self.assertEqual(self.count(ProductionStage), 2)
         self.assertEqual(out["production"].progress, 0)
-        for action in [lambda: quality.start_inspection(self.db, public_id=child.public_id, tenant_id=self.tid),
-                       lambda: quality.set_result(self.db, public_id=child.public_id, status="Pass", tenant_id=self.tid)]:
-            with self.assertRaises(HTTPException) as err:
-                action()
-            self.assertEqual(err.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as err:
+            quality.start_inspection(self.db, public_id=child.public_id, tenant_id=self.tid)
+        self.assertEqual(err.exception.status_code, 409)
         with self.assertRaises(HTTPException):
             quality.reopen_failed(self.db, tenant_id=self.tid, public_id=parent.public_id, mode="inspection")
         production.stage_action(self.db, action="complete", public_id=new.public_id)
         self.assertFalse(po.inventory_received)
         quality.start_inspection(self.db, public_id=child.public_id, tenant_id=self.tid)
-        quality.set_result(self.db, public_id=child.public_id, status="Pass", tenant_id=self.tid)
+        self.approve_qc(child)
         self.assertFalse(po.inventory_received)
         self.receive(po)
         self.assertTrue(po.inventory_received)
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
 
     def test_recovery_rejects_other_tenant_and_already_received_stock(self):
         order = self.order()
@@ -287,7 +350,6 @@ class SalesFulfillmentTests(unittest.TestCase):
         self.assertEqual(err.exception.status_code, 409)
 
     def test_production_recovery_leaves_other_items_and_selected_mode_intact(self):
-        from app.modules.quality.dto import DispositionIn
         order = self.order()
         po = self.create_po(order)
         parent = self.clear_qc(po, "Fail")
@@ -302,8 +364,6 @@ class SalesFulfillmentTests(unittest.TestCase):
         quality.reopen_failed(self.db, tenant_id=self.tid, public_id=parent.public_id, mode="production")
         self.assertFalse(sibling_stage.is_deleted)
         self.assertEqual(sibling_stage.status, "Completed")
-        with self.assertRaises(HTTPException):
-            quality.set_disposition(self.db, public_id=parent.public_id, payload=DispositionIn(disposition="Hold"))
 
     def test_production_recovery_requires_production_permission(self):
         from app.core.security import Principal
@@ -322,7 +382,7 @@ class SalesFulfillmentTests(unittest.TestCase):
     def test_fully_stocked_order_creates_pending_shipment_and_invoice(self):
         order = self.order(40)
         shipment = self.db.scalar(select(Shipment))
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         self.assertEqual(shipment.status, "Pending")
         self.assertEqual(shipment.order_ref, order.order_no)
         self.assertEqual(self.level.reserved, 40)
@@ -364,7 +424,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         level = StockLevel(tenant_id=self.tid, variant_id=self.variant.id, location_id=other.id, on_hand=40, reserved=0)
         self.db.add(level); self.db.flush()
         order = self.order()
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         self.assertEqual((self.level.reserved, level.reserved), (60, 40))
         self.assertEqual(self.count(Shipment), 1)
 
@@ -379,7 +439,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         order = self.order()
         po = self.create_po(order)
         ins = self.clear_qc(po, result="In Progress")
-        quality.pass_and_ship(self.db, tenant_id=self.tid, public_id=ins.public_id, carrier="", destination="")
+        self.approve_qc(ins)
         qc_detail = quality.inspection_detail(self.db, public_id=ins.public_id)
         self.assertEqual(qc_detail["inspection"]["shipment"]["replenishmentPO"]["publicId"], str(po.public_id))
         self.assertEqual(self.count(Shipment), 0)
@@ -389,21 +449,23 @@ class SalesFulfillmentTests(unittest.TestCase):
         self.assertEqual(receipt.status, "Received")
         self.assertEqual(receipt.location, self.location.name)
         self.assertEqual((self.level.on_hand, self.level.reserved), (100, 100))
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         shipment = self.db.scalar(select(Shipment))
         self.assertEqual(self.db.scalar(select(ShipmentLine)).qty, 100)
         self.assertEqual(self.receive(po).id, receipt.id)
         self.assertEqual(self.level.on_hand, 100)
         self.assertEqual(self.count(Shipment), 1)
-        shipping.set_status(self.db, public_id=shipment.public_id, status="Dispatched")
+        self.dispatch_shipment(shipment)
         self.assertEqual((self.level.on_hand, self.level.reserved), (0, 0))
         self.assertEqual(order.status, "Shipped")
-        shipping.set_status(self.db, public_id=shipment.public_id, status="Delivered")
-        shipping.set_status(self.db, public_id=shipment.public_id, status="Delivered")
+        self.deliver_shipment(shipment)
+        with self.assertRaises(HTTPException):  # a second delivery is a closed shipment
+            self.deliver_shipment(shipment)
         self.assertEqual(self.level.on_hand, 0)
 
     def test_cancelling_only_releases_this_orders_holds(self):
-        first = self.order(40, extra_lines=[{"name": "Missing item", "qty": 1, "price": 10}])
+        self.add_variant("M", "SH-B-M")
+        first = self.order(40, extra_lines=[dict(name="Shirt", color="Blue", size="M", sku="SH-B-M", qty=1, price=20)])
         second = self.order(30)
         sales.set_order_status(self.db, public_id=first.public_id, status="Cancelled")
         self.assertEqual((self.level.on_hand, self.level.reserved), (60, 20))
@@ -419,6 +481,8 @@ class SalesFulfillmentTests(unittest.TestCase):
 
     def test_missing_purchase_price_does_not_create_po(self):
         self.variant.supplier_price = None
+        for price in self.db.scalars(select(SupplierPrice)).all():  # the catalog supplier price is what POs use
+            self.db.delete(price)
         self.db.flush()
         with self.assertRaises(HTTPException):
             self.create_po(self.order())
@@ -461,7 +525,7 @@ class SalesFulfillmentTests(unittest.TestCase):
     def test_shipped_order_cannot_be_cancelled_after_dispatch(self):
         order = self.order(30)
         shipment = self.db.scalar(select(Shipment))
-        shipping.set_status(self.db, public_id=shipment.public_id, status="Dispatched")
+        self.dispatch_shipment(shipment)
         with self.assertRaises(HTTPException):
             sales.set_order_status(self.db, public_id=order.public_id, status="Cancelled")
         self.assertEqual(shipment.status, "Dispatched")
@@ -471,6 +535,9 @@ class SalesFulfillmentTests(unittest.TestCase):
         passed = self.clear_qc(po)
         self.db.add(Inspection(tenant_id=self.tid, order_ref=passed.order_ref, item=passed.item,
             stage="Final", result="Fail", parent_inspection_id=passed.id))
+        from app.models.quality import QcLineBalance
+        for balance in self.db.scalars(select(QcLineBalance)).all():  # a failed reinspection holds the pieces
+            balance.held, balance.approved = balance.approved, 0
         self.db.flush()
         with self.assertRaises(HTTPException):
             self.receive(po)
@@ -526,13 +593,9 @@ class SalesFulfillmentTests(unittest.TestCase):
         order = self.order()
         po = self.create_po(order)
         ins = self.clear_qc(po, result="In Progress")
-        ins.max_defects = 0
-        self.db.add(InspectionCheck(tenant_id=self.tid, inspection_id=ins.id, seq=1,
-            criterion="Sizing", requirement="Correct size", result="Pass"))
-        self.db.flush()
-        out = quality.complete_inspection(self.db, public_id=ins.public_id)
-        self.assertEqual(out["result"], "Pass")
+        self.approve_qc(ins)  # the QC decision releases quantities for receipt; it posts no stock
         self.assertFalse(po.inventory_received)
+        self.assertEqual(self.level.on_hand, 60)
         self.receive(po)
         self.assertTrue(po.inventory_received)
         self.assertEqual((self.level.on_hand, self.level.reserved), (100, 100))
@@ -540,13 +603,9 @@ class SalesFulfillmentTests(unittest.TestCase):
 
     def test_failed_inspection_does_not_add_stock(self):
         po = self.create_po(self.order())
-        ins = self.clear_qc(po, result="In Progress")
-        ins.max_defects = 0
-        self.db.add(InspectionCheck(tenant_id=self.tid, inspection_id=ins.id, seq=1,
-            criterion="Sizing", requirement="Correct size", result="Fail"))
-        self.db.flush()
-        out = quality.complete_inspection(self.db, public_id=ins.public_id)
-        self.assertEqual(out["result"], "Fail")
+        self.clear_qc(po, result="Fail")  # no approved quantity
+        with self.assertRaises(HTTPException):
+            self.receive(po)
         self.assertEqual(self.level.on_hand, 60)
         self.assertEqual(self.count(GoodsReceipt), 0)
 
@@ -554,7 +613,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         po = self.create_po(self.order())
         ins = self.clear_qc(po, result="In Progress")
         for _ in range(2):
-            quality.set_result(self.db, public_id=ins.public_id, status="Pass", tenant_id=self.tid)
+            self.approve_qc(ins)
         self.assertEqual(self.level.on_hand, 60)
         self.assertEqual(self.count(GoodsReceipt), 0)
         self.receive(po)
@@ -572,10 +631,10 @@ class SalesFulfillmentTests(unittest.TestCase):
         self.level.on_hand += 20
         self.db.flush()
         ins = self.clear_qc(source_po, result="In Progress")
-        quality.set_result(self.db, public_id=ins.public_id, status="Pass", tenant_id=self.tid)
+        self.approve_qc(ins)
         self.receive(source_po)
         self.assertEqual((self.level.on_hand, self.level.reserved), (120, 120))
-        self.assertEqual(other.status, "Packed")
+        self.assertEqual(other.status, "Ready to pack")
         self.assertEqual(self.count(Shipment), 2)
         self.assertEqual(fulfillment.stock_summary(self.db, other)[0]["missing"], 0)
 
@@ -585,7 +644,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         other = self.order(20)
         self.create_po(other)
         ins = self.clear_qc(po, result="In Progress")
-        quality.set_result(self.db, public_id=ins.public_id, status="Pass")
+        self.approve_qc(ins)
         self.receive(po)
         self.assertEqual(fulfillment.stock_summary(self.db, source)[0]["reserved"], 100)
         self.assertEqual(fulfillment.stock_summary(self.db, other)[0]["reserved"], 0)
@@ -597,7 +656,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         ins = self.clear_qc(po, result="In Progress")
         ins.stage = "In-line"
         self.db.flush()
-        quality.set_result(self.db, public_id=ins.public_id, status="Pass")
+        self.approve_qc(ins)
         self.assertFalse(po.inventory_received)
         self.assertEqual(self.level.on_hand, 60)
 
@@ -608,7 +667,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         other = SalesOrder(tenant_id=uuid.uuid4(), customer_name="Other", status="Awaiting stock", fulfillment_tracked=True)
         self.db.add(other); self.db.flush()
         ins = self.clear_qc(po, result="In Progress")
-        quality.set_result(self.db, public_id=ins.public_id, status="Pass")
+        self.approve_qc(ins)
         self.receive(po)
         self.assertEqual(other.status, "Awaiting stock")
 
@@ -619,7 +678,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         stage = self.db.scalar(select(ProductionStage))
         stage.status = "In Progress"
         self.db.flush()
-        quality.set_result(self.db, public_id=ins.public_id, status="Pass")
+        self.approve_qc(ins)
         self.assertEqual(self.count(GoodsReceipt), 0)
         production.stage_action(self.db, action="complete", public_id=stage.public_id)
         self.assertEqual(self.level.on_hand, 60)
@@ -631,7 +690,7 @@ class SalesFulfillmentTests(unittest.TestCase):
     def test_warehouse_receipt_rolls_back_on_shipment_failure_but_qc_remains_passed(self):
         po = self.create_po(self.order())
         ins = self.clear_qc(po, result="In Progress")
-        quality.set_result(self.db, public_id=ins.public_id, status="Pass")
+        self.approve_qc(ins)
         self.db.commit()
         with patch.object(fulfillment, "refresh_order", side_effect=RuntimeError("Shipment failed")):
             with self.assertRaises(RuntimeError):
@@ -646,7 +705,7 @@ class SalesFulfillmentTests(unittest.TestCase):
         ins = self.clear_qc(po, result="In Progress")
         self.location.is_deleted = True
         self.db.flush()
-        quality.set_result(self.db, public_id=ins.public_id, status="Pass")
+        self.approve_qc(ins)
         with self.assertRaises(HTTPException) as out:
             self.receive(po)
         self.assertIn("location", out.exception.detail)
@@ -657,17 +716,21 @@ class SalesFulfillmentTests(unittest.TestCase):
     def test_dispatch_consumes_stock_once_and_delivery_only_confirms_receipt(self):
         order = self.order(40)
         shipment = self.db.scalar(select(Shipment))
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         with self.assertRaises(HTTPException):
             sales.set_order_status(self.db, public_id=order.public_id, status="Shipped")
         with self.assertRaises(HTTPException):
             shipping.set_status(self.db, public_id=shipment.public_id, status="Delivered")
-        shipping.set_status(self.db, public_id=shipment.public_id, status="Label created")
         self.assertEqual((self.level.on_hand, self.level.reserved), (60, 40))
-        for status in ["Dispatched", "Dispatched", "In transit", "Out for delivery", "Delivered", "Delivered"]:
-            shipping.set_status(self.db, public_id=shipment.public_id, status=status)
-            self.assertEqual((self.level.on_hand, self.level.reserved), (20, 0))
+        self.dispatch_shipment(shipment)
+        self.assertEqual((self.level.on_hand, self.level.reserved), (20, 0))
         self.assertEqual(order.status, "Shipped")
+        self.act(shipment, "dispatch")  # a repeated dispatch is a no-op: it cannot consume the stock again
+        self.assertEqual((self.level.on_hand, self.level.reserved), (20, 0))
+        self.deliver_shipment(shipment)
+        self.assertEqual((self.level.on_hand, self.level.reserved), (20, 0))
         self.assertEqual(self.variant.qty_on_hand, 20)
         with self.assertRaises(HTTPException):
-            shipping.set_status(self.db, public_id=shipment.public_id, status="In transit")
+            self.deliver_shipment(shipment)
+        self.assertEqual(self.level.on_hand, 20)
+

@@ -749,6 +749,8 @@ def ensure_invoice_payable(session, invoice):
 
 
 def create_invoice(session: Session, *, tenant_id, data: dict, actor_id=None) -> dict:
+    from app.core.validation import validate_invoice_phones
+    validate_invoice_phones(data)  # reject bad input before touching (or locking) any row
     from app.models.procurement import PurchaseOrder
     source = session.scalar(select(PurchaseOrder).where(PurchaseOrder.tenant_id == _tid(tenant_id),
         PurchaseOrder.po_no == data.get("poNo")).with_for_update())

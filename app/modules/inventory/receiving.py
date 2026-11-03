@@ -72,7 +72,7 @@ def queue(session, *, tenant_id, limit=50, offset=0):
                 "remaining": max(0, line.qty - received.get(line.id, 0))} for line in lines]})
     locations = session.scalars(select(Location).where(Location.tenant_id == tid,
         Location.is_deleted.is_(False)).order_by(Location.name)).all()
-    from app.models.batches import BatchLine, InboundAllocation, ProductionBatch
+    from app.models.batches import BatchLine, InboundAllocation
     from app.models.shipments import Shipment
     batch_ships = session.scalars(select(Shipment).where(Shipment.tenant_id == tid,
         Shipment.batch_managed.is_(True), Shipment.direction == "Inbound", Shipment.is_deleted.is_(False),

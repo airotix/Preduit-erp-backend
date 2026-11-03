@@ -10,7 +10,9 @@ def start_block_reason(work, po):
         return None
     if po is None or po.is_deleted:
         return "The source PO is unavailable. Resolve it in Procurement before starting production TNA."
-    if po.status != "Approved":
+    # "Partially received" is an approved PO that already took delivery of an earlier batch; its
+    # remaining batches must still be able to start production.
+    if po.status not in ("Approved", "Partially received"):
         return (f"Production TNA cannot start until {po.po_no or 'the source PO'} is Approved. "
                 f"Current PO status: {po.status}. Approve the PO in Procurement first.")
     return None

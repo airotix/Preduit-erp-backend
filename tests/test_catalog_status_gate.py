@@ -44,7 +44,9 @@ class CatalogStatusGateTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 409)
 
     def test_activation_requires_release_data(self):
-        self.product.status = "Draft"; self.db.flush()
+        self.product.status = "Draft"
+        self.variant.retail_price = self.variant.wholesale_price = self.variant.online_price = None  # prices not set yet
+        self.db.flush()
         with self.assertRaises(HTTPException) as error:
             self.update("Active")
         self.assertIn("active category", error.exception.detail)
@@ -81,23 +83,24 @@ class CatalogStatusGateTests(unittest.TestCase):
             self.assertEqual(catalog.search_products(self.db, q="Shirt"), [])
             with self.assertRaises(HTTPException) as error:
                 sales.create_order(self.db, tenant_id=self.tid,
-                    payload=OrderCreate(customer="Customer", channel="Retail",
-                        lines=[{**self.line(), "sku": None, "name": "shirt"}]))
-            self.assertIn(status, error.exception.detail)
+                    payload=OrderCreate(customer="Customer", channel="Retail", lines=[self.line()]))
+            self.assertIn("not available for new orders", error.exception.detail)
             with self.assertRaises(HTTPException):
                 procurement.create_po(self.db, tenant_id=self.tid,
-                    payload=PurchaseOrderCreate(supplier="Factory", expected="20 Oct 2026",
+                    payload=PurchaseOrderCreate(supplier="Factory", expected="2026-10-20",
                         lines=[{**self.line(), "sku": None}]))
             self.assertEqual(self.db.scalars(select(SalesOrder)).all(), [])
             self.assertEqual(self.db.scalars(select(PurchaseOrder)).all(), [])
 
-    def test_custom_line_still_allowed_when_it_does_not_match_a_catalog_article(self):
+    def test_custom_line_is_rejected_because_orders_need_saved_catalog_variants(self):
         self.product.status = "Discontinued"; self.db.flush()
         with patch("app.modules.sales.service.build_sales_invoice_draft", return_value=None):
-            result = sales.create_order(self.db, tenant_id=self.tid,
-                payload=OrderCreate(customer="Customer", channel="Retail",
-                    lines=[{**self.line(), "name": "Custom service", "sku": None, "price": 0}]))
-        self.assertIsNotNone(result["order"].id)
+            with self.assertRaises(HTTPException) as error:
+                sales.create_order(self.db, tenant_id=self.tid,
+                    payload=OrderCreate(customer="Customer", channel="Retail",
+                        lines=[{**self.line(), "name": "Custom service", "sku": None, "price": 0}]))
+        self.assertIn("saved Catalog", error.exception.detail)
+        self.assertEqual(self.db.scalars(select(SalesOrder)).all(), [])
 
     def test_discontinuing_article_keeps_existing_order_link(self):
         order = self.order(qty=100)
@@ -107,7 +110,7 @@ class CatalogStatusGateTests(unittest.TestCase):
         inventory.create_stock_receipt(self.db, tenant_id=self.tid,
             payload=StockReceiptCreate(location="Warehouse", reference="RC-STATUS",
                 reason="Complete existing order", lines=[dict(name="Shirt", color="Blue", size="S", qty=40)]))
-        self.assertEqual(order.status, "Packed")
+        self.assertEqual(order.status, "Ready to pack")
         with self.assertRaises(HTTPException):
             sales.create_order(self.db, tenant_id=self.tid,
                 payload=OrderCreate(customer="New customer", channel="Retail", lines=[self.line()]))

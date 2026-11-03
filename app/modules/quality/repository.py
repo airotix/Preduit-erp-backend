@@ -5,8 +5,15 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.models.core import Tenant
 from app.models.quality import DefectType, Inspection, InspectionCheck, InspectionDefect
 from app.modules.quality import aql as aql_engine
+
+
+def tenant_aql(session: Session, tenant_id) -> str:
+    """The company's AQL level for new inspections (2.5 until an admin changes it)."""
+    tenant = session.get(Tenant, tenant_id) if tenant_id else None
+    return aql_engine._normalise_aql(tenant.qc_aql if tenant is not None else None)
 
 
 # ---------- Inspections ----------
@@ -27,13 +34,14 @@ def list_inspections(session, *, limit, offset):
     return rows, total
 
 
-def create_inspection(session: Session, *, tenant_id: UUID, order_ref, stage, aql,
+def create_inspection(session: Session, *, tenant_id: UUID, order_ref, stage, aql=None,
                       sku=None, product=None, batch_lot=None, inspection_type=None,
                       prod_qty=None, inspector=None, parent_inspection_id=None,
                       item=None) -> Inspection:
     """Create a Pending inspection. Sample size + max allowed defects are derived
-    from the AQL engine using the production quantity (when known)."""
-    plan = aql_engine.sampling_plan(prod_qty, aql)
+    from the AQL engine using the production quantity (when known). The AQL level
+    is the company setting unless a caller passes one explicitly."""
+    plan = aql_engine.sampling_plan(prod_qty, aql or tenant_aql(session, tenant_id))
     ins = Inspection(
         tenant_id=tenant_id, order_ref=order_ref, item=item, stage=stage, aql=plan["aql"],
         result="Pending", defect_count=0,
@@ -62,42 +70,6 @@ def start_inspection(session: Session, *, public_id: str, tenant_id: UUID | None
         session.flush()
         seed_default_checks(session, tenant_id=tenant_id or ins.tenant_id, inspection_id=ins.id)
     return ins
-
-
-def update_inspection_header(session: Session, *, public_id: str, inspector, batch_lot,
-                             inspection_type, aql, sample_size=None) -> Inspection | None:
-    """Edit header fields.
-      - If the AQL level changes, sample size + max defects are recomputed from
-        the AQL sampling plan (auto behaviour, unchanged).
-      - If a manual sample size is supplied, it overrides the plan and the max
-        allowed defects are recomputed to match that sample size + AQL.
-    """
-    ins = get_inspection(session, public_id=public_id)
-    if ins is None:
-        return None
-    ins.inspector = inspector
-    ins.batch_lot = batch_lot
-    ins.inspection_type = inspection_type
-    aql_changed = bool(aql) and aql != ins.aql
-    if aql:
-        ins.aql = aql_engine._normalise_aql(aql)
-    if aql_changed and not sample_size:
-        # AQL changed, no manual override → recompute the standard plan.
-        plan = aql_engine.sampling_plan(ins.prod_qty, ins.aql)
-        ins.sample_size = plan["sampleSize"]
-        ins.max_defects = plan["maxDefects"]
-    if sample_size and int(sample_size) > 0:
-        # Manual sample size → keep it, recompute the acceptance number for it.
-        ins.sample_size = int(sample_size)
-        ins.max_defects = aql_engine.acceptance_for_sample(int(sample_size), ins.aql)
-    session.flush()
-    return ins
-
-
-def link_shipment(session: Session, *, ins: Inspection, shipment_no: str | None) -> None:
-    if shipment_no and not ins.shipment_ref:
-        ins.shipment_ref = shipment_no
-        session.flush()
 
 
 # ---------- Checklist ----------
@@ -151,8 +123,12 @@ def add_check(session: Session, *, tenant_id: UUID, inspection_id: int, **f) -> 
 
 
 def get_check(session: Session, *, public_id: str) -> InspectionCheck | None:
+    try:
+        check_id = UUID(str(public_id))
+    except (ValueError, TypeError):
+        return None
     return session.execute(
-        select(InspectionCheck).where(InspectionCheck.public_id == public_id,
+        select(InspectionCheck).where(InspectionCheck.public_id == check_id,
                                       InspectionCheck.is_deleted == False)  # noqa: E712
     ).scalar_one_or_none()
 
@@ -257,15 +233,6 @@ def delete_inspection_defect(session: Session, *, public_id: str) -> Inspection 
     return ins
 
 
-def set_result(session: Session, *, public_id: str, result: str) -> Inspection | None:
-    ins = get_inspection(session, public_id=public_id)
-    if ins is None:
-        return None
-    ins.result = result
-    session.flush()
-    return ins
-
-
 def promote_open_to_final(session: Session, *, order_ref: str | None) -> Inspection | None:
     """When production for an order finishes, advance its still-open inspection
     (Pending / In Progress) to the Final QC stage so the stage isn't stuck at an
@@ -328,20 +295,6 @@ def get_inspection(session: Session, *, public_id: str) -> Inspection | None:
         select(Inspection).where(Inspection.public_id == inspection_id,
                                  Inspection.is_deleted == False)  # noqa: E712
     ).scalar_one_or_none()
-
-
-def set_disposition(session: Session, *, public_id: str, disposition: str,
-                    notes: str | None, assigned_to: str | None, due_date) -> Inspection | None:
-    """Record the disposition of a FAILED inspection."""
-    ins = get_inspection(session, public_id=public_id)
-    if ins is None:
-        return None
-    ins.disposition = disposition
-    ins.disposition_notes = notes
-    ins.assigned_to = assigned_to
-    ins.due_date = due_date
-    session.flush()
-    return ins
 
 
 def create_reinspection(session: Session, *, tenant_id: UUID, parent: Inspection) -> Inspection:

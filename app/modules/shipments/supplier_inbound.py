@@ -53,32 +53,6 @@ def ensure(db, po):
     return shipment
 
 
-def guard_final_qc_change(db, tenant_id, order_ref, stage):
-    """Serialize final-QC changes against supplier dispatch and warehouse receipt."""
-    if stage != "Final":
-        return
-    po = db.scalar(select(PurchaseOrder).where(PurchaseOrder.tenant_id == tenant_id,
-        PurchaseOrder.supplier_shipment_required.is_(True), PurchaseOrder.id.in_(
-            select(ProductionOrder.purchase_order_id).where(ProductionOrder.tenant_id == tenant_id,
-                ProductionOrder.order_no == order_ref, ProductionOrder.is_deleted.is_(False))))
-        .with_for_update().execution_options(populate_existing=True))
-    shipment = for_po(db, po) if po else None
-    if shipment and shipment.dispatched_at:
-        raise HTTPException(409, "Supplier goods have already dispatched. Reconcile the shipment before replacing or changing its final QC.")
-
-
-def after_inspection(db, inspection):
-    if inspection is None or inspection.stage != "Final" or inspection.result != "Pass":
-        return None
-    if inspection.batch_line_id or inspection.batch_id or inspection.release_decision == "inline":
-        return None
-    po = db.scalar(select(PurchaseOrder).join(ProductionOrder,
-        ProductionOrder.purchase_order_id == PurchaseOrder.id).where(
-        ProductionOrder.tenant_id == inspection.tenant_id, PurchaseOrder.tenant_id == inspection.tenant_id,
-        ProductionOrder.order_no == inspection.order_ref, ProductionOrder.is_deleted.is_(False)))
-    return ensure(db, po) if po else None
-
-
 def transition(db, shipment, status, actor=None):
     from app.core.audit import write_audit
     po = db.scalar(select(PurchaseOrder).where(PurchaseOrder.id == shipment.purchase_order_id,

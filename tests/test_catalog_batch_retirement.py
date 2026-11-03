@@ -18,6 +18,9 @@ from app.modules.procurement import service as procurement
 from app.modules.batches import service as batches
 
 
+from test_procurement_production import close_po
+
+
 class CatalogBatchRetirementTests(unittest.TestCase):
     setUp = batch_fixtures.BatchExecutionTests.setUp
     tearDown = batch_fixtures.BatchExecutionTests.tearDown
@@ -30,29 +33,44 @@ class CatalogBatchRetirementTests(unittest.TestCase):
     receive = batch_fixtures.BatchExecutionTests.receive
     ship = batch_fixtures.BatchExecutionTests.ship
     lot = batch_fixtures.BatchExecutionTests.lot
+    pack = batch_fixtures.BatchExecutionTests.pack
+    act = batch_fixtures.BatchExecutionTests.act
+    deliver_customer = batch_fixtures.BatchExecutionTests.deliver_customer
 
     def preview(self):
         return retirement.preview(self.db, tenant_id=self.tid, public_id=self.product.public_id)
 
     def test_unreceived_production_can_be_withdrawn_and_cannot_restart(self):
+        from app.modules.procurement import changes
+        batch, line = self.plan()  # planned, nothing produced yet
+        with patch.object(commitments, "write_audit"):
+            close_po(self.db, self.tid, self.po, "Inactive", "Supplier commitment withdrawn")
+            self.assertEqual(self.po.status, "Inactive")
+            self.assertNotEqual(batch.status, "Cancelled")  # withdrawal alone leaves production for explicit closure
+            changes.resolve_issue(self.db, self.po, key=f"production:{self.work.public_id}",
+                                  reason="Stop production", permissions=["*"])
+        self.assertEqual(batch.status, "Cancelled")
+        self.assertEqual(line.completed, 0)
+        self.assertEqual(self.work.stage, "Cancelled")
+        self.assertEqual(self.level.on_hand, 0)
+        self.assertEqual(self.so.status, "Awaiting stock")  # withdrawal does not change the source sales order
+
+    def test_produced_batch_output_blocks_po_withdrawal_until_reconciled(self):
         batch, line = self.plan()
         self.produce(batch, line)
         with patch.object(commitments, "write_audit"):
-            procurement.set_po_status(self.db, public_id=self.po.public_id, status="Inactive", reason="Supplier commitment withdrawn")
-        self.assertEqual(self.po.status, "Inactive")
-        self.assertEqual(batch.status, "Cancelled")
+            with self.assertRaises(HTTPException) as error:
+                close_po(self.db, self.tid, self.po, "Inactive", "Supplier commitment withdrawn")
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertIn("Batch output", error.exception.detail)
+        self.assertNotEqual(self.po.status, "Inactive")
         self.assertEqual(line.completed, 200)
-        self.assertTrue(self.work.is_deleted)
-        with self.assertRaises(HTTPException):
-            batches.parent(self.db, self.tid, self.work.public_id, lock=True)
-        self.assertEqual(self.level.on_hand, 0)
-        self.assertEqual(self.so.status, "PO needed")
 
     def test_warehouse_receipt_prevents_po_withdrawal(self):
         batch, line = self.plan()
         self.produce(batch, line); self.qc(batch, line, 200); self.receive(batch, line, 200)
         with self.assertRaises(HTTPException):
-            procurement.set_po_status(self.db, public_id=self.po.public_id, status="Inactive", reason="Supplier withdrawal")
+            close_po(self.db, self.tid, self.po, "Inactive", "Supplier withdrawal")
         self.assertEqual(self.level.on_hand, 200)
         self.assertFalse(self.work.is_deleted)
         self.assertFalse(self.preview()["purchaseOrders"][0]["canMarkInactive"])
@@ -115,8 +133,13 @@ class CatalogBatchRetirementTests(unittest.TestCase):
         self.assertEqual(self.level.reserved, 1000)
         self.assertEqual(self.preview()["stockRows"][0]["available"], 1000)
         with patch.object(retirement, "write_audit"):
+            with self.assertRaises(HTTPException) as refused:  # supplier returns are recorded in Procurement
+                retirement.dispose_stock(self.db, tenant_id=self.tid, public_id=self.product.public_id,
+                    payload=StockDisposition(stockLevelId=self.level.public_id, quantity=1000, kind="Return to supplier",
+                        reference="RTV-1", reason="Supplier accepted return"))
+            self.assertIn("Supplier returns", refused.exception.detail)
             retirement.dispose_stock(self.db, tenant_id=self.tid, public_id=self.product.public_id,
-                payload=StockDisposition(stockLevelId=self.level.public_id, quantity=1000, kind="Return to supplier",
-                    reference="RTV-1", reason="Supplier accepted return"))
+                payload=StockDisposition(stockLevelId=self.level.public_id, quantity=1000, kind="Write off",
+                    reference="WO-1", reason="Earmarked stock written off"))
         self.assertEqual((self.level.on_hand, self.level.reserved, self.lot(line).on_hand), (0, 0, 0))
         self.assertTrue(self.preview()["canDelete"])

@@ -23,6 +23,7 @@ from app.models.core import Tenant
 from app.models.catalog import Product, ProductVariant, AttributeValue
 from app.models.inventory import Location, StockLevel
 from app.models.procurement import Supplier, GoodsReceipt
+from app.models.supplier_pricing import SupplierPrice
 from app.modules.inventory import receiving
 from test_warehouse_receiving import WarehouseReceivingTests
 
@@ -39,11 +40,14 @@ class PostgreSQLWarehouseTests(WarehouseReceivingTests):
         self.connection = engine.connect()
         self.connection.execute(text(f'SET search_path TO "{schema}", public'))
         self.db = Session(self.connection, autoflush=False)
+        # Release the connection even if setUp fails; a leaked open transaction blocks the TRUNCATE in later cleanup.
+        self.addCleanup(lambda: (self.db.close(), self.connection.rollback(), self.connection.close()))
         self.tid = uuid.uuid4()
         self.db.add(Tenant(id=self.tid, name="Warehouse check", slug=str(self.tid), base_currency_code="EUR"))
         self.db.flush()
         for target, result in [("app.modules.finance.service.post_unposted", 0),
-                ("app.modules.procurement.repository.company_info", {}), ("app.core.audit.write_audit", None)]:
+                ("app.modules.procurement.repository.company_info", {}), ("app.core.audit.write_audit", None),
+                ("app.modules.shipments.actions.write_audit", None)]:
             mock = patch(target, return_value=result); mock.start(); self.addCleanup(mock.stop)
         self.supplier = Supplier(tenant_id=self.tid, name="Factory", lead_time="14 days")
         self.location = Location(tenant_id=self.tid, name="Warehouse")
@@ -52,8 +56,11 @@ class PostgreSQLWarehouseTests(WarehouseReceivingTests):
         self.size = AttributeValue(tenant_id=self.tid, attr_type="Size", value="S", code="S")
         self.db.add_all([self.supplier, self.location, self.product, self.color, self.size]); self.db.flush()
         self.variant = ProductVariant(tenant_id=self.tid, product_id=self.product.id, sku="SH-B-S",
-            color_id=self.color.id, size_id=self.size.id, price=20, supplier_price=8, currency_code="EUR")
+            color_id=self.color.id, size_id=self.size.id, price=20, retail_price=20, wholesale_price=18,
+            online_price=22, supplier_price=8, currency_code="EUR")
         self.db.add(self.variant); self.db.flush()
+        self.db.add(SupplierPrice(tenant_id=self.tid, variant_id=self.variant.id, supplier_id=self.supplier.id,
+            price=8, currency="EUR", active=True)); self.db.flush()
         self.level = StockLevel(tenant_id=self.tid, variant_id=self.variant.id, location_id=self.location.id, on_hand=60, reserved=0)
         self.db.add(self.level); self.db.flush()
 
@@ -110,7 +117,7 @@ class PostgreSQLWarehouseTests(WarehouseReceivingTests):
         self.assertTrue(shipment.inventory_dispatched)
         self.apply_migration()
         self.assertEqual((self.level.on_hand, self.level.reserved), (20, 0))
-        shipping.set_status(self.db, public_id=shipment.public_id, status="Delivered")
+        self.deliver_shipment(shipment)  # delivery after migration must not relieve stock again
         self.assertEqual(self.level.on_hand, 20)
 
     def test_migration_preserves_stock_already_consumed_by_legacy_delivery(self):
@@ -118,7 +125,7 @@ class PostgreSQLWarehouseTests(WarehouseReceivingTests):
         from app.modules.sales import fulfillment
         order = self.order(40)
         shipment = self.db.scalar(select(Shipment))
-        fulfillment.complete_shipment(self.db, order)
+        self.dispatch_shipment(shipment)  # stock was already consumed by the legacy dispatch
         shipment.status = "Delivered"
         self.db.flush()
         self.apply_migration()

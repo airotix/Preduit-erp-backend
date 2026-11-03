@@ -13,3 +13,7 @@ README.md
 *.md
 .vscode/
 .idea/
+
+# Dev-only demo data and legacy SQL Server scripts are not shipped in the image.
+db/seeds_pg/
+db/legacy-sqlserver/

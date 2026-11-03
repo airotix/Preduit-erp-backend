@@ -371,7 +371,7 @@ def line_action(db, tid, actor, batch_id, line_id, command, action):
         source = db.get(PurchaseOrderLine, line.po_line_id)
         inspection = quality_repo.create_inspection(db, tenant_id=uid(tid),
             order_ref=work.order_no, item=" / ".join(filter(None, [source.name, source.color, source.size])),
-            stage="In-line" if command.kind == "Inline" else "Final", aql="2.5",
+            stage="In-line" if command.kind == "Inline" else "Final",
             sku=source.sku, product=source.name, batch_lot=batch.name[:60],
             inspection_type=command.kind, prod_qty=command.assessed, inspector=actor)
         inspection.batch_line_id = line.id

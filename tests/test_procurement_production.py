@@ -14,6 +14,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.base import Base
+import importlib, pkgutil
+import app.models as _models
+for _module in pkgutil.iter_modules(_models.__path__):  # every mapped table, e.g. catalog_supplier_prices
+    importlib.import_module(f"app.models.{_module.name}")
 from app.models.core import Tenant, User  # Register profile tables before copying the test schema.
 from app.models.procurement import PurchaseOrder, PurchaseOrderLine, PoInvoice
 from app.models.production import ProductionOrder, ProductionOrderLine, ProductionStage
@@ -29,6 +33,46 @@ from app.modules.production.router import create_porder
 from app.modules.production.dto import ProductionOrderCreate
 from app.modules.sales import service as sales
 from app.modules.sales.dto import OrderCreate
+
+
+def ensure_catalog(db, tid):
+    """Saved supplier + exact saved catalog variants (with the supplier's price): what PO and order lines now need."""
+    from decimal import Decimal
+    from app.models.catalog import AttributeValue, Product, ProductVariant
+    from app.models.procurement import Supplier
+    from app.models.supplier_pricing import SupplierPrice
+    supplier = db.scalar(select(Supplier).where(Supplier.tenant_id == tid, Supplier.name == "Test supplier"))
+    if supplier is None:
+        supplier = Supplier(tenant_id=tid, name="Test supplier"); db.add(supplier); db.flush()
+    for title, color, size, sku, price in [("Shirt", "Blue", "S", "SH-B-S", 10), ("Shirt", "Blue", "M", "SH-B-M", 10),
+                                           ("Jacket", "Black", "L", "JK-L", 25)]:
+        if db.scalar(select(ProductVariant).where(ProductVariant.tenant_id == tid, ProductVariant.sku == sku)):
+            continue
+        product = db.scalar(select(Product).where(Product.tenant_id == tid, Product.title == title))
+        if product is None:
+            product = Product(tenant_id=tid, title=title, status="Active"); db.add(product); db.flush()
+        values = {}
+        for kind, value in (("Color", color), ("Size", size)):
+            row = db.scalar(select(AttributeValue).where(AttributeValue.tenant_id == tid,
+                AttributeValue.attr_type == kind, AttributeValue.value == value))
+            if row is None:
+                row = AttributeValue(tenant_id=tid, attr_type=kind, value=value, code=value); db.add(row); db.flush()
+            values[kind] = row
+        variant = ProductVariant(tenant_id=tid, product_id=product.id, sku=sku, color_id=values["Color"].id,
+            size_id=values["Size"].id, price=price, retail_price=price, wholesale_price=price, online_price=price,
+            supplier_price=Decimal(price), currency_code="EUR")
+        db.add(variant); db.flush()
+        db.add(SupplierPrice(tenant_id=tid, variant_id=variant.id, supplier_id=supplier.id,
+            price=Decimal(price), currency="EUR", active=True)); db.flush()
+    return supplier
+
+
+def close_po(db, tid, po, status, reason="Closed in test"):
+    """Withdrawing a PO needs the current impact-review token and an acknowledgement."""
+    from app.modules.procurement import changes
+    token = changes.review(db, po, status=status)["reviewToken"]
+    return procurement.set_po_status(db, public_id=po.public_id, tenant_id=tid, status=status, reason=reason,
+                                     review_token=token, acknowledged=True)
 
 
 class ProcurementProductionTests(unittest.TestCase):
@@ -62,8 +106,9 @@ class ProcurementProductionTests(unittest.TestCase):
         return self.db.scalar(select(func.count()).select_from(model))
 
     def create_po(self):
+        ensure_catalog(self.db, self.tid)
         return procurement.create_po(self.db, tenant_id=self.tid, payload=PurchaseOrderCreate(
-            supplier="Test supplier", expected="20 Oct 2026", lines=[
+            supplier="Test supplier", expected="2026-10-20", lines=[
                 {"name": "Shirt", "color": "Blue", "size": "S", "sku": "SH-B-S", "qty": 3, "price": 10},
                 {"name": "Shirt", "color": "Blue", "size": "M", "sku": "SH-B-M", "qty": 5, "price": 10},
                 {"name": "Jacket", "color": "Black", "size": "L", "sku": "JK-L", "qty": 2, "price": 25},
@@ -92,14 +137,15 @@ class ProcurementProductionTests(unittest.TestCase):
         first = production.create_for_purchase_order(self.db, tenant_id=self.tid, purchase_order=po)
         second = production.create_for_purchase_order(self.db, tenant_id=self.tid, purchase_order=po)
         self.assertEqual(first.id, second.id)
-        procurement.set_po_status(self.db, public_id=po.public_id, status="Approved")
+        procurement.set_po_status(self.db, public_id=po.public_id, tenant_id=self.tid, status="Approved")
         with self.assertRaises(HTTPException):
-            procurement.set_po_status(self.db, public_id=po.public_id, status="Received")
+            procurement.set_po_status(self.db, public_id=po.public_id, tenant_id=self.tid, status="Received")
         self.assertEqual(self.count(ProductionOrder), 1)
         self.assertEqual(self.count(ProductionOrderLine), 2)
         self.assertEqual(self.count(PoInvoice), 1)
 
-    def test_rejected_po_removes_production_tna_and_inspections_from_active_work(self):
+    def test_rejected_po_keeps_linked_work_until_it_is_resolved(self):
+        from app.modules.procurement import changes
         po = self.create_po()
         work = self.db.scalar(select(ProductionOrder))
         line = self.db.scalar(select(ProductionOrderLine))
@@ -109,12 +155,16 @@ class ProcurementProductionTests(unittest.TestCase):
             stage="Final", result="Pending")
         self.db.add_all([stage, inspection])
         self.db.flush()
-        procurement.set_po_status(self.db, public_id=po.public_id, status="Rejected", tenant_id=self.tid)
-        self.assertTrue(work.is_deleted)
-        self.assertTrue(stage.is_deleted)
-        self.assertTrue(inspection.is_deleted)
-        self.assertTrue(all(l.is_deleted for l in self.db.scalars(select(ProductionOrderLine)).all()))
-        self.assertIsNone(production_repo.order_by_public(self.db, work.public_id))
+        close_po(self.db, self.tid, po, "Rejected")
+        self.assertEqual(po.status, "Rejected")
+        # Withdrawal no longer silently deletes production or inspections; they are closed one by one.
+        self.assertFalse(work.is_deleted)
+        self.assertFalse(inspection.is_deleted)
+        changes.resolve_issue(self.db, po, key=f"production:{work.public_id}", reason="Stop production", permissions=["*"])
+        changes.resolve_issue(self.db, po, key=f"quality:{inspection.public_id}", reason="Stop inspection", permissions=["*"])
+        self.assertEqual(work.stage, "Cancelled")
+        self.assertEqual(stage.status, "Cancelled")
+        self.assertEqual(inspection.result, "Cancelled")
         with self.assertRaises(HTTPException):
             procurement.set_po_status(self.db, public_id=po.public_id, status="Approved", tenant_id=self.tid)
 
@@ -123,7 +173,7 @@ class ProcurementProductionTests(unittest.TestCase):
         po.inventory_received = True
         self.db.flush()
         with self.assertRaises(HTTPException):
-            procurement.set_po_status(self.db, public_id=po.public_id, status="Rejected", tenant_id=self.tid)
+            close_po(self.db, self.tid, po, "Rejected")
         self.assertFalse(self.db.scalar(select(ProductionOrder)).is_deleted)
 
     def test_database_rejects_duplicate_source_po(self):
@@ -158,10 +208,11 @@ class ProcurementProductionTests(unittest.TestCase):
         self.assertEqual(self.count(ProductionOrderLine), 0)
 
     def test_sales_order_no_longer_creates_production(self):
+        ensure_catalog(self.db, self.tid)
         with patch.object(sales, "build_sales_invoice_draft", return_value=None):
             sales.create_order(self.db, tenant_id=self.tid, payload=OrderCreate(
                 customer="Test customer", channel="Retail", lines=[
-                    {"name": "Shirt", "color": "Blue", "size": "S", "qty": 3, "price": 10}]))
+                    {"name": "Shirt", "color": "Blue", "size": "S", "sku": "SH-B-S", "qty": 3, "price": 10}]))
         self.assertEqual(self.count(SalesOrder), 1)
         self.assertEqual(self.count(ProductionOrder), 0)
 
@@ -173,10 +224,11 @@ class ProcurementProductionTests(unittest.TestCase):
         self.assertEqual(self.count(ProductionOrder), 0)
 
     def test_existing_sales_link_and_tna_progress_are_preserved(self):
+        ensure_catalog(self.db, self.tid)
         with patch.object(sales, "build_sales_invoice_draft", return_value=None):
             result = sales.create_order(self.db, tenant_id=self.tid, payload=OrderCreate(
                 customer="Legacy customer", channel="Retail", lines=[
-                    {"name": "Old style", "qty": 4, "price": 10}]))
+                    {"name": "Shirt", "color": "Blue", "size": "S", "sku": "SH-B-S", "qty": 4, "price": 10}]))
         work = production_repo.create_porder(self.db, tenant_id=self.tid, style="Old style",
                                             factory="Factory", qty=4, sales_order_id=result["order"].id)
         item = production_repo.create_porder_line(self.db, tenant_id=self.tid,
@@ -188,7 +240,7 @@ class ProcurementProductionTests(unittest.TestCase):
         detail = production.porder_detail(self.db, public_id=work.public_id)
         self.assertIsNone(work.purchase_order_id)
         self.assertIsNone(detail["sourcePurchaseOrder"])
-        self.assertEqual(detail["orderLines"][0]["item"], "Old style")
+        self.assertEqual(detail["orderLines"][0]["item"], "Shirt")  # lines come from the linked sales order
         self.assertEqual(detail["orderTotal"], "€40.00")
         self.assertTrue(detail["started"])
         self.assertEqual(stage.status, "In Progress")
@@ -209,7 +261,8 @@ class ProcurementProductionTests(unittest.TestCase):
         self.assertIsNone(screen["action"])
 
     def test_explicit_tna_start_and_completion_still_open_inspection(self):
-        self.create_po()
+        po = self.create_po()
+        procurement.set_po_status(self.db, public_id=po.public_id, tenant_id=self.tid, status="Approved")  # TNA needs an approved PO
         work = self.db.scalar(select(ProductionOrder))
         item = self.db.scalar(select(ProductionOrderLine).order_by(ProductionOrderLine.id))
         production.start_production(self.db, tenant_id=self.tid, public_id=work.public_id,

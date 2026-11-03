@@ -22,6 +22,9 @@ from app.modules.procurement import service as procurement_service
 from app.modules.sales import service as sales_service
 
 
+from test_procurement_production import close_po
+
+
 class CatalogRetirementTests(unittest.TestCase):
     def setUp(self):
         fixtures.ProcurementProductionTests.setUp(self)
@@ -66,10 +69,15 @@ class CatalogRetirementTests(unittest.TestCase):
         self.assertEqual(self.variant.qty_on_hand, 2)
         self.assertEqual(audit.call_count, 2)
         with patch.object(retirement, "write_audit"):
+            with self.assertRaises(HTTPException) as refused:  # supplier returns are recorded in Procurement
+                retirement.dispose_stock(self.db, tenant_id=self.tid, public_id=str(self.pid),
+                                         payload=StockDisposition(stockLevelId=self.stock.public_id, quantity=2,
+                                                                  kind="Return to supplier", reason="Rejected goods",
+                                                                  reference="RTV-1"))
+            self.assertIn("Supplier returns", refused.exception.detail)
             retirement.dispose_stock(self.db, tenant_id=self.tid, public_id=str(self.pid),
                                      payload=StockDisposition(stockLevelId=self.stock.public_id, quantity=2,
-                                                              kind="Return to supplier", reason="Rejected goods",
-                                                              reference="RTV-1"))
+                                                              kind="Write off", reason="Remaining units written off"))
         self.assertTrue(retirement.preview(self.db, tenant_id=self.tid, public_id=str(self.pid))["canDelete"])
 
     def test_reserved_stock_cannot_be_disposed(self):
@@ -184,7 +192,7 @@ class CatalogRetirementTests(unittest.TestCase):
         self.assertFalse(line.is_deleted)
         self.assertFalse(inspection.is_deleted)
 
-    def test_inactive_po_stops_its_production_and_inspection(self):
+    def test_inactive_po_keeps_linked_records_until_each_is_resolved(self):
         source_order = SalesOrder(id=1, public_id=uuid4(), tenant_id=self.tid,
                                   customer_name="Buyer", status="Awaiting stock",
                                   fulfillment_tracked=True, is_deleted=False)
@@ -203,18 +211,17 @@ class CatalogRetirementTests(unittest.TestCase):
         self.db.add_all([source_order, po, work, stage, inspection])
         self.db.flush()
 
-        def set_status(session, *, public_id, status):
-            po.status = status
-            session.flush()
-            return po
-
-        with patch.object(procurement_service.repo, "get_po_detail", return_value={"po": po}), \
-             patch.object(procurement_service.repo, "set_po_status", side_effect=set_status), \
-             patch("app.modules.catalog.commitments.write_audit"):
-            procurement_service.set_po_status(self.db, public_id=str(po.public_id),
-                                              status="Inactive", reason="Supplier cancelled")
-        self.assertEqual(po.status, "Inactive")
-        self.assertEqual(source_order.status, "PO needed")
+        with patch("app.modules.catalog.commitments.write_audit"), patch("app.modules.procurement.changes.write_audit"):
+            close_po(self.db, self.tid, po, "Inactive", "Supplier cancelled")
+            # Withdrawal retains linked records and leaves the source order alone (see PROCUREMENT_CHANGE_REVIEW.md).
+            self.assertEqual(po.status, "Inactive")
+            self.assertEqual(source_order.status, "Awaiting stock")
+            self.assertEqual(stage.status, "In Progress")
+            self.assertEqual(inspection.result, "Pending")
+            # Each linked record is then closed explicitly, by someone allowed to change it.
+            from app.modules.procurement import changes
+            changes.resolve_issue(self.db, po, key=f"production:{work.public_id}", reason="Stop production", permissions=["*"])
+            changes.resolve_issue(self.db, po, key=f"quality:{inspection.public_id}", reason="Stop inspection", permissions=["*"])
         self.assertEqual(stage.status, "Cancelled")
         self.assertEqual(inspection.result, "Cancelled")
 

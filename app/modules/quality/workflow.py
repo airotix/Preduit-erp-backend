@@ -109,6 +109,17 @@ def _status(*, awaiting, held, approved, rejected, open_result, legacy) -> str:
     return "Pending"
 
 
+def _next_action(*, awaiting, held, open_result) -> str:
+    """The one thing a user should do next on this article, for the queue."""
+    if open_result == "In Progress":
+        return "Continue"
+    if awaiting > 0:
+        return "Inspect"
+    if held > 0:
+        return "Resolve hold"
+    return "Done"
+
+
 def _po_for(session, work: ProductionOrder):
     if not work.purchase_order_id:
         return None
@@ -233,13 +244,15 @@ def _order_tasks(session, tenant, work, po):
         legacy = _legacy_cleared(session, tenant, work.order_no, name) and not quantity_mode and approved == 0 and held == 0 and rejected == 0
         if legacy:
             awaiting = 0
+        open_result = _open_result(session, tenant, work.order_no, name)
         tasks.append({
+            "nextAction": _next_action(awaiting=awaiting, held=held, open_result=open_result),
             "taskKey": task_key("order", str(work.public_id), name),
             "article": name, "scope": "Full order", "scopeKind": "order",
             "awaiting": awaiting, "held": held, "approved": approved, "rejected": rejected,
             "inspector": _latest_inspector(session, tenant, work.order_no, name),
             "status": _status(awaiting=awaiting, held=held, approved=approved, rejected=rejected,
-                              open_result=_open_result(session, tenant, work.order_no, name), legacy=legacy),
+                              open_result=open_result, legacy=legacy),
             "legacy": legacy, "quantityMode": quantity_mode or not legacy,
         })
     return tasks
@@ -269,13 +282,15 @@ def _batch_tasks(session, tenant, work, po, batch):
         for line in group:
             claimed = _reserved(session, tenant, batch_line_id=line.id, kind="awaiting")
             awaiting += max(0, line.completed - line.approved - line.held - line.rejected - claimed)
+        open_result = _open_result(session, tenant, work.order_no, name, batch.id)
         tasks.append({
+            "nextAction": _next_action(awaiting=awaiting, held=held, open_result=open_result),
             "taskKey": task_key("batch", str(batch.public_id), name),
             "article": name, "scope": batch.name, "scopeKind": "batch",
             "awaiting": awaiting, "held": held, "approved": approved, "rejected": rejected,
             "inspector": _latest_inspector(session, tenant, work.order_no, name, batch.id),
             "status": _status(awaiting=awaiting, held=held, approved=approved, rejected=rejected,
-                              open_result=_open_result(session, tenant, work.order_no, name, batch.id), legacy=False),
+                              open_result=open_result, legacy=False),
             "legacy": False, "quantityMode": True,
         })
     return tasks
@@ -361,7 +376,8 @@ def get_task(session: Session, tenant_id, key: str, permissions: list[str]) -> d
         awaiting = 0
     open_row = _open_inspection(session, tenant, work.order_no, article, batch_id)
     plan_qty = awaiting or held or 0
-    plan = aql_engine.sampling_plan(plan_qty, "2.5")
+    aql_level = repo.tenant_aql(session, tenant)
+    plan = aql_engine.sampling_plan(plan_qty, aql_level)
     return {
         "taskKey": task_key(scope, public_id, article),
         "orderRef": work.order_no, "orderId": str(work.public_id),
@@ -374,8 +390,9 @@ def get_task(session: Session, tenant_id, key: str, permissions: list[str]) -> d
                           open_result=open_row.result if open_row else None, legacy=legacy),
         "legacy": legacy,
         "legacyNote": "Cleared by an earlier inspection that did not record release quantities. Those pieces are not released again." if legacy else None,
+        "aql": aql_level,
         "suggestedSampleSize": plan["sampleSize"], "suggestedMaxDefects": plan["maxDefects"],
-        "plan": "Configured single-sampling plan in quality/aql.py (Level II tables stored in the application).",
+        "plan":"Configured single-sampling plan in quality/aql.py (Level II tables stored in the application).",
         "sources": sources,
         "reworkOpen": _rework_blocking(session, tenant, work, batch, article),
         "canReleaseException": has_permission(permissions, "quality.release_exception"),
@@ -528,7 +545,7 @@ def start_task(session, *, tenant_id, actor, permissions, key, payload):
         ins = existing
     else:
         ins = repo.create_inspection(
-            session, tenant_id=tenant, order_ref=work.order_no, item=article, stage=stage, aql=payload.aql,
+            session, tenant_id=tenant, order_ref=work.order_no, item=article, stage=stage,
             product=article, batch_lot=(batch.name[:60] if batch else "Full order"),
             inspection_type="Inline" if stage == "In-line" else ("Reinspection" if purpose == "held" else "Final"),
             prod_qty=lot if stage == "Final" else None, inspector=payload.inspector or actor)
@@ -637,6 +654,8 @@ def _allocations(payload, reservations, outcome, permissions):
         holder = reserved.get(item.sourceId)
         if holder is None:
             raise HTTPException(422, "A split line is not part of this inspection's quantity.")
+        if item.sourceId in seen:
+            raise HTTPException(422, "Each colour and size can only be decided once in a split.")
         if item.approved + item.held + item.rejected != holder.qty:
             raise HTTPException(422, "Approved, held and rejected must equal the reserved quantity on every colour and size.")
         if item.approved and not outcome["accepted"]:
@@ -729,7 +748,7 @@ def resolve_hold(session, *, tenant_id, actor, key, payload):
         if not moved:
             raise HTTPException(409, "There is no held quantity to reject.")
         ins = repo.create_inspection(
-            session, tenant_id=tenant, order_ref=work.order_no, item=article, stage="Final", aql="2.5",
+            session, tenant_id=tenant, order_ref=work.order_no, item=article, stage="Final",
             product=article, batch_lot=(batch.name[:60] if batch else "Full order"),
             inspection_type="Reject hold", prod_qty=sum(item["qty"] for item in moved), inspector=actor)
         ins.batch_id = batch.id if batch else None

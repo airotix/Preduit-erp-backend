@@ -9,6 +9,8 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 import test_sales_fulfillment as fixtures
+from test_procurement_production import close_po
+from app.models.supplier_pricing import SupplierPrice
 from app.models.catalog import Product, ProductVariant
 from app.models.core import Tenant, User
 from app.models.inventory import Location, StockLevel, StockTransfer
@@ -32,8 +34,9 @@ class RequestedWorkflowTests(unittest.TestCase):
         supplier = Supplier(tenant_id=self.tid, name="Second factory")
         self.db.add_all([product, supplier]); self.db.flush()
         variant = ProductVariant(tenant_id=self.tid, product_id=product.id, sku="J-B-S",
-            color_id=self.color.id, size_id=self.size.id, price=30, supplier_price=12, currency_code="EUR")
+            color_id=self.color.id, size_id=self.size.id, price=30, retail_price=30, wholesale_price=27, online_price=32, supplier_price=12, currency_code="EUR")
         self.db.add(variant); self.db.flush()
+        self.db.add(SupplierPrice(tenant_id=self.tid, variant_id=variant.id, supplier_id=supplier.id, price=12, currency="EUR", active=True)); self.db.flush()
         order = self.order(extra_lines=[dict(name="Jacket", color="Blue", size="S", sku=variant.sku, qty=25, price=30)])
         lines = fulfillment.lines_for(self.db, order)
         assignments = [SimpleNamespace(lineId=l.id, supplierId=s.public_id)
@@ -45,7 +48,7 @@ class RequestedWorkflowTests(unittest.TestCase):
         self.assertEqual([self.db.scalar(select(PurchaseOrderLine.qty).where(PurchaseOrderLine.po_id == p.id)) for p in pos], [40, 25])
         fulfillment.create_shortage_pos(self.db, tenant_id=self.tid, public_id=order.public_id, assignments=assignments)
         self.assertEqual(self.count(PurchaseOrder), 2)
-        procurement.set_po_status(self.db, public_id=pos[0].public_id, status="Rejected", tenant_id=self.tid)
+        close_po(self.db, self.tid, pos[0], "Rejected")
         replacement = fulfillment.create_shortage_pos(self.db, tenant_id=self.tid,
             public_id=order.public_id, assignments=assignments[:1])
         self.assertEqual(len(replacement), 1)
@@ -65,8 +68,9 @@ class RequestedWorkflowTests(unittest.TestCase):
         size = AttributeValue(tenant_id=self.tid, attr_type="Size", value="M", code="M")
         self.db.add(size); self.db.flush()
         variant = ProductVariant(tenant_id=self.tid, product_id=self.product.id, sku="SH-B-M",
-            color_id=self.color.id, size_id=size.id, price=20, supplier_price=8, currency_code="EUR")
+            color_id=self.color.id, size_id=size.id, price=20, retail_price=20, wholesale_price=18, online_price=22, supplier_price=8, currency_code="EUR")
         self.db.add(variant); self.db.flush()
+        self.db.add(SupplierPrice(tenant_id=self.tid, variant_id=variant.id, supplier_id=self.supplier.id, price=8, currency="EUR", active=True)); self.db.flush()
         order = self.order(extra_lines=[dict(name="Shirt", color="Blue", size="M", sku=variant.sku, qty=5, price=20)])
         pos = fulfillment.create_shortage_pos(self.db, tenant_id=self.tid, public_id=order.public_id,
             assignments=[SimpleNamespace(lineId=l.id, supplierId=self.supplier.public_id)

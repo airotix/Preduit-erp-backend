@@ -10,21 +10,6 @@ class ReopenIn(BaseModel):
     dueDate: str | None = Field(default=None, max_length=20)
 
 
-class InspectionCreate(BaseModel):
-    order: str = Field(min_length=1, max_length=40)
-    # Widened beyond Inline/Final — a stage label from the production timeline.
-    stage: str = Field(min_length=1, max_length=20)
-    aql: str = Field(default="2.5", max_length=10)
-    # Optional header fields; anything omitted is auto-pulled from the PO.
-    sku: str | None = Field(default=None, max_length=64)
-    product: str | None = Field(default=None, max_length=200)
-    batchLot: str | None = Field(default=None, max_length=60)
-    inspectionType: str | None = Field(default=None, max_length=40)
-    inspector: str | None = Field(default=None, max_length=120)
-    # Optional item (production line) this inspection is for; blank = whole order.
-    item: str | None = Field(default=None, max_length=200)
-
-
 class DefectTypeCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     category: str = Field(min_length=1, max_length=40)
@@ -58,32 +43,9 @@ class DefectIn(BaseModel):
     imageDocId: str | None = Field(default=None, max_length=64)
 
 
-class InspectionHeaderUpdate(BaseModel):
-    """Edit the inspection header (from the drill-down Edit button)."""
-    inspector: str | None = Field(default=None, max_length=120)
-    batchLot: str | None = Field(default=None, max_length=60)
-    inspectionType: str | None = Field(default=None, max_length=40)
-    aql: str | None = Field(default=None, max_length=10)
-    # Optional manual override of the sample size (string; blank = keep/auto).
-    sampleSize: str | None = Field(default=None, max_length=10)
-
-
-class DispositionIn(BaseModel):
-    """Disposition for a FAILED inspection."""
-    disposition: str = Field(pattern="^(Rework|Hold|Scrap|Return to Vendor|Re-inspection)$")
-    notes: str | None = Field(default=None, max_length=400)
-    assignedTo: str | None = Field(default=None, max_length=120)
-    dueDate: str | None = Field(default=None, max_length=20)   # ISO date string
-
-
-class StatusUpdate(BaseModel):
-    status: str = Field(min_length=1, max_length=24)
-
-
-class PassShipIn(BaseModel):
-    """Mark an inspection Passed and ship it (carrier + destination)."""
-    carrier: str = Field(min_length=1, max_length=120)
-    destination: str = Field(min_length=1, max_length=160)
+class QualitySettingsIn(BaseModel):
+    """Company-wide quality settings."""
+    aql: Literal["1.0", "1.5", "2.5", "4.0", "6.5"]
 
 
 class QcQtyLine(BaseModel):
@@ -98,7 +60,6 @@ class StartTask(BaseModel):
     purpose: Literal["awaiting", "held"] = "awaiting"
     samplingMode: Literal["sample", "full"]
     sampleSize: int | None = None
-    aql: str = Field(default="2.5", max_length=10)
     inspector: str | None = Field(default=None, max_length=120)
     lines: list[QcQtyLine] = []
 

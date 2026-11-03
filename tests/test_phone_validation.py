@@ -1,5 +1,6 @@
 """Phone limits across contact DTOs and editable invoice documents."""
 import unittest
+import uuid
 from unittest.mock import MagicMock
 
 from fastapi import HTTPException
@@ -56,7 +57,8 @@ class PhoneValidationTests(unittest.TestCase):
     def test_invoice_create_and_update_reject_before_database_changes(self):
         for create, update in ((sales.create_sales_invoice_doc, sales.update_sales_invoice_doc),
                                (procurement.create_invoice, procurement.update_invoice)):
-            for function, identity in ((create, {"tenant_id": "unused"}), (update, {"public_id": "unused"})):
+            tenant = str(uuid.uuid4())  # ids are parsed before the payload, so they must be well formed
+            for function, identity in ((create, {"tenant_id": tenant}), (update, {"public_id": tenant})):
                 session = MagicMock()
                 with self.subTest(function=function.__name__), self.assertRaises(HTTPException) as caught:
                     function(session, **identity, data={"exporter": {"tel": "123456789012345"}})
