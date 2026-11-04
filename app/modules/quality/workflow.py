@@ -109,7 +109,7 @@ def _status(*, awaiting, held, approved, rejected, open_result, legacy) -> str:
     return "Pending"
 
 
-def _next_action(*, awaiting, held, open_result) -> str:
+def _next_action(*, awaiting, held, open_result, in_production=False) -> str:
     """The one thing a user should do next on this article, for the queue."""
     if open_result == "In Progress":
         return "Continue"
@@ -117,6 +117,8 @@ def _next_action(*, awaiting, held, open_result) -> str:
         return "Inspect"
     if held > 0:
         return "Resolve hold"
+    if in_production:
+        return "Check"
     return "Done"
 
 
@@ -245,8 +247,10 @@ def _order_tasks(session, tenant, work, po):
         if legacy:
             awaiting = 0
         open_result = _open_result(session, tenant, work.order_no, name)
+        in_production = not legacy and not all(_tna_done(session, line.id) for line in group)
         tasks.append({
-            "nextAction": _next_action(awaiting=awaiting, held=held, open_result=open_result),
+            "nextAction": _next_action(awaiting=awaiting, held=held, open_result=open_result, in_production=in_production),
+            "inProduction": in_production,
             "taskKey": task_key("order", str(work.public_id), name),
             "article": name, "scope": "Full order", "scopeKind": "order",
             "awaiting": awaiting, "held": held, "approved": approved, "rejected": rejected,
@@ -264,6 +268,12 @@ def _line_started(session, line_id: int) -> bool:
     return any(stage.status != "Pending" for stage in stages)
 
 
+def _batch_started(session, tenant, batch) -> bool:
+    stages = session.scalars(select(BatchStage).where(
+        BatchStage.tenant_id == tenant, BatchStage.batch_id == batch.id)).all()
+    return any(stage.name != "Tech Pack" and stage.status != "Pending" for stage in stages)
+
+
 def _batch_tasks(session, tenant, work, po, batch):
     lines = session.scalars(select(BatchLine).where(
         BatchLine.tenant_id == tenant, BatchLine.batch_id == batch.id)).all()
@@ -272,8 +282,9 @@ def _batch_tasks(session, tenant, work, po, batch):
         source = session.get(PurchaseOrderLine, line.po_line_id)
         grouped.setdefault(source.name if source else "Article", []).append(line)
     tasks = []
+    started = _batch_started(session, tenant, batch)
     for name, group in grouped.items():
-        if not any(line.completed or line.held or line.approved or _batch_style_done(session, tenant, line) for line in group):
+        if not started and not any(line.completed or line.held or line.approved or _batch_style_done(session, tenant, line) for line in group):
             continue
         approved = sum(line.approved for line in group)
         held = sum(line.held for line in group)
@@ -283,8 +294,10 @@ def _batch_tasks(session, tenant, work, po, batch):
             claimed = _reserved(session, tenant, batch_line_id=line.id, kind="awaiting")
             awaiting += max(0, line.completed - line.approved - line.held - line.rejected - claimed)
         open_result = _open_result(session, tenant, work.order_no, name, batch.id)
+        in_production = not all(_batch_style_done(session, tenant, line) for line in group)
         tasks.append({
-            "nextAction": _next_action(awaiting=awaiting, held=held, open_result=open_result),
+            "nextAction": _next_action(awaiting=awaiting, held=held, open_result=open_result, in_production=in_production),
+            "inProduction": in_production,
             "taskKey": task_key("batch", str(batch.public_id), name),
             "article": name, "scope": batch.name, "scopeKind": "batch",
             "awaiting": awaiting, "held": held, "approved": approved, "rejected": rejected,
@@ -332,7 +345,7 @@ def _sources(session, tenant, work, batch, article):
             awaiting = max(0, line.completed - line.approved - line.held - line.rejected - awaiting_reserved)
             rows.append({
                 "id": line.id, "kind": "batch", "color": source.color, "size": source.size, "sku": source.sku,
-                "awaiting": awaiting, "held": max(0, line.held - held_reserved),
+                "planned": line.planned, "awaiting": awaiting, "held": max(0, line.held - held_reserved),
                 "approved": line.approved, "rejected": line.rejected,
                 "tnaComplete": _batch_style_done(session, tenant, line),
             })
@@ -350,8 +363,16 @@ def _sources(session, tenant, work, batch, article):
         produced = line.qty if done or approved or held or rejected else 0
         awaiting_reserved = _reserved(session, tenant, production_line_id=line.id, kind="awaiting")
         held_reserved = _reserved(session, tenant, production_line_id=line.id, kind="held")
+        # A production line covers every colour/size of its style; the PO lines behind it
+        # give the colour and size split used to display the quantities.
+        variants = [{"color": p.color, "size": p.size, "qty": int(p.qty or 0)} for p in session.scalars(
+            select(PurchaseOrderLine).where(PurchaseOrderLine.tenant_id == tenant,
+                                            PurchaseOrderLine.production_line_id == line.id)
+            .order_by(PurchaseOrderLine.id)).all()]
         rows.append({
             "id": line.id, "kind": "order", "color": line.color, "size": line.size, "sku": line.sku,
+            "variants": variants,
+            "planned": int(line.qty or 0),
             "awaiting": max(0, produced - approved - held - rejected - awaiting_reserved),
             "held": max(0, held - held_reserved),
             "approved": approved, "rejected": rejected, "tnaComplete": done,
@@ -375,7 +396,9 @@ def get_task(session: Session, tenant_id, key: str, permissions: list[str]) -> d
     if legacy:
         awaiting = 0
     open_row = _open_inspection(session, tenant, work.order_no, article, batch_id)
-    plan_qty = awaiting or held or 0
+    in_production = not legacy and not all(row["tnaComplete"] for row in sources)
+    planned_qty = sum(row.get("planned", 0) for row in sources)
+    plan_qty = awaiting or held or (planned_qty if in_production else 0)
     aql_level = repo.tenant_aql(session, tenant)
     plan = aql_engine.sampling_plan(plan_qty, aql_level)
     return {
@@ -386,6 +409,7 @@ def get_task(session: Session, tenant_id, key: str, permissions: list[str]) -> d
         "article": article, "scope": batch.name if batch else "Full order",
         "scopeKind": scope,
         "awaiting": awaiting, "held": held, "approved": approved, "rejected": rejected,
+        "inProduction": in_production, "plannedQty": planned_qty,
         "status": _status(awaiting=awaiting, held=held, approved=approved, rejected=rejected,
                           open_result=open_row.result if open_row else None, legacy=legacy),
         "legacy": legacy,
@@ -534,7 +558,8 @@ def start_task(session, *, tenant_id, actor, permissions, key, payload):
             if qty < 0 or qty > row[pool]:
                 raise HTTPException(422, "Selected quantity exceeds the pieces still eligible on a colour or size.")
             row[pool] = qty
-    lot = sum(row[pool] for row in sources) if stage == "Final" else max(1, sum(row["awaiting"] + row["held"] + row["approved"] for row in sources))
+    lot = sum(row[pool] for row in sources) if stage == "Final" else max(
+        1, sum(row["awaiting"] + row["held"] + row["approved"] for row in sources), sum(row.get("planned", 0) for row in sources))
     if stage == "Final" and lot <= 0:
         raise HTTPException(409, "No eligible quantity is left for this inspection.")
     sample = lot if payload.samplingMode == "full" else int(payload.sampleSize or 0)
@@ -572,6 +597,25 @@ def start_task(session, *, tenant_id, actor, permissions, key, payload):
     if ins.result == "Pending":
         repo.start_inspection(session, public_id=str(ins.public_id), tenant_id=tenant)
     return _remember(session, tenant, payload.requestId, {"inspectionId": str(ins.public_id), "reused": reused})
+
+
+def failed_midchecks(session: Session, tenant_id=None, order_ref: str | None = None) -> list[dict]:
+    """Articles whose latest inspection is a failed mid-production check.
+
+    A later inspection on the same article (a pass, or a final inspection)
+    replaces the failure, so the alert clears once the problem is rechecked.
+    """
+    query = select(Inspection).where(Inspection.is_deleted.is_(False), Inspection.result != "Cancelled")
+    if tenant_id is not None:
+        query = query.where(Inspection.tenant_id == _tid(tenant_id))
+    if order_ref:
+        query = query.where(Inspection.order_ref == order_ref)
+    latest: dict[tuple, Inspection] = {}
+    for row in session.scalars(query.order_by(Inspection.id.desc())):
+        latest.setdefault((row.order_ref, row.item, row.batch_id), row)
+    return [{"orderRef": row.order_ref, "article": row.item, "scope": row.batch_lot or "Full order",
+             "inspectionNo": row.inspection_no}
+            for row in latest.values() if row.stage == "In-line" and row.result == "Fail"]
 
 
 def _rework_parent_id(session, tenant, order_ref, article):
@@ -623,8 +667,8 @@ def decide_task(session, *, tenant_id, permissions, key, payload):
     for row in reservations:
         session.delete(row)
     session.flush()
-    if batch is None:
-        _refresh_ordinary_shipment(session, work)
+    # Released goods appear under Shipments > Ready to ship. A shipment is only created
+    # when someone prepares it, never automatically.
     return _remember(session, tenant, payload.requestId, {
         "result": ins.result, "released": True, "approved": ins.approved_qty,
         "held": ins.held_qty, "rejected": ins.rejected_qty, "reasons": outcome["reasons"],

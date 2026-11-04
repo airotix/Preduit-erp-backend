@@ -310,6 +310,10 @@ def stage_action(db, tid, actor, batch_id, stage_id, action, command):
             found.status = "Completed"
             found.actual_start_on = found.actual_start_on or date.today()
             found.actual_end_on = date.today()
+            upcoming = next((stage for stage in following if stage.status == "Pending"), None)
+            if upcoming is not None:
+                upcoming.status = "In progress"
+                upcoming.actual_start_on = upcoming.actual_start_on or date.today()
     elif action == "assign":
         if not command.worker.strip(): raise HTTPException(422, "Enter a worker")
         found.worker = command.worker.strip()
@@ -504,6 +508,8 @@ def create_shipment(db, tid, actor, order_id, kind, command):
             raise HTTPException(409, "This order must ship complete. Include every remaining unit.")
     if not command.carrier.strip() or not command.destination.strip():
         raise HTTPException(400, "Enter carrier and destination")
+    from app.modules.shipments.actions import _ensure_carrier
+    _ensure_carrier(db, tid, command.carrier)
     ship = Shipment(tenant_id=uid(tid), sales_order_id=sales_id, batch_managed=True,
         order_ref=db.get(SalesOrder, sales_id).order_no if sales_id else obj.order_no if kind == "production" else obj.po_no,
         carrier=command.carrier.strip(), destination=command.destination.strip(), eta=command.eta, status="Pending")

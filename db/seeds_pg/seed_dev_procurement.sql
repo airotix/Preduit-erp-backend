@@ -35,14 +35,17 @@ BEGIN
       JOIN suppliers s ON s.tenant_id=t AND s.name=x.sup;
   END IF;
 
-  IF NOT EXISTS (SELECT 1 FROM goods_receipts WHERE tenant_id=t) THEN
-    INSERT INTO goods_receipts (tenant_id, grn_no, po_ref, supplier_name, supplier_country, line_count, received_count, status, received_date, location) VALUES
-      (t,'GRN-3320','PO-5581','Lahore Textile Co.','PK',12,12,'Complete','26 Jun 2026','Lahore DC'),
-      (t,'GRN-3319','PO-5582','Anhui Knit Mills',  'CN', 6, 4,'Partial', '26 Jun 2026','Lahore DC'),
-      (t,'GRN-3318','PO-5580','Porto Trims Ltd.',  'PT', 4, 0,'Expected','26 Jun 2026','Lahore DC');
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM goods_receipt_lines WHERE tenant_id=t) THEN
-    SELECT id INTO g FROM goods_receipts WHERE tenant_id=t AND grn_no='GRN-3319';
+  INSERT INTO goods_receipts (tenant_id, grn_no, po_ref, supplier_name, supplier_country, line_count, received_count, status, received_date, location)
+  SELECT t, x.grn_no, x.po_ref, x.supplier_name, x.supplier_country, x.line_count, x.received_count, x.status, x.received_date, x.location
+    FROM (VALUES
+      ('GRN-3320','PO-5581','Lahore Textile Co.','PK',12,12,'Complete','26 Jun 2026','Lahore DC'),
+      ('GRN-3319','PO-5582','Anhui Knit Mills',  'CN', 6, 4,'Partial', '26 Jun 2026','Lahore DC'),
+      ('GRN-3318','PO-5580','Porto Trims Ltd.',  'PT', 4, 0,'Expected','26 Jun 2026','Lahore DC')
+    ) x(grn_no, po_ref, supplier_name, supplier_country, line_count, received_count, status, received_date, location)
+   WHERE NOT EXISTS (SELECT 1 FROM goods_receipts r WHERE r.tenant_id=t AND r.grn_no=x.grn_no);
+
+  SELECT id INTO g FROM goods_receipts WHERE tenant_id=t AND grn_no='GRN-3319' AND NOT is_deleted;
+  IF g IS NOT NULL AND NOT EXISTS (SELECT 1 FROM goods_receipt_lines WHERE tenant_id=t AND grn_id=g) THEN
     INSERT INTO goods_receipt_lines (tenant_id, grn_id, name, sku, ordered, received) VALUES
       (t,g,'Merino yarn 2/28 · Navy',    'YRN-MER-NVY',800,800),
       (t,g,'Merino yarn 2/28 · Charcoal','YRN-MER-CHR',600,400),

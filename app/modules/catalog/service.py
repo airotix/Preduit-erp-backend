@@ -11,7 +11,7 @@ from app.modules.catalog import repository as repo
 from app.modules.inventory import repository as inv_repo
 from app.modules.catalog.dto import (
     AttributeCreate, AttributeUpdate, CategoryCreate, CategoryUpdate,
-    ProductCreate, ProductUpdate, ProductEditorSave, VariantPricesUpdate, VariantGtinsUpdate,
+    ProductCreate, ProductUpdate, ProductEditorSave, VariantPricesUpdate,
 )
 from app.presenters.screen import list_config, text_cell
 
@@ -184,7 +184,6 @@ def product_detail(session: Session, *, public_id: str) -> dict | None:
             "prices": prices,
             "variants": [{"id": str(v["public_id"]), "sku": v["sku"],
                           "color": v["color"], "size": v["size"],
-                          "gtin": v["barcode"],
                           "currency": v["currency_code"],
                           "retailPrice": float(v["retail_price"]) if v["retail_price"] is not None else None,
                           "wholesalePrice": float(v["wholesale_price"]) if v["wholesale_price"] is not None else None,
@@ -358,66 +357,6 @@ def update_variant_prices(session: Session, *, tenant_id: str | UUID, public_id:
     session.flush()
     write_audit(session, tenant_id=tid, action="UPDATE", entity_type="product",
                 entity_id=str(product.public_id), detail=f"Updated variant prices for “{product.title}”")
-    return product
-
-
-def _gtin(value: str | None) -> str | None:
-    candidate = (value or "").strip()
-    if not candidate:
-        return None
-    if not candidate.isascii() or not candidate.isdigit() or len(candidate) not in (8, 12, 13, 14):
-        raise HTTPException(422, "GTIN must have 8, 12, 13 or 14 digits.")
-    total = sum(int(digit) * (3 if offset % 2 == 0 else 1)
-                for offset, digit in enumerate(reversed(candidate[:-1])))
-    if (10 - total % 10) % 10 != int(candidate[-1]):
-        raise HTTPException(422, "GTIN check digit is invalid.")
-    return candidate
-
-
-def update_variant_gtins(session: Session, *, tenant_id: str | UUID, public_id: str,
-                         payload: VariantGtinsUpdate):
-    from sqlalchemy import select
-    from app.models.catalog import Product, ProductVariant
-
-    tid = _tid(tenant_id)
-    product = session.scalar(select(Product).where(Product.public_id == public_id,
-        Product.tenant_id == tid, Product.is_deleted.is_(False)).with_for_update())
-    if product is None:
-        return None
-    ids = [entry.variantId for entry in payload.variants]
-    if len(ids) != len(set(ids)):
-        raise HTTPException(400, "Each variant can appear only once in a GTIN save.")
-    variants = session.scalars(select(ProductVariant).where(
-        ProductVariant.product_id == product.id, ProductVariant.tenant_id == tid,
-        ProductVariant.public_id.in_(ids), ProductVariant.status != "Archived",
-        ProductVariant.color_id.is_not(None), ProductVariant.size_id.is_not(None))
-        .order_by(ProductVariant.id).with_for_update()).all()
-    if len(variants) != len(ids):
-        raise HTTPException(409, "A variant changed or was removed. Reload the article before saving GTINs.")
-    codes = [_gtin(entry.gtin) for entry in payload.variants]
-    assigned = [code for code in codes if code]
-    if len(assigned) != len(set(assigned)):
-        raise HTTPException(409, "A GTIN cannot be assigned to more than one variant.")
-    conflicts = session.scalar(select(ProductVariant.id).where(
-        ProductVariant.tenant_id == tid, ProductVariant.barcode.in_(assigned),
-        ProductVariant.public_id.not_in(ids)).limit(1)) if assigned else None
-    if conflicts is not None:
-        raise HTTPException(409, "This GTIN is already assigned to another variant.")
-    by_id = {v.public_id: v for v in variants}
-    try:
-        with session.begin_nested():
-            # Clear the edited rows first so two variants can exchange GTINs
-            # without a transient violation of the unique barcode index.
-            for variant in variants:
-                variant.barcode = None
-            session.flush()
-            for entry, code in zip(payload.variants, codes):
-                by_id[entry.variantId].barcode = code
-            session.flush()
-    except IntegrityError as exc:
-        raise HTTPException(409, "This GTIN is already assigned to another variant.") from exc
-    write_audit(session, tenant_id=tid, action="UPDATE", entity_type="product",
-                entity_id=str(product.public_id), detail=f"Updated variant GTINs for “{product.title}”")
     return product
 
 

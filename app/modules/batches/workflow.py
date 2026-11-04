@@ -101,6 +101,8 @@ def create_inbound(db, tid, actor, order_id, command):
             raise HTTPException(400, "Select an active receiving warehouse")
         s.active_article(db, line)
     if not command.carrier.strip(): raise HTTPException(400, "Enter a carrier")
+    from app.modules.shipments.actions import _ensure_carrier
+    _ensure_carrier(db, tid, command.carrier)
     if len(pos) != 1:
         raise HTTPException(409, "Plan the inbound shipment from one supplier PO's production workspace.")
     if pos[0].status not in ("Approved", "Partially received", "Received"):
@@ -158,6 +160,8 @@ def plan_consolidated(db, tid, actor, command):
         raise HTTPException(409, "Keep different suppliers in separate shipments.")
     if not command.carrier.strip():
         raise HTTPException(400, "Enter a carrier.")
+    from app.modules.shipments.actions import _ensure_carrier
+    _ensure_carrier(db, tid, command.carrier)
     unique_pos = {po.id: po for po in pos}
     primary = next(iter(unique_pos.values()))
     ship = Shipment(tenant_id=s.uid(tid), batch_managed=True, direction="Inbound",

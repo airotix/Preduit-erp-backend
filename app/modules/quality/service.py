@@ -309,9 +309,9 @@ def reopen_failed(session, *, tenant_id, public_id, mode, notes=None, assigned_t
         if po and po.inventory_received:
             raise HTTPException(409, "This PO has already entered inventory; reconcile received stock before reopening it.")
         if po and po.supplier_shipment_required:
-            from app.modules.shipments.supplier_inbound import for_po
-            incoming = for_po(session, po)
-            if incoming and incoming.dispatched_at:
+            from app.modules.shipments.supplier_inbound import dispatched_for_po
+            incoming = dispatched_for_po(session, po)
+            if incoming:
                 raise HTTPException(409, "Supplier goods have already been dispatched; reconcile the shipment before reopening production or QC.")
     if mode == "production":
         if work is None:

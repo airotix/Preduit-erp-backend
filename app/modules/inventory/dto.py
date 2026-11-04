@@ -31,6 +31,7 @@ class WarehouseReceiptCreate(BaseModel):
     reference: str = Field(min_length=3, max_length=80)
     reason: str = Field(min_length=3, max_length=400)
     requestId: UUID
+    shipmentId: UUID | None = None
 
 
 class BatchReceiptLine(BaseModel):

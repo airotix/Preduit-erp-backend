@@ -27,7 +27,7 @@ def require_approved_po(session, work):
     if reason:
         raise HTTPException(409, reason)
     if po and po.supplier_shipment_required:
-        from app.modules.shipments.supplier_inbound import for_po
-        shipment = for_po(session, po)
-        if shipment and shipment.dispatched_at:
+        from app.modules.shipments.supplier_inbound import dispatched_for_po
+        shipment = dispatched_for_po(session, po)
+        if shipment:
             raise HTTPException(409, "Reconcile the dispatched supplier shipment before changing production work.")

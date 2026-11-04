@@ -129,7 +129,7 @@ def _incoming_ordinary(session, tid, upcoming):
         PurchaseOrder.status.not_in(["Cancelled", "Rejected", "Inactive"]))).all()
     rows = []
     for po in pos:
-        if _batch_managed(session, po):
+        if _batch_managed(session, po) or not po.supplier_shipment_required:
             continue
         work = session.scalar(select(ProductionOrder).where(ProductionOrder.tenant_id == tid,
             ProductionOrder.purchase_order_id == po.id, ProductionOrder.is_deleted.is_(False)))
@@ -137,13 +137,14 @@ def _incoming_ordinary(session, tid, upcoming):
             continue
         release = supplier_release(session, po)
         existing = supplier_inbound.for_po(session, po)
+        left = {row["poLineId"]: row["qty"] for row in supplier_inbound.remaining_lines(session, po, release)} if release["ready"] else {}
         if upcoming:
             if release["ready"] or existing:
                 continue
             blocking = "Waiting for production TNA and final QC release."
             eligible = 0
         else:
-            if not release["ready"] or existing:
+            if not release["ready"] or not left:
                 continue
             if po.status not in ("Approved", "Partially received", "Received"):
                 continue
@@ -157,12 +158,14 @@ def _incoming_ordinary(session, tid, upcoming):
             })
             continue
         for line in release["lines"]:
+            if line["poLineId"] not in left:
+                continue
             source = session.get(PurchaseOrderLine, line["poLineId"])
             rows.append({
                 "key": f"oin:{po.public_id}:{line['poLineId']}", "direction": "Incoming", "party": po.supplier_name,
                 "source": po.po_no, "article": source.name if source else line["description"],
                 "color": source.color if source else None, "size": source.size if source else None,
-                "batch": None, "eligible": line["qty"], "blocking": None, "partial": False,
+                "batch": None, "eligible": left[line["poLineId"]], "blocking": None, "partial": True,
                 "savedDestination": None,
             })
     return rows

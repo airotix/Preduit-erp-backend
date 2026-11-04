@@ -10,7 +10,7 @@ from app.modules.catalog import service
 from app.modules.catalog import retirement
 from app.modules.catalog.dto import (
     AttributeCreate, AttributeUpdate, CategoryCreate, CategoryUpdate,
-    ProductCreate, ProductUpdate, ProductEditorSave, VariantPricesUpdate, VariantGtinsUpdate,
+    ProductCreate, ProductUpdate, ProductEditorSave, VariantPricesUpdate,
     StockDisposition, StockReconciliation,
 )
 from app.modules.inventory.dto import MatrixUpdate
@@ -127,17 +127,6 @@ def update_variant_prices(public_id: str, payload: VariantPricesUpdate,
                           db: Session = Depends(tenant_db)):
     product = service.update_variant_prices(db, tenant_id=principal.tenant_id,
                                             public_id=public_id, payload=payload)
-    if product is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
-    return {"public_id": str(product.public_id)}
-
-
-@router.put("/products/{public_id}/variant-gtins")
-def update_variant_gtins(public_id: str, payload: VariantGtinsUpdate,
-                         principal: Principal = Depends(write),
-                         db: Session = Depends(tenant_db)):
-    product = service.update_variant_gtins(db, tenant_id=principal.tenant_id,
-                                           public_id=public_id, payload=payload)
     if product is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
     return {"public_id": str(product.public_id)}

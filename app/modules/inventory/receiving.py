@@ -14,6 +14,7 @@ from app.models.inventory import Location, StockEntry, StockLevel
 from app.models.procurement import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine, Supplier
 from app.models.production import ProductionOrder
 from app.models.sales import SalesOrder
+from app.models.shipments import ShipmentLine
 from app.modules.inventory.dto import WarehouseReceiptCreate
 
 
@@ -57,12 +58,21 @@ def queue(session, *, tenant_id, limit=50, offset=0):
         ready = fulfillment.qc_cleared(session, po)
         from app.modules.shipments import supplier_inbound
         incoming = supplier_inbound.for_po(session, po) if po.supplier_shipment_required else None
+        in_flight = [s for s in supplier_inbound.all_for_po(session, po) if s.status in supplier_inbound.IN_FLIGHT] if po.supplier_shipment_required else []
         status = "Ready for warehouse receipt" if ready else "Awaiting production / final QC"
         if ready and po.supplier_shipment_required:
-            ready = bool(incoming and incoming.status in supplier_inbound.IN_FLIGHT)
+            ready = bool(in_flight)
             if not ready:
                 status = "Dispatch the supplier shipment in Shipments before receiving"
+        public_by_id = {line.id: str(line.public_id) for line in lines}
+        flight_rows = []
+        for ship in in_flight:
+            ship_lines = session.scalars(select(ShipmentLine).where(ShipmentLine.tenant_id == tid,
+                ShipmentLine.shipment_id == ship.id, ShipmentLine.po_line_id.is_not(None))).all()
+            flight_rows.append({"id": str(ship.public_id), "ref": ship.shipment_no, "status": ship.status,
+                "lines": [{"poLineId": public_by_id.get(l.po_line_id), "quantity": l.qty} for l in ship_lines if l.po_line_id in public_by_id]})
         result.append({"id": str(po.public_id), "poNo": po.po_no, "supplier": po.supplier_name,
+            "shipments": flight_rows,
             "shipment": {"id": str(incoming.public_id), "ref": incoming.shipment_no, "status": incoming.status} if incoming else None,
             "plannedLocation": session.get(Location, po.incoming_location_id).name if po.incoming_location_id else None,
             "ready": ready, "status": status,
@@ -155,9 +165,19 @@ def _post(session, *, tenant_id, public_id, payload, actor):
     if not fulfillment.qc_cleared(session, po):
         raise HTTPException(409, "Complete production and pass final QC before warehouse receipt.")
     from app.modules.shipments import supplier_inbound
-    incoming = supplier_inbound.for_po(session, po, lock=True) if po.supplier_shipment_required else None
-    if po.supplier_shipment_required and (incoming is None or incoming.status not in supplier_inbound.IN_FLIGHT):
-        raise HTTPException(409, "Dispatch this PO's supplier shipment in Shipments before warehouse receipt.")
+    incoming = None
+    if po.supplier_shipment_required:
+        in_flight = [s for s in supplier_inbound.all_for_po(session, po, lock=True) if s.status in supplier_inbound.IN_FLIGHT]
+        if not in_flight:
+            raise HTTPException(409, "Dispatch this PO's supplier shipment in Shipments before warehouse receipt.")
+        if payload.shipmentId is not None:
+            incoming = next((s for s in in_flight if s.public_id == payload.shipmentId), None)
+            if incoming is None:
+                raise HTTPException(409, "That supplier shipment is not on its way for this purchase order.")
+        elif len(in_flight) == 1:
+            incoming = in_flight[0]
+        else:
+            raise HTTPException(422, "Choose which supplier shipment has arrived.")
     location = session.scalar(select(Location).where(Location.public_id == payload.locationId,
         Location.tenant_id == tid, Location.is_deleted.is_(False)))
     if location is None:
@@ -171,10 +191,20 @@ def _post(session, *, tenant_id, public_id, payload, actor):
     if len(ids) != len(set(ids)) or any(line_id not in by_public for line_id in ids):
         raise HTTPException(422, "Choose each PO line once, from this purchase order.")
     received = received_quantities(session, tid, [line.id for line in lines])
+    on_shipment = {}
+    if incoming is not None:
+        on_shipment = {l.po_line_id: l for l in session.scalars(select(ShipmentLine).where(
+            ShipmentLine.tenant_id == tid, ShipmentLine.shipment_id == incoming.id, ShipmentLine.po_line_id.is_not(None)))}
     planned, quantities = [], {}
     for entry in payload.lines:
         line = by_public[entry.poLineId]
         remaining = line.qty - received.get(line.id, 0)
+        if incoming is not None:
+            sent = on_shipment.get(line.id)
+            if sent is None:
+                raise HTTPException(409, f"{line.name} / {line.color} / {line.size} is not on shipment {incoming.shipment_no}.")
+            if entry.quantity > sent.qty:
+                raise HTTPException(409, f"Shipment {incoming.shipment_no} carried only {sent.qty} units of {line.name} / {line.color} / {line.size}.")
         if entry.quantity > remaining:
             raise HTTPException(409, f"Only {remaining} units remain to receive for {line.name} / {line.color} / {line.size}.")
         variant = fulfillment.variant_for(session, source or SimpleNamespace(tenant_id=tid), line)
@@ -212,8 +242,12 @@ def _post(session, *, tenant_id, public_id, payload, actor):
     complete = all(received.get(line.id, 0) == line.qty for line in lines)
     po.inventory_received = complete
     po.status = "Received" if complete else "Partially received"
-    if complete and incoming:
+    if incoming is not None:
+        # This shipment has arrived. Record what actually came; any shortfall goes back to Ready to ship.
         from datetime import datetime, timezone
+        arrived = {line.id: qty for line, _, qty, _ in planned}
+        for po_line_id, sent in on_shipment.items():
+            sent.delivered_qty = arrived.get(po_line_id, 0)
         incoming.status = "Delivered"
         incoming.delivered_at = datetime.now(timezone.utc)
     grn.status = "Received"  # This document records one completed physical receipt.

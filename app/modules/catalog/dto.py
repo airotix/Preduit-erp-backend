@@ -69,15 +69,6 @@ class VariantPricesUpdate(BaseModel):
     variants: list[VariantPriceChange] = Field(min_length=1)
 
 
-class VariantGtinChange(BaseModel):
-    variantId: UUID
-    gtin: str | None = Field(default=None, max_length=64)
-
-
-class VariantGtinsUpdate(BaseModel):
-    variants: list[VariantGtinChange] = Field(min_length=1)
-
-
 class ProductOut(BaseModel):
     public_id: UUID
     title: str

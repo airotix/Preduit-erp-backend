@@ -379,6 +379,9 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         status_label = "Cancelled"
         can_inspect = False
 
+    from app.modules.quality.workflow import failed_midchecks
+    failed_checks = failed_midchecks(session, po.tenant_id, po.order_no)
+
     # One timeline per production line (style) → tabs on the detail page.
     lines_out = [
         {"publicId": str(ld["line"].public_id), "name": ld["line"].name,
@@ -417,6 +420,7 @@ def porder_detail(session: Session, *, public_id: str) -> dict | None:
         "batchManaged": batch_managed,
         "progress": progress,
         "canInspect": can_inspect,
+        "failedChecks": failed_checks,
         "inspected": inspected,
         "alert": alert,
         "stageNames": STAGES,
@@ -472,6 +476,12 @@ def stage_action(session, *, action, public_id, days=None, worker=None, notes=No
         return repo.start_stage(session, public_id=public_id)
     if action == "complete":
         stage = repo.complete_stage(session, public_id=public_id)
+        if stage is not None:
+            siblings = (repo.list_line_stages(session, stage.line_id) if stage.line_id
+                        else repo.list_stages(session, stage.order_id))
+            upcoming = next((s for s in siblings if s.seq > stage.seq and s.status == "Pending"), None)
+            if upcoming is not None:
+                repo.start_stage(session, public_id=str(upcoming.public_id))
         # When this completes a whole production LINE (item), open that item's
         # inspection right away — independently of the other items on the order.
         if stage is not None:
@@ -488,11 +498,6 @@ def stage_action(session, *, action, public_id, days=None, worker=None, notes=No
                     qc_repo.create_inspection(session, tenant_id=stage.tenant_id,
                                               order_ref=po.order_no, stage="Final",
                                               product=po.style, prod_qty=po.qty)
-            if po is not None and po.purchase_order_id:
-                from app.modules.shipments.supplier_inbound import ensure
-                source_po = session.get(PurchaseOrder, po.purchase_order_id)
-                if source_po:
-                    ensure(session, source_po)
         return stage
     if action == "extend":
         return repo.extend_stage(session, public_id=public_id, days=days or 0)

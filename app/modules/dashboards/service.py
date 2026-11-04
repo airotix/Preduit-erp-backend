@@ -387,7 +387,9 @@ def proddash(session: Session) -> dict:
     rows = [[ono or "—", style or "—", f"{qty:,}", f"{stage or '—'} · {prog}%", _accent(i)]
             for i, (ono, style, qty, stage, prog) in enumerate(wos)]
 
-    alerts = []
+    from app.modules.quality.workflow import failed_midchecks
+    alerts = [_alert("red", f"{f['orderRef']} · {f['article']}: mid-production check failed", "quality check")
+              for f in failed_midchecks(session)]
     for ono, style, _qty, _stage, prog in wos[:4]:
         if prog >= 100:
             continue
@@ -410,7 +412,7 @@ def proddash(session: Session) -> dict:
                   "cols": [{"l": "Order", "a": "left"}, {"l": "Style", "a": "left"},
                            {"l": "Qty", "a": "right"}, {"l": "Stage", "a": "right"}],
                   "rows": rows},
-        "alerts": {"title": "Production alerts", "items": alerts[:6]},
+        "alerts": {"title": "Production alerts", "items": alerts[:8]},
     }
 
 

@@ -142,14 +142,12 @@ def _prepare_incoming_ordinary(session, tid, actor, payload, groups):
         raise HTTPException(404, "Purchase order not found")
     if po.status not in ("Approved", "Partially received", "Received"):
         raise HTTPException(409, "The supplier purchase order must be approved before its goods can be shipped.")
-    release = {line["poLineId"]: line["qty"] for line in supplier_release(session, po)["lines"]}
-    if set(quantities) != set(release) or any(quantities[line_id] != release[line_id] for line_id in release):
-        raise HTTPException(409, "This supplier shipment includes the full QC-released quantity.")
-    ship = supplier_inbound.ensure(session, po)
+    if not any(qty > 0 for qty in quantities.values()):
+        raise HTTPException(422, "Enter a quantity to ship.")
+    # Each shipment carries the pieces chosen; the rest stay under Ready to ship for a later shipment.
+    ship = supplier_inbound.create(session, po, quantities)
     if ship is None:
         raise HTTPException(409, "Complete production TNA and final QC before preparing this shipment.")
-    if ship.dispatched_at:
-        raise HTTPException(409, "This supplier shipment has already been dispatched.")
     _stamp(ship, payload)
     session.flush()
     return _finish(session, tid, actor, payload, ship)
@@ -164,7 +162,7 @@ def _prepare_outgoing_ordinary(session, tid, actor, payload, groups):
     order = fulfillment.lock_order(session, tenant_id=tid, public_id=UUID(order_id))
     if order.allow_partial_shipments is False and any(qty <= 0 for qty in quantities.values()):
         raise HTTPException(409, "This order must ship complete. Include every remaining unit.")
-    ship = refresh(session, order)
+    ship = refresh(session, order, create=True)
     if ship is None:
         raise HTTPException(409, "This order is not ready to ship. Reserved stock is still outstanding or already on a shipment.")
     if ship.packed_at or ship.inventory_dispatched:
@@ -231,6 +229,20 @@ def _prepare_outgoing_batch(session, tid, actor, payload, lots, reservations):
     return _result(ship)
 
 
+def _ensure_carrier(session, tid, name):
+    """A carrier typed on the form that isn't in the carriers list yet is added to it."""
+    from sqlalchemy import func
+    from app.models.shipments import Carrier
+    name = (name or "").strip()
+    if not name:
+        return
+    known = session.scalar(select(Carrier.id).where(
+        Carrier.is_deleted.is_(False), func.lower(Carrier.name) == name.lower()).limit(1))
+    if known is None:
+        from app.modules.shipments import repository as repo
+        repo.create_carrier(session, tenant_id=UUID(str(tid)), name=name, service="", avg_transit="")
+
+
 def prepare(session, tid, actor, payload: PrepareBody):
     remembered = _remembered(session, tid, payload.requestId, {"Plan inbound shipment", "Allocate shipment"})
     if remembered:
@@ -240,6 +252,7 @@ def prepare(session, tid, actor, payload: PrepareBody):
     if existing:
         return json.loads(existing.payload).get("snapshot")
     _require_transport(payload)
+    _ensure_carrier(session, tid, payload.carrier)
     parsed = []
     for line in payload.lines:
         parts = line.key.split(":")
@@ -433,6 +446,7 @@ def perform(session, tid, actor, public_id, payload: ActionBody):
     existing = flow.replay(session, tid, payload.requestId, f"Shipment {payload.action}", payload)
     if existing:
         return json.loads(existing.payload).get("snapshot")
+    _ensure_carrier(session, tid, payload.carrier)
     preview = session.scalar(select(Shipment).where(Shipment.tenant_id == tid,
         Shipment.public_id == UUID(str(public_id)), Shipment.is_deleted.is_(False)))
     if preview and preview.sales_order_id:

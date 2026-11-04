@@ -33,7 +33,9 @@ def active(session, order):
         Shipment.status != "Cancelled").order_by(Shipment.id))
 
 
-def refresh(session, order):
+def refresh(session, order, create=False):
+    """Re-reads stock and order status. Only creates the shipment record when asked to (create=True),
+    which happens when a user prepares the shipment; until then the goods wait under Ready to ship."""
     from app.modules.sales import fulfillment as f
     if order.status in ("Cancelled", "Inactive"):
         return None
@@ -46,8 +48,8 @@ def refresh(session, order):
     f.reserve_available(session, order)
     rows = f.stock_summary(session, order)
     current = active(session, order)
-    if current is None and (all(r["missing"] == 0 for r in rows) or
-            (order.allow_partial_shipments and any(r["reserved"] for r in rows))):
+    ready_now = all(r["missing"] == 0 for r in rows) or bool(order.allow_partial_shipments and any(r["reserved"] for r in rows))
+    if current is None and create and ready_now:
         customer = session.get(Customer, order.customer_id) if order.customer_id else None
         current = Shipment(tenant_id=order.tenant_id, sales_order_id=order.id, order_ref=order.order_no,
             carrier=None, destination=(customer.address or customer.region)[:160] if customer and (customer.address or customer.region) else None,
@@ -66,8 +68,8 @@ def refresh(session, order):
         session.flush()
     if sent:
         order.status = "Partially shipped"
-    elif current:
-        order.status = "Packed" if current.packed_at else "Ready to pack"
+    elif current or ready_now:
+        order.status = "Packed" if current and current.packed_at else "Ready to pack"
     else:
         order.status = "PO needed" if any(r["toPurchase"] for r in f.procurement_summary(session, order)) else "Awaiting stock"
     session.flush()

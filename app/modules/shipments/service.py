@@ -171,6 +171,9 @@ def update_shipment(session, *, public_id, payload, actor=None):
             Shipment.is_deleted.is_(False)))
         if pending and not pending.purchase_order_id and (not payload.carrier.strip() or not payload.destination.strip()):
             raise HTTPException(422, "Carrier and destination are required.")
+        if pending and payload.carrier.strip():
+            from app.modules.shipments.actions import _ensure_carrier
+            _ensure_carrier(session, pending.tenant_id, payload.carrier)
         if pending and pending.purchase_order_id and not pending.batch_managed:
             from app.models.procurement import PurchaseOrder
             session.scalar(select(PurchaseOrder).where(PurchaseOrder.id == pending.purchase_order_id,
